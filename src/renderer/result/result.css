@@ -625,6 +625,12 @@ body,
   animation: result-fade-in 150ms ease-out;
 }
 
+.result-thinking__body .result-thinking__markdown {
+  /* The thinking body inherits pre-wrap for plain reasoning; Markdown must
+     reflow normally so paragraphs and tables render correctly. */
+  white-space: normal;
+}
+
 .markdown-body {
   animation: result-fade-in 180ms ease-out;
 }
@@ -857,21 +863,41 @@ body,
   width: max-content;
   max-width: 100%;
   overflow-x: auto;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
   scrollbar-width: thin;
   overscroll-behavior-x: contain;
 }
 
 .markdown-body th,
 .markdown-body td {
-  padding: 6px 9px;
-  border: 1px solid var(--border-strong);
+  padding: 7px 11px;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+}
+
+.markdown-body th:last-child,
+.markdown-body td:last-child {
+  border-right: none;
+}
+
+.markdown-body tr:last-child td {
+  border-bottom: none;
 }
 
 .markdown-body th {
   font-weight: 620;
   background: color-mix(in srgb, var(--surface-muted) 80%, transparent);
-  text-align: left;
+}
+
+.markdown-body tbody tr:hover > td {
+  background: color-mix(in srgb, var(--surface-muted) 55%, transparent);
 }
 
 .markdown-body img {
@@ -1278,6 +1304,10 @@ body,
 
   .markdown-body th {
     background: color-mix(in srgb, var(--surface-muted) 72%, var(--text) 6%);
+  }
+
+  .markdown-body tbody tr:hover > td {
+    background: color-mix(in srgb, var(--surface-muted) 62%, var(--text) 6%);
   }
 
   .markdown-body .katex,

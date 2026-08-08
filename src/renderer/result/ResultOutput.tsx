@@ -74,7 +74,9 @@ export function useDeferredRichMarkdown(
   const milestoneRef = useRef(onMilestone)
   milestoneRef.current = onMilestone
   const plainLayoutRecorded = useRef(false)
-  const active = status === 'completed' && eligible
+  // Rich Markdown now upgrades live while a reply streams in (Cherry-style),
+  // so the deferred module load starts as soon as content looks Markdown-like.
+  const active = (status === 'completed' || status === 'streaming') && eligible
 
   const record = useCallback((milestone: ResultOutputMilestone): void => {
     milestoneRef.current?.(milestone, performance.now())
@@ -222,7 +224,9 @@ function ResultOutputInstance({
   scheduler = browserMarkdownScheduler,
   onMilestone
 }: ResultOutputProps): JSX.Element {
-  const eligible = status === 'completed' && shouldRenderRichMarkdown(content, contentScalarCount)
+  const eligible =
+    (status === 'completed' || status === 'streaming') &&
+    shouldRenderRichMarkdown(content, contentScalarCount)
   const deferred = useDeferredRichMarkdown(
     requestKey,
     status,

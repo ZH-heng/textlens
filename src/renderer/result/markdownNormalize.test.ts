@@ -71,4 +71,21 @@ describe('normalizeMarkdownSource', () => {
     const input = ['# 标题', '', '段落一。', '', '- a', '- b', '', '段落二。'].join('\n')
     expect(normalizeMarkdownSource(input)).toBe(input)
   })
+
+  it('keeps pipe-less GFM table rows tight', () => {
+    const input = ['功能 | 说明', '--- | ---', '划词 | 选中即查', '翻译 | 一键翻译'].join('\n')
+    expect(normalizeMarkdownSource(input)).toBe(input)
+  })
+
+  it('does not treat a `- | -` delimiter row as a list', () => {
+    const input = ['A | B', '- | -', '1 | 2'].join('\n')
+    expect(normalizeMarkdownSource(input)).toBe(input)
+  })
+
+  it('separates surrounding prose from a pipe-less table', () => {
+    const input = ['方案如下：', '方案 | 耗时', '--- | ---', 'A | 1 天', '说明结束。'].join('\n')
+    expect(normalizeMarkdownSource(input)).toBe(
+      ['方案如下：', '', '方案 | 耗时', '--- | ---', 'A | 1 天', '', '说明结束。'].join('\n')
+    )
+  })
 })

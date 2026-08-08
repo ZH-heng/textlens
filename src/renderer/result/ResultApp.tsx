@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  Suspense,
   useSyncExternalStore,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
@@ -55,7 +56,9 @@ import {
   patchStreamingAssistant,
   type TranscriptTurn
 } from './conversationTranscript'
-import { ResultOutput } from './ResultOutput'
+import { safeMarkdownLoader } from './LazySafeMarkdown'
+import { shouldRenderRichMarkdown } from './markdownPolicy'
+import { ResultOutput, useDeferredRichMarkdown } from './ResultOutput'
 import { useResultContentOverflow } from './resultContentOverflow'
 import type { ResultSessionBootstrap } from './resultSessionBootstrap'
 import type { ResultState } from './resultState'
@@ -228,16 +231,28 @@ function ResultStreamBody({
  *
  * Chrome is intentionally minimal: only the accent「思考」badge + chevron.
  */
-function ThinkingPanel(): JSX.Element | null {
+function ThinkingPanel({
+  onOpenExternal
+}: {
+  onOpenExternal: (url: string) => void
+}): JSX.Element | null {
   const thinkingContent = useResultField((state) => state.thinkingContent)
   const status = useResultField((state) => state.status)
   const requestGeneration = useResultField((state) => state.requestGeneration)
+  const sessionGeneration = useResultField((state) => state.sessionGeneration)
+  const requestId = useResultField((state) => state.requestId)
   const hasAnswer = useResultField((state) => state.content.length > 0)
   const [expanded, setExpanded] = useState(false)
   const userToggledRef = useRef(false)
 
   const live = status === 'streaming' && !hasAnswer
   const hasThinking = thinkingContent.length > 0
+  const requestKey = `${sessionGeneration ?? 'none'}:${requestGeneration ?? 'none'}:${requestId ?? 'none'}`
+  // Thinking stays lightweight (plain text + caret) unless the reasoning
+  // itself contains Markdown; then it upgrades live like the answer body.
+  const eligible =
+    hasThinking && shouldRenderRichMarkdown(thinkingContent, countUnicodeScalars(thinkingContent))
+  const deferred = useDeferredRichMarkdown(requestKey, status, eligible, true)
 
   // New request (retry / continue / model switch) always restarts collapse preference.
   useEffect(() => {
@@ -253,6 +268,11 @@ function ThinkingPanel(): JSX.Element | null {
   }, [hasThinking, live, hasAnswer])
 
   if (!hasThinking) return null
+
+  const MarkdownComponent =
+    eligible && !deferred.loading && !deferred.failed && deferred.generation
+      ? deferred.generation.Component
+      : null
 
   return (
     <section
@@ -283,7 +303,15 @@ function ThinkingPanel(): JSX.Element | null {
       </button>
       {expanded && (
         <div className="result-thinking__body">
-          {thinkingContent}
+          {MarkdownComponent ? (
+            <Suspense fallback={thinkingContent}>
+              <article className="markdown-body result-thinking__markdown">
+                <MarkdownComponent content={thinkingContent} onOpenExternal={onOpenExternal} />
+              </article>
+            </Suspense>
+          ) : (
+            thinkingContent
+          )}
           {live && <span className="stream-caret" aria-hidden="true" />}
         </div>
       )}
@@ -1072,34 +1100,25 @@ function ResultSessionApp({
                     ) : (
                       <>
                         {/* CoT attaches to the latest assistant bubble (Cherry-style). */}
-                        {isLatestAssistant && <ThinkingPanel />}
-                        {turn.streaming || !turn.content ? (
-                          turn.content ? (
-                            <div className="result-turn__content stream-plain-text">
-                              {turn.content}
-                              {turn.streaming ? (
-                                <span className="stream-caret" aria-hidden="true" />
-                              ) : null}
-                            </div>
-                          ) : !hasThinking ? (
-                            <div className="result-turn__waiting">
-                              <LoaderCircle className="result-spin" size={16} />
-                              <span>正在等待模型响应…</span>
-                            </div>
-                          ) : null
-                        ) : (
+                        {isLatestAssistant && <ThinkingPanel onOpenExternal={openExternal} />}
+                        {turn.content ? (
                           <article className="markdown-body result-turn__content">
                             <ResultOutput
                               requestKey={`${sessionGeneration ?? 'none'}:${requestGeneration ?? 'none'}:${turn.id}`}
-                              status="completed"
+                              status={turn.streaming ? 'streaming' : 'completed'}
                               content={turn.content}
-                              contentScalarCount={turn.content.length}
+                              contentScalarCount={countUnicodeScalars(turn.content)}
                               contentRevision={1}
                               revealCommitted={revealCommitted}
                               onOpenExternal={openExternal}
                             />
                           </article>
-                        )}
+                        ) : !hasThinking ? (
+                          <div className="result-turn__waiting">
+                            <LoaderCircle className="result-spin" size={16} />
+                            <span>正在等待模型响应…</span>
+                          </div>
+                        ) : null}
                       </>
                     )}
                   </div>
@@ -1108,7 +1127,7 @@ function ResultSessionApp({
             </>
           ) : (
             <>
-              <ThinkingPanel />
+              <ThinkingPanel onOpenExternal={openExternal} />
               {hasContent ? (
                 <ResultStreamBody
                   revealCommitted={revealCommitted}

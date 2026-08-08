@@ -135,7 +135,7 @@ describe('ResultOutput', () => {
     ])
   })
 
-  it.each(['streaming', 'cancelled', 'error'] as const)(
+  it.each(['cancelled', 'error'] as const)(
     'keeps %s content plain after all scheduler work',
     (status) => {
       const scheduler = new DeterministicScheduler()
@@ -156,6 +156,49 @@ describe('ResultOutput', () => {
       expect(importer).not.toHaveBeenCalled()
     }
   )
+
+  it('renders Markdown content live while streaming', async () => {
+    const scheduler = new DeterministicScheduler()
+    const importer = vi.fn().mockResolvedValue({
+      SafeMarkdown: ({ content }: SafeMarkdownProps) => <h1>{content.replace(/^# /u, '')}</h1>
+    })
+    render(
+      <ResultOutput
+        {...outputProps({ status: 'streaming', revealCommitted: true })}
+        loader={createRetryableMarkdownLoader(importer)}
+        scheduler={scheduler}
+      />
+    )
+
+    expect(screen.getByText('# Deferred heading')).toHaveClass('stream-plain-text')
+
+    act(() => scheduler.runNextFrame())
+    act(() => scheduler.runNextIdle())
+    expect(importer).toHaveBeenCalledOnce()
+
+    expect(await screen.findByRole('heading', { name: 'Deferred heading' })).toBeInTheDocument()
+  })
+
+  it('keeps streaming plain text lightweight', () => {
+    const scheduler = new DeterministicScheduler()
+    const importer = vi.fn()
+    render(
+      <ResultOutput
+        {...outputProps({
+          status: 'streaming',
+          content: 'ordinary plain text',
+          contentScalarCount: 19,
+          revealCommitted: true
+        })}
+        loader={createRetryableMarkdownLoader(importer)}
+        scheduler={scheduler}
+      />
+    )
+
+    expect(screen.getByText('ordinary plain text')).toHaveClass('stream-plain-text')
+    expect(scheduler.frames.size).toBe(0)
+    expect(importer).not.toHaveBeenCalled()
+  })
 
   it.each([
     { name: 'plain text', content: 'ordinary plain text', contentScalarCount: 19 },

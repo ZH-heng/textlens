@@ -2,6 +2,7 @@ import {
   RICH_MARKDOWN_SCALAR_LIMIT,
   contentLooksLikeMath,
   hasLikelyMarkdownSyntax,
+  isTableDelimiterRow,
   shouldRenderRichMarkdown
 } from './markdownPolicy'
 
@@ -23,9 +24,29 @@ describe('rich Markdown policy', () => {
     '[link](https://example.com)',
     '```ts\nconst value = 1\n```',
     '$x^2$',
-    '| A | B |\n| - | - |'
+    '| A | B |\n| - | - |',
+    'A | B\n--- | ---',
+    '功能 | 说明\n- | -\n划词 | 选中即查'
   ])('recognizes representative Markdown: %s', (content) => {
     expect(hasLikelyMarkdownSyntax(content)).toBe(true)
+  })
+
+  it('recognizes pipe-less GFM tables as rich Markdown', () => {
+    const table = ['方案 | 耗时', '--- | ---', 'A | 1 天', 'B | 2 天'].join('\n')
+    expect(hasLikelyMarkdownSyntax(table)).toBe(true)
+    expect(shouldRenderRichMarkdown(table, table.length)).toBe(true)
+  })
+
+  it.each([
+    ['--- | ---', true],
+    ['- | -', true],
+    ['| --- | --- |', true],
+    ['| - |', true],
+    ['A | B', false],
+    ['---', false],
+    ['- item | other', false]
+  ])('isTableDelimiterRow(%s) === %s', (line, expected) => {
+    expect(isTableDelimiterRow(line)).toBe(expected)
   })
 
   it('uses Unicode scalars at the exact rich-render boundary', () => {

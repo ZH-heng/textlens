@@ -7,6 +7,8 @@
  * outside fenced code without a full re-parse, keeping O(n) cost.
  */
 
+import { isTableDelimiterRow } from './markdownPolicy'
+
 const FENCE_MARKER = /^[ \t]{0,3}([`~]{3,})(.*)$/u
 const ATX_HEADING = /^[ \t]{0,3}#{1,6}(?:[ \t]|$)/u
 const BLOCKQUOTE = /^[ \t]{0,3}>/u
@@ -23,6 +25,34 @@ const SENTENCE_END = /(?:[.!?…。！？；;]|\u2026)["'”’」』》）)\]]*
 
 type LineKind = 'blank' | 'list' | 'table' | 'heading' | 'quote' | 'hr' | 'fence' | 'prose'
 
+/**
+ * Mark contiguous non-blank runs of pipe-containing lines as table rows when
+ * the run contains a GFM delimiter row. GFM tables do not require leading
+ * pipes, and a delimiter such as `- | -` would otherwise be misread as a list
+ * or horizontal rule and split the table apart.
+ */
+function computeTableRunRows(lines: string[]): Set<number> {
+  const rows = new Set<number>()
+  let index = 0
+  while (index < lines.length) {
+    if (lines[index]!.trim() === '' || !lines[index]!.includes('|')) {
+      index++
+      continue
+    }
+    const start = index
+    while (index < lines.length && lines[index]!.trim() !== '' && lines[index]!.includes('|')) {
+      index++
+    }
+    for (let j = start; j < index; j++) {
+      if (isTableDelimiterRow(lines[j]!)) {
+        for (let k = start; k < index; k++) rows.add(k)
+        break
+      }
+    }
+  }
+  return rows
+}
+
 export function normalizeMarkdownSource(source: string): string {
   if (!source) return source
 
@@ -32,6 +62,7 @@ export function normalizeMarkdownSource(source: string): string {
   }
 
   const lines = text.split('\n')
+  const tableRows = computeTableRunRows(lines)
   const out: string[] = []
   let fenceChar: string | null = null
   let previousKind: LineKind = 'blank'
@@ -50,7 +81,7 @@ export function normalizeMarkdownSource(source: string): string {
     previousLine = line
   }
 
-  for (const raw of lines) {
+  for (const [index, raw] of lines.entries()) {
     if (fenceChar !== null) {
       emitLine(raw, 'fence')
       if (isMatchingFenceClose(raw, fenceChar)) {
@@ -73,8 +104,9 @@ export function normalizeMarkdownSource(source: string): string {
       continue
     }
 
-    const line = convertListMarkers(raw)
-    const kind = classifyLine(line)
+    const isTableRow = tableRows.has(index)
+    const line = isTableRow ? raw : convertListMarkers(raw)
+    const kind = isTableRow ? 'table' : classifyLine(line)
 
     if (previousKind !== 'blank' && shouldSeparate(previousKind, kind, previousLine, line)) {
       emitBlank()

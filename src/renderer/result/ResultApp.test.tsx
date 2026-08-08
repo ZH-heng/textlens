@@ -551,15 +551,17 @@ describe('ResultApp window interactions', () => {
     expect(screen.getByText('const answer = 42').closest('pre')).toBeInTheDocument()
   })
 
-  it('uses plain text while streaming and switches to Markdown after completion', async () => {
+  it('renders Markdown live while streaming and keeps it after completion', async () => {
     await renderResult({
       ...completedSession,
       status: 'streaming',
       content: '# 尚未完成'
     })
 
-    expect(screen.queryByRole('heading', { name: '尚未完成' })).not.toBeInTheDocument()
-    expect(screen.getByText('# 尚未完成')).toHaveClass('stream-plain-text')
+    // The deferred Markdown module upgrades the body live during streaming.
+    expect(
+      await screen.findByRole('heading', { name: '尚未完成', level: 1 }, { timeout: 5_000 })
+    ).toBeInTheDocument()
 
     const store = await import('./actionEventStore')
     act(() => {
@@ -919,6 +921,23 @@ describe('ResultApp window interactions', () => {
       'false'
     )
     expect(screen.queryByText('先拆解题意，再给出解释。')).not.toBeInTheDocument()
+  })
+
+  it('renders thinking content as Markdown live while reasoning', async () => {
+    await renderResult(
+      resultSnapshot({
+        status: 'streaming',
+        content: '',
+        contentScalarCount: 0,
+        thinkingContent: ['| 步骤 | 说明 |', '| --- | --- |', '| 1 | 拆题 |'].join('\n')
+      })
+    )
+
+    expect(
+      await screen.findByRole('table', {}, { timeout: 5_000 })
+    ).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: '步骤' })).toBeInTheDocument()
+    expect(screen.getByRole('cell', { name: '拆题' })).toBeInTheDocument()
   })
 
   it('shows a single-line waiting label without the streaming-hint subtitle', async () => {

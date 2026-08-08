@@ -108,6 +108,19 @@ describe('SafeMarkdown', () => {
     expect(container.querySelector('input[type="checkbox"]')).toBeDisabled()
   })
 
+  it('renders pipe-less GFM tables as real tables', () => {
+    render(
+      <SafeMarkdown
+        content={'项目 | 状态\n--- | ---\n翻译 | 完成'}
+        onOpenExternal={() => undefined}
+      />
+    )
+
+    expect(screen.getByRole('table')).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: '项目' })).toBeInTheDocument()
+    expect(screen.getByRole('cell', { name: '完成' })).toBeInTheDocument()
+  })
+
   it('renders headings, ordered and unordered lists, blockquotes and fenced code', () => {
     render(
       <SafeMarkdown

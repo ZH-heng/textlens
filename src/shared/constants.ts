@@ -50,6 +50,8 @@ export const DEFAULT_PROVIDER_NAME = 'OpenAI Compatible'
 /** @deprecated Models now live under providers. */
 export const DEFAULT_MODEL = ''
 export const DEFAULT_CAPTURE_SHORTCUT = ''
+/** Global shortcut that toggles the selection assistant on/off (empty = unset). */
+export const DEFAULT_ENABLE_SHORTCUT = ''
 
 export const DEFAULT_LOCALE = 'zh-CN' as const
 export const DEFAULT_TRANSLATION_PAIR = {

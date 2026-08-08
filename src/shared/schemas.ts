@@ -518,6 +518,7 @@ const commonSettingsShape = {
   version: z.literal(SETTINGS_VERSION),
   enabled: z.boolean(),
   captureShortcut: captureShortcutSchema,
+  enableShortcut: captureShortcutSchema,
   locale: supportedLocaleSchema,
   translate: translationSettingsSchema,
   toolbar: toolbarSettingsSchema,
@@ -577,6 +578,7 @@ export const settingsUpdateSchema = z
   .object({
     enabled: z.boolean().optional(),
     captureShortcut: captureShortcutSchema.optional(),
+    enableShortcut: captureShortcutSchema.optional(),
     locale: supportedLocaleSchema.optional(),
     translate: translationSettingsSchema.optional(),
     toolbar: toolbarSettingsSchema.optional(),

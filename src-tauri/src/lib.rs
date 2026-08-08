@@ -28,8 +28,8 @@ static WINDOWS_RUNTIME_READY: AtomicBool = AtomicBool::new(false);
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shortcut_plugin = tauri_plugin_global_shortcut::Builder::new()
-        .with_handler(|app, _shortcut, event| {
-            runtime::handle_global_shortcut(app, event);
+        .with_handler(|app, shortcut, event| {
+            runtime::handle_global_shortcut(app, shortcut, event);
         })
         .build();
 
@@ -131,6 +131,7 @@ pub fn run() {
             runtime::request_accessibility,
             runtime::open_settings,
             runtime::take_settings_guidance,
+            runtime::set_settings_always_on_top,
             runtime::quit_app,
             runtime::toolbar_ready,
             runtime::present_toolbar,

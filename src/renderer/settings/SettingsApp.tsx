@@ -35,6 +35,7 @@ import {
   LoaderCircle,
   LockKeyhole,
   Pencil,
+  Pin,
   Plus,
   RefreshCw,
   ShieldCheck,
@@ -245,6 +246,7 @@ export function SettingsApp(): JSX.Element {
   const [operation, setOperation] = useState<Operation>(null)
   const [banner, setBanner] = useState<Banner>(null)
   const [bannerFading, setBannerFading] = useState(false)
+  const [settingsPinned, setSettingsPinned] = useState(false)
   const [dirty, setDirty] = useState(false)
   const [editor, setEditor] = useState<ActionDefinition | 'new' | null>(null)
   const [providerPendingDelete, setProviderPendingDelete] = useState<PublicProviderSettings | null>(null)
@@ -659,6 +661,21 @@ export function SettingsApp(): JSX.Element {
     }
   }
 
+  const toggleSettingsPin = useCallback(async (): Promise<void> => {
+    const next = !settingsPinned
+    setSettingsPinned(next)
+    setBanner(null)
+    try {
+      if (!window.textLens.setSettingsAlwaysOnTop) {
+        throw new Error('当前后端尚不支持固定设置窗口')
+      }
+      await window.textLens.setSettingsAlwaysOnTop(next)
+    } catch (error) {
+      setSettingsPinned(!next)
+      setBanner({ kind: 'error', text: getErrorMessage(error, '无法切换窗口置顶') })
+    }
+  }, [settingsPinned])
+
   const addProvider = (): void => {
     const id = createId('provider')
     const provider: PublicProviderSettings = {
@@ -988,6 +1005,16 @@ export function SettingsApp(): JSX.Element {
 
   return (
     <main className="settings-page settings-page--shell">
+      <button
+        type="button"
+        className={`settings-pin-window ${settingsPinned ? 'is-pinned' : ''}`}
+        aria-pressed={settingsPinned}
+        title={settingsPinned ? '取消固定窗口' : '固定窗口'}
+        onClick={() => void toggleSettingsPin()}
+      >
+        <Pin size={15} aria-hidden="true" />
+        <span>{settingsPinned ? '已固定' : '固定窗口'}</span>
+      </button>
       <aside className="settings-shell__nav">
         <header className="settings-hero">
           <div className="settings-logo" aria-hidden="true"><Sparkles size={22} /></div>
@@ -1048,6 +1075,48 @@ export function SettingsApp(): JSX.Element {
                     checked={draft.enabled}
                     onChange={(enabled) => changeDraft((current) => ({ ...current, enabled }))}
                   />
+                  <div className="setting-row setting-row--stackable">
+                    <div>
+                      <strong>启用/禁用快捷键</strong>
+                      <p>设置全局快捷键后，可在任意应用中一键开启或关闭划词助手；留空则不启用。</p>
+                    </div>
+                    <div className="shortcut-capture">
+                      <input
+                        className="control shortcut-control"
+                        value={draft.enableShortcut}
+                        maxLength={128}
+                        spellCheck={false}
+                        readOnly
+                        aria-label="启用划词助手快捷键"
+                        placeholder="点击后按下组合键"
+                        onKeyDown={(event) => {
+                          if (event.key === 'Tab') return
+                          event.preventDefault()
+                          event.stopPropagation()
+                          if (event.key === 'Backspace' || event.key === 'Delete') {
+                            changeDraft((current) => ({ ...current, enableShortcut: '' }))
+                            return
+                          }
+                          if (event.key === 'Escape') {
+                            event.currentTarget.blur()
+                            return
+                          }
+                          const shortcut = formatKeyboardEventToTauriShortcut(event)
+                          if (!shortcut) return
+                          changeDraft((current) => ({ ...current, enableShortcut: shortcut }))
+                        }}
+                      />
+                      {draft.enableShortcut.trim() !== '' && (
+                        <button
+                          className="button button--ghost shortcut-clear"
+                          type="button"
+                          onClick={() => changeDraft((current) => ({ ...current, enableShortcut: '' }))}
+                        >
+                          清除
+                        </button>
+                      )}
+                    </div>
+                  </div>
                   <div className="setting-row setting-row--stackable">
                     <div><strong>触发方式</strong><p>「划词后」自动弹出工具栏；「快捷键」仅在按下组合键时捕获选区。</p></div>
                     <div className="segmented-control" role="radiogroup" aria-label="触发方式">

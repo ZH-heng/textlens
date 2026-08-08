@@ -99,6 +99,13 @@ export function buildSettingsUpdate(settings: PublicSettings):
       message: '快捷键触发模式需要设置捕获快捷键'
     }
   }
+  const enableShortcut = settings.enableShortcut.trim()
+  if (!isValidTauriGlobalShortcut(enableShortcut)) {
+    return {
+      valid: false,
+      message: '启用/禁用快捷键格式无效，请使用例如 CommandOrControl+Shift+E 的格式'
+    }
+  }
 
   for (const provider of settings.providers) {
     const validation = validateOpenAiBaseUrl(provider.baseUrl.trim())
@@ -136,6 +143,7 @@ export function buildSettingsUpdate(settings: PublicSettings):
   const candidate: SettingsUpdate = {
     enabled: settings.enabled,
     captureShortcut,
+    enableShortcut,
     locale: settings.locale,
     translate: settings.translate,
     toolbar: settings.toolbar,

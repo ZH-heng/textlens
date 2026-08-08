@@ -17,7 +17,7 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WebviewWindow, WindowEvent,
 };
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutEvent, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 use tokio::sync::oneshot;
 use url::{Host, Url};
 use uuid::Uuid;
@@ -513,6 +513,8 @@ pub struct RuntimeState {
     result_reveals: Mutex<HashMap<String, ResultRevealHandshake>>,
     shortcut_switch: Mutex<()>,
     registered_shortcut: Mutex<String>,
+    enable_shortcut_switch: Mutex<()>,
+    registered_enable_shortcut: Mutex<String>,
     runtime_diagnostics: Mutex<RuntimeDiagnostics>,
     pending_result_sizes: Mutex<HashMap<String, PendingResultSize>>,
     resize_revision: AtomicU64,
@@ -543,6 +545,8 @@ impl RuntimeState {
             result_reveals: Mutex::new(HashMap::new()),
             shortcut_switch: Mutex::new(()),
             registered_shortcut: Mutex::new(String::new()),
+            enable_shortcut_switch: Mutex::new(()),
+            registered_enable_shortcut: Mutex::new(String::new()),
             runtime_diagnostics: Mutex::new(RuntimeDiagnostics::default()),
             pending_result_sizes: Mutex::new(HashMap::new()),
             resize_revision: AtomicU64::new(0),
@@ -883,6 +887,10 @@ impl RuntimeState {
             // the replayable source of truth for windows opened afterwards.
             let _ = app.emit(SHORTCUT_ERROR_EVENT, error);
         }
+        let enable_requested = settings.enable_shortcut.trim().to_owned();
+        if let Err(error) = self.switch_enable_shortcut(app, &enable_requested) {
+            let _ = app.emit(SHORTCUT_ERROR_EVENT, error);
+        }
     }
 
     fn switch_shortcut(&self, app: &AppHandle, requested: &str) -> Result<String, String> {
@@ -905,6 +913,39 @@ impl RuntimeState {
                 return Err(GLOBAL_SHORTCUT_ERROR.to_owned());
             }
             *self.registered_shortcut.lock() = requested.to_owned();
+            Ok(current)
+        })();
+        self.set_shortcut_error(shortcut_registration_diagnostic(outcome.is_err()));
+        outcome
+    }
+
+    /// Registers the global shortcut that toggles the selection assistant
+    /// on/off, independent of the capture shortcut.
+    fn switch_enable_shortcut(&self, app: &AppHandle, requested: &str) -> Result<String, String> {
+        let _transaction = self.enable_shortcut_switch.lock();
+        let requested = requested.trim();
+        let outcome = (|| {
+            let current = self.registered_enable_shortcut.lock().clone();
+            if current == requested {
+                return Ok(current);
+            }
+            if !requested.is_empty() {
+                app.global_shortcut()
+                    .register(requested)
+                    .map_err(|_| GLOBAL_SHORTCUT_ERROR.to_owned())?;
+            }
+            if !current.is_empty()
+                && app
+                    .global_shortcut()
+                    .unregister(current.as_str())
+                    .is_err()
+            {
+                if !requested.is_empty() {
+                    let _ = app.global_shortcut().unregister(requested);
+                }
+                return Err(GLOBAL_SHORTCUT_ERROR.to_owned());
+            }
+            *self.registered_enable_shortcut.lock() = requested.to_owned();
             Ok(current)
         })();
         self.set_shortcut_error(shortcut_registration_diagnostic(outcome.is_err()));
@@ -1029,6 +1070,10 @@ impl RuntimeState {
         let shortcut = std::mem::take(&mut *self.registered_shortcut.lock());
         if !shortcut.is_empty() {
             let _ = app.global_shortcut().unregister(shortcut.as_str());
+        }
+        let enable_shortcut = std::mem::take(&mut *self.registered_enable_shortcut.lock());
+        if !enable_shortcut.is_empty() {
+            let _ = app.global_shortcut().unregister(enable_shortcut.as_str());
         }
 
         // On Windows this sends Shutdown to the UIA/OLE STA worker and only
@@ -1593,15 +1638,41 @@ pub fn start_permission_poll(app: AppHandle) {
     });
 }
 
-pub fn handle_global_shortcut(app: &AppHandle, event: ShortcutEvent) {
-    if event.state == ShortcutState::Pressed {
-        let state = app.state::<RuntimeState>();
-        if state.shutting_down.load(Ordering::Acquire) {
-            return;
-        }
-        let settings = state.settings.get_settings();
-        if settings.enabled && settings.trigger.mode == TriggerMode::Shortcut {
-            state.capture_current(app);
+pub fn handle_global_shortcut(app: &AppHandle, shortcut: &Shortcut, event: ShortcutEvent) {
+    if event.state != ShortcutState::Pressed {
+        return;
+    }
+    let state = app.state::<RuntimeState>();
+    if state.shutting_down.load(Ordering::Acquire) {
+        return;
+    }
+    let settings = state.settings.get_settings();
+    let enable_shortcut = settings.enable_shortcut.trim();
+    if !enable_shortcut.is_empty()
+        && enable_shortcut
+            .parse::<Shortcut>()
+            .is_ok_and(|expected| expected.id() == shortcut.id())
+    {
+        state.toggle_enabled(app);
+        return;
+    }
+    if settings.enabled && settings.trigger.mode == TriggerMode::Shortcut {
+        state.capture_current(app);
+    }
+}
+
+impl RuntimeState {
+    /// Global-shortcut handler: flips the selection assistant between enabled
+    /// and disabled, persisting the change through the normal settings path so
+    /// the tray, capture monitor and UI all stay consistent.
+    fn toggle_enabled(&self, app: &AppHandle) {
+        let next = !self.settings.get_settings().enabled;
+        match self
+            .settings
+            .update(SettingsUpdate { enabled: Some(next), ..Default::default() })
+        {
+            Ok(public) => self.after_settings_changed(app, &public),
+            Err(error) => eprintln!("[shortcut] failed to toggle enabled: {error}"),
         }
     }
 }
@@ -1758,6 +1829,15 @@ pub fn take_settings_guidance(
 ) -> Result<Option<SettingsGuidance>, String> {
     ensure_settings_caller(&window)?;
     Ok(state.pending_settings_guidance.lock().take())
+}
+
+#[tauri::command]
+pub fn set_settings_always_on_top(
+    window: WebviewWindow,
+    pinned: bool,
+) -> Result<(), String> {
+    ensure_settings_caller(&window)?;
+    window.set_always_on_top(pinned).map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "windows")]

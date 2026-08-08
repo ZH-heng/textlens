@@ -182,6 +182,9 @@ impl SettingsRepository {
             if let Some(value) = update.capture_shortcut {
                 settings.capture_shortcut = value;
             }
+            if let Some(value) = update.enable_shortcut {
+                settings.enable_shortcut = value;
+            }
             if let Some(value) = update.locale {
                 settings.locale = value;
             }
@@ -227,6 +230,7 @@ impl SettingsRepository {
                 version: SETTINGS_VERSION,
                 enabled: public.enabled,
                 capture_shortcut: public.capture_shortcut,
+                enable_shortcut: public.enable_shortcut,
                 locale: public.locale,
                 translate: public.translate,
                 toolbar: public.toolbar,
@@ -990,6 +994,7 @@ fn migrate_v1(value: serde_json::Value) -> Result<LoadedSettings, SettingsError>
         version: SETTINGS_VERSION,
         enabled: legacy.enabled,
         capture_shortcut: legacy.capture_shortcut,
+        enable_shortcut: String::new(),
         locale: legacy.locale,
         translate: legacy.translate,
         toolbar: Default::default(),

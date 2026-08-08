@@ -1,6 +1,7 @@
 import {
   BUILTIN_SEARCH_ENGINE_IDS,
   DEFAULT_CAPTURE_SHORTCUT,
+  DEFAULT_ENABLE_SHORTCUT,
   DEFAULT_APPLICATION_SETTINGS,
   DEFAULT_FILTER_SETTINGS,
   DEFAULT_LOCALE,
@@ -205,6 +206,7 @@ export const DEFAULT_APP_SETTINGS: Readonly<AppSettings> = Object.freeze(
     version: SETTINGS_VERSION,
     enabled: true,
     captureShortcut: DEFAULT_CAPTURE_SHORTCUT,
+    enableShortcut: DEFAULT_ENABLE_SHORTCUT,
     locale: DEFAULT_LOCALE,
     translate: DEFAULT_TRANSLATION_PAIR,
     toolbar: DEFAULT_TOOLBAR_SETTINGS,
@@ -231,6 +233,7 @@ export function toPublicSettings(settings: AppSettings): PublicSettings {
     version: settings.version,
     enabled: settings.enabled,
     captureShortcut: settings.captureShortcut,
+    enableShortcut: settings.enableShortcut,
     locale: settings.locale,
     translate: settings.translate,
     toolbar: settings.toolbar,
@@ -460,7 +463,15 @@ function migratePromptDefaultsCandidate(candidate: UnknownRecord): UnknownRecord
     : candidate.actions
   return migrateSearchEnginesCandidate(
     migrateBuiltinSearchActionsCandidate(
-      migrateQuoteToAskActions({ ...candidate, version: SETTINGS_VERSION, actions })
+      migrateQuoteToAskActions({
+        ...candidate,
+        version: SETTINGS_VERSION,
+        enableShortcut:
+          typeof candidate.enableShortcut === 'string'
+            ? candidate.enableShortcut
+            : DEFAULT_ENABLE_SHORTCUT,
+        actions
+      })
     )
   )
 }
@@ -581,6 +592,8 @@ function migrateLegacyCommon(input: UnknownRecord) {
     enabled: typeof input.enabled === 'boolean' ? input.enabled : defaults.enabled,
     captureShortcut:
       typeof input.captureShortcut === 'string' ? input.captureShortcut : defaults.captureShortcut,
+    enableShortcut:
+      typeof input.enableShortcut === 'string' ? input.enableShortcut : defaults.enableShortcut,
     locale: input.locale ?? defaults.locale,
     translate: input.translate ?? defaults.translate,
     toolbar: input.toolbar ?? defaults.toolbar,

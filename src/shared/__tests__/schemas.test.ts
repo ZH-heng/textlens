@@ -399,6 +399,12 @@ describe('settings schemas and defaults', () => {
     expect(current.result.dismissMode).toBe('manual')
   })
 
+  it('fills the enable/disable shortcut default when upgrading existing settings', () => {
+    const { enableShortcut: _legacy, ...withoutEnableShortcut } = DEFAULT_PUBLIC_SETTINGS
+    const migrated = migratePublicSettings({ ...withoutEnableShortcut, version: 11 })
+    expect(migrated.enableShortcut).toBe('')
+  })
+
   it('preserves v2 providers, models and actions during migration', () => {
     const secondProvider = {
       id: 'second-provider',

@@ -487,6 +487,50 @@ describe('SettingsApp provider deletion', () => {
     expect(input).toHaveValue('')
   })
 
+  it('records and saves the assistant enable/disable shortcut', async () => {
+    const updateSettings = vi.fn(async (update: SettingsUpdate) => ({
+      ...DEFAULT_PUBLIC_SETTINGS,
+      ...update,
+      enableShortcut: update.enableShortcut ?? DEFAULT_PUBLIC_SETTINGS.enableShortcut
+    }))
+    window.textLens = {
+      getSettings: vi.fn(async () => DEFAULT_PUBLIC_SETTINGS),
+      updateSettings,
+      getAccessibilityStatus: vi.fn(async () => ({
+        platform: 'darwin' as const,
+        trusted: true,
+        canRequest: true,
+        available: true,
+        diagnostics: {}
+      })),
+      requestAccessibility: vi.fn(),
+      onSettingsChanged: vi.fn(() => () => undefined)
+    } as unknown as WindowTextLensApi
+
+    render(<SettingsApp />)
+    const input = await screen.findByLabelText('启用划词助手快捷键')
+    expect(input).toHaveValue('')
+
+    fireEvent.keyDown(input, {
+      key: 'e',
+      code: 'KeyE',
+      metaKey: true,
+      shiftKey: true,
+      bubbles: true
+    })
+    const platform = `${navigator.platform ?? ''} ${navigator.userAgent ?? ''}`.toLowerCase()
+    const isMac = platform.includes('mac') || platform.includes('darwin')
+    const expected = isMac ? 'CommandOrControl+Shift+E' : 'Super+Shift+E'
+    expect(input).toHaveValue(expected)
+
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1))
+    expect(updateSettings.mock.calls[0]?.[0]).toMatchObject({ enableShortcut: expected })
+
+    fireEvent.keyDown(input, { key: 'Backspace', code: 'Backspace', bubbles: true })
+    expect(input).toHaveValue('')
+  })
+
   it('refreshes the replayable shortcut diagnostic immediately after save fails', async () => {
     const updateSettings = vi.fn(async () => {
       throw new Error('无法注册快捷键')
@@ -1213,5 +1257,45 @@ describe('SettingsApp provider deletion', () => {
     expect(
       (updateSettings.mock.calls[0]?.[0].providers?.[0]?.models ?? []).map((model) => model.id)
     ).toEqual(['o3-mini', 'gpt-4o-mini'])
+  })
+})
+
+describe('SettingsApp window pin', () => {
+  it('pins and unpins the settings window through the native bridge', async () => {
+    const setSettingsAlwaysOnTop = vi.fn().mockResolvedValue(undefined)
+    installDefaultBridge({ setSettingsAlwaysOnTop })
+
+    render(<SettingsApp />)
+    const pinButton = await screen.findByRole('button', { name: /固定窗口/ })
+    expect(pinButton).toHaveAttribute('aria-pressed', 'false')
+
+    fireEvent.click(pinButton)
+    await waitFor(() => expect(setSettingsAlwaysOnTop).toHaveBeenCalledWith(true))
+    expect(screen.getByRole('button', { name: /已固定/ })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /已固定/ }))
+    await waitFor(() => expect(setSettingsAlwaysOnTop).toHaveBeenCalledWith(false))
+    expect(screen.getByRole('button', { name: /固定窗口/ })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    )
+  })
+
+  it('restores the previous state and shows an error when the bridge call fails', async () => {
+    const setSettingsAlwaysOnTop = vi.fn().mockRejectedValue(new Error())
+    installDefaultBridge({ setSettingsAlwaysOnTop })
+
+    render(<SettingsApp />)
+    fireEvent.click(await screen.findByRole('button', { name: /固定窗口/ }))
+
+    await waitFor(() => expect(setSettingsAlwaysOnTop).toHaveBeenCalledWith(true))
+    expect(screen.getByRole('button', { name: /固定窗口/ })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    )
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法切换窗口置顶')
   })
 })

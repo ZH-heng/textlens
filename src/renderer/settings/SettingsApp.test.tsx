@@ -1215,3 +1215,43 @@ describe('SettingsApp provider deletion', () => {
     ).toEqual(['o3-mini', 'gpt-4o-mini'])
   })
 })
+
+describe('SettingsApp window pin', () => {
+  it('pins and unpins the settings window through the native bridge', async () => {
+    const setSettingsAlwaysOnTop = vi.fn().mockResolvedValue(undefined)
+    installDefaultBridge({ setSettingsAlwaysOnTop })
+
+    render(<SettingsApp />)
+    const pinButton = await screen.findByRole('button', { name: /固定窗口/ })
+    expect(pinButton).toHaveAttribute('aria-pressed', 'false')
+
+    fireEvent.click(pinButton)
+    await waitFor(() => expect(setSettingsAlwaysOnTop).toHaveBeenCalledWith(true))
+    expect(screen.getByRole('button', { name: /已固定/ })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /已固定/ }))
+    await waitFor(() => expect(setSettingsAlwaysOnTop).toHaveBeenCalledWith(false))
+    expect(screen.getByRole('button', { name: /固定窗口/ })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    )
+  })
+
+  it('restores the previous state and shows an error when the bridge call fails', async () => {
+    const setSettingsAlwaysOnTop = vi.fn().mockRejectedValue(new Error())
+    installDefaultBridge({ setSettingsAlwaysOnTop })
+
+    render(<SettingsApp />)
+    fireEvent.click(await screen.findByRole('button', { name: /固定窗口/ }))
+
+    await waitFor(() => expect(setSettingsAlwaysOnTop).toHaveBeenCalledWith(true))
+    expect(screen.getByRole('button', { name: /固定窗口/ })).toHaveAttribute(
+      'aria-pressed',
+      'false'
+    )
+    expect(await screen.findByRole('alert')).toHaveTextContent('无法切换窗口置顶')
+  })
+})

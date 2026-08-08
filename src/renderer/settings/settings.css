@@ -22,6 +22,46 @@ body {
   margin: 0 auto;
 }
 
+.settings-pin-window {
+  position: fixed;
+  top: 12px;
+  right: 14px;
+  z-index: 1001;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12.5px;
+  font-weight: 560;
+  color: var(--text-secondary, #64748b);
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    color 120ms ease,
+    background 120ms ease,
+    border-color 120ms ease;
+}
+
+.settings-pin-window:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.settings-pin-window:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.settings-pin-window.is-pinned {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+}
+
 .settings-shell__nav {
   position: sticky;
   top: 0;

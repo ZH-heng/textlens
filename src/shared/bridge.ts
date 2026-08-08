@@ -130,6 +130,8 @@ export interface WindowTextLensApi {
   openSettings?(options?: OpenSettingsOptions): Promise<void>
   /** Settings window only: consume one-shot open guidance (focus + notice). */
   takeSettingsGuidance?(): Promise<SettingsGuidance | null>
+  /** Settings window only: pin the window so it stays on top of other apps. */
+  setSettingsAlwaysOnTop?(pinned: boolean): Promise<void>
   hideResult?(sessionId?: string): Promise<void>
   closeResult(sessionId?: string): Promise<void>
   quitApp?(): Promise<void>

@@ -28,6 +28,7 @@ export const TAURI_COMMANDS = {
   commitResultReveal: 'commit_result_reveal',
   failResultReveal: 'fail_result_reveal',
   setResultPinned: 'set_result_pinned',
+  setSettingsAlwaysOnTop: 'set_settings_always_on_top',
   setResultPointerInside: 'set_result_pointer_inside',
   showResultSelection: 'show_result_selection',
   hideResultSelection: 'hide_result_selection',

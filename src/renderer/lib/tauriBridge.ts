@@ -443,6 +443,9 @@ export function installTauriBridge(): void {
       if (value == null) return null
       return parseSettingsGuidance(value)
     },
+    async setSettingsAlwaysOnTop(pinned: boolean) {
+      await invoke(TAURI_COMMANDS.setSettingsAlwaysOnTop, { pinned })
+    },
     async hideResult(sessionId?: string) {
       await invoke(TAURI_COMMANDS.hideResult, { sessionId: requiredSessionId(sessionId) })
     },

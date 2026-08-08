@@ -1760,6 +1760,15 @@ pub fn take_settings_guidance(
     Ok(state.pending_settings_guidance.lock().take())
 }
 
+#[tauri::command]
+pub fn set_settings_always_on_top(
+    window: WebviewWindow,
+    pinned: bool,
+) -> Result<(), String> {
+    ensure_settings_caller(&window)?;
+    window.set_always_on_top(pinned).map_err(|error| error.to_string())
+}
+
 #[cfg(target_os = "windows")]
 fn request_settings_close_confirmation(app: &AppHandle) -> bool {
     app.emit_to(SETTINGS_LABEL, SETTINGS_CLOSE_REQUEST_EVENT, ())

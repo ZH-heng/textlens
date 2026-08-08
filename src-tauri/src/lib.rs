@@ -131,6 +131,7 @@ pub fn run() {
             runtime::request_accessibility,
             runtime::open_settings,
             runtime::take_settings_guidance,
+            runtime::set_settings_always_on_top,
             runtime::quit_app,
             runtime::toolbar_ready,
             runtime::present_toolbar,

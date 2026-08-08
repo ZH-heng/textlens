@@ -35,6 +35,7 @@ import {
   LoaderCircle,
   LockKeyhole,
   Pencil,
+  Pin,
   Plus,
   RefreshCw,
   ShieldCheck,
@@ -245,6 +246,7 @@ export function SettingsApp(): JSX.Element {
   const [operation, setOperation] = useState<Operation>(null)
   const [banner, setBanner] = useState<Banner>(null)
   const [bannerFading, setBannerFading] = useState(false)
+  const [settingsPinned, setSettingsPinned] = useState(false)
   const [dirty, setDirty] = useState(false)
   const [editor, setEditor] = useState<ActionDefinition | 'new' | null>(null)
   const [providerPendingDelete, setProviderPendingDelete] = useState<PublicProviderSettings | null>(null)
@@ -659,6 +661,21 @@ export function SettingsApp(): JSX.Element {
     }
   }
 
+  const toggleSettingsPin = useCallback(async (): Promise<void> => {
+    const next = !settingsPinned
+    setSettingsPinned(next)
+    setBanner(null)
+    try {
+      if (!window.textLens.setSettingsAlwaysOnTop) {
+        throw new Error('当前后端尚不支持固定设置窗口')
+      }
+      await window.textLens.setSettingsAlwaysOnTop(next)
+    } catch (error) {
+      setSettingsPinned(!next)
+      setBanner({ kind: 'error', text: getErrorMessage(error, '无法切换窗口置顶') })
+    }
+  }, [settingsPinned])
+
   const addProvider = (): void => {
     const id = createId('provider')
     const provider: PublicProviderSettings = {
@@ -988,6 +1005,16 @@ export function SettingsApp(): JSX.Element {
 
   return (
     <main className="settings-page settings-page--shell">
+      <button
+        type="button"
+        className={`settings-pin-window ${settingsPinned ? 'is-pinned' : ''}`}
+        aria-pressed={settingsPinned}
+        title={settingsPinned ? '取消固定窗口' : '固定窗口'}
+        onClick={() => void toggleSettingsPin()}
+      >
+        <Pin size={15} aria-hidden="true" />
+        <span>{settingsPinned ? '已固定' : '固定窗口'}</span>
+      </button>
       <aside className="settings-shell__nav">
         <header className="settings-hero">
           <div className="settings-logo" aria-hidden="true"><Sparkles size={22} /></div>

@@ -899,7 +899,13 @@ static bool CaptureSelection(
             std::this_thread::sleep_for(std::chrono::milliseconds(12));
             found = ReadViaAccessibility(application, info);
         }
-        if (!found && ShouldUseClipboardFallback(info.bundleId, info.appName)) {
+        // The clipboard fallback posts a synthetic Cmd+C to the frontmost app
+        // to read its selection. That replaces whatever the user just copied
+        // (e.g. another translator's auto-copied OCR result), so only allow it
+        // for an explicit user-triggered capture (capture shortcut / tray),
+        // never for automatic drag/double-click/keyboard selection detection.
+        if (!found && trigger == Trigger::Manual &&
+            ShouldUseClipboardFallback(info.bundleId, info.appName)) {
             found = ReadViaClipboard(application, info);
         }
         if (!found || IsBlank(info.text)) {

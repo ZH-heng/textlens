@@ -1,3 +1,5 @@
+
+
 # TextLens
 
 [English](./README.en.md) | **中文**
@@ -85,7 +87,7 @@ macOS 使用系统自带的 WKWebView；Windows 使用 Microsoft Edge WebView2 R
 | [react-markdown](https://github.com/remarkjs/react-markdown) | 安全 Markdown 渲染 | MIT |
 | [remark-gfm](https://github.com/remarkjs/remark-gfm) | GFM 表格、任务列表等语法 | MIT |
 | [remark-math](https://github.com/remarkjs/remark-math) | Markdown 数学公式语法 | MIT |
-| [rehype-katex](https://github.com/remarkjs/remark-math/tree/main/packages/rehype-katex) / [KaTeX](https://github.com/KaTeX/KaTeX) | 数学公式渲染 | MIT |
+| [rehype-katex](https://github.com/remarkjs/rehype-katex) / [KaTeX](https://github.com/KaTeX/KaTeX) | 数学公式渲染 | MIT |
 | [Zod](https://github.com/colinhacks/zod) | 前端数据校验 | MIT |
 | [reqwest](https://github.com/seanmonstar/reqwest) | OpenAI-compatible HTTP 与 SSE 请求 | MIT OR Apache-2.0 |
 | [Tokio](https://github.com/tokio-rs/tokio) | Rust 异步运行时 | MIT |

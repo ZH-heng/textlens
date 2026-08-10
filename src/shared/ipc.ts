@@ -13,6 +13,11 @@ export const TAURI_COMMANDS = {
   testProviderConnection: 'test_provider_connection',
   listProviderModels: 'list_provider_models',
   syncProviderModels: 'sync_provider_models',
+  saveHistoryEntry: 'save_history_entry',
+  listHistory: 'list_history',
+  deleteHistory: 'delete_history',
+  clearHistory: 'clear_history',
+  exportHistory: 'export_history',
   getAccessibilityStatus: 'get_accessibility_status',
   requestAccessibility: 'request_accessibility',
   toolbarReady: 'toolbar_ready',
@@ -51,7 +56,8 @@ export const TAURI_EVENTS = {
   settingsCloseRequested: 'textlens:settings-close-requested',
   settingsGuidance: 'textlens:settings-guidance',
   toolbarPointer: 'textlens:toolbar-pointer',
-  toolbarDismissed: 'textlens:toolbar-dismissed'
+  toolbarDismissed: 'textlens:toolbar-dismissed',
+  historyChanged: 'textlens:history-changed'
 } as const
 
 export type TauriCommand = (typeof TAURI_COMMANDS)[keyof typeof TAURI_COMMANDS]

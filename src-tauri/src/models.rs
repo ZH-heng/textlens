@@ -3,6 +3,14 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+fn default_history_enabled() -> bool {
+    true
+}
+
+fn default_history_retention() -> String {
+    "30m".to_owned()
+}
+
 pub const SETTINGS_VERSION: u8 = 12;
 pub const TEXT_PLACEHOLDER: &str = "{{text}}";
 pub const OUTPUT_LANGUAGE_PLACEHOLDER: &str = "{{language}}";
@@ -638,6 +646,10 @@ pub struct AppSettings {
     pub version: u8,
     pub enabled: bool,
     pub capture_shortcut: String,
+    #[serde(default = "default_history_enabled")]
+    pub history_enabled: bool,
+    #[serde(default = "default_history_retention")]
+    pub history_retention: String,
     pub locale: Locale,
     pub translate: TranslationSettings,
     pub toolbar: ToolbarSettings,
@@ -659,6 +671,8 @@ pub struct PublicSettings {
     pub version: u8,
     pub enabled: bool,
     pub capture_shortcut: String,
+    pub history_enabled: bool,
+    pub history_retention: String,
     pub locale: Locale,
     pub translate: TranslationSettings,
     pub toolbar: ToolbarSettings,
@@ -681,6 +695,8 @@ impl PublicSettings {
             version: SETTINGS_VERSION,
             enabled: settings.enabled,
             capture_shortcut: settings.capture_shortcut.clone(),
+            history_enabled: settings.history_enabled,
+            history_retention: settings.history_retention.clone(),
             locale: settings.locale,
             translate: settings.translate.clone(),
             toolbar: settings.toolbar.clone(),
@@ -709,6 +725,8 @@ impl PublicSettings {
 pub struct SettingsUpdate {
     pub enabled: Option<bool>,
     pub capture_shortcut: Option<String>,
+    pub history_enabled: Option<bool>,
+    pub history_retention: Option<String>,
     pub locale: Option<Locale>,
     pub translate: Option<TranslationSettings>,
     pub toolbar: Option<ToolbarSettings>,
@@ -975,6 +993,8 @@ impl Default for AppSettings {
             version: SETTINGS_VERSION,
             enabled: true,
             capture_shortcut: String::new(),
+            history_enabled: true,
+            history_retention: "30m".to_owned(),
             locale: Locale::ZhCn,
             translate: TranslationSettings::default(),
             toolbar: ToolbarSettings::default(),

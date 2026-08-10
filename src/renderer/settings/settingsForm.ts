@@ -136,6 +136,8 @@ export function buildSettingsUpdate(settings: PublicSettings):
   const candidate: SettingsUpdate = {
     enabled: settings.enabled,
     captureShortcut,
+    historyEnabled: settings.historyEnabled,
+    historyRetention: settings.historyRetention,
     locale: settings.locale,
     translate: settings.translate,
     toolbar: settings.toolbar,

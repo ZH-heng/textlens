@@ -554,10 +554,40 @@ export const selectionCaptureSettingsSchema = z
   })
 export type SelectionCaptureSettings = z.infer<typeof selectionCaptureSettingsSchema>
 
+export const historyRetentionSchema = z.enum(['5m', '10m', '30m', '1d', '1w', '1M', '6M', '1Y', 'forever'])
+export type HistoryRetention = z.infer<typeof historyRetentionSchema>
+
+export const historyTurnSchema = z.object({
+  role: z.string().trim().min(1).max(16),
+  content: z.string().max(2_000_000)
+}).strict()
+export type HistoryTurn = z.infer<typeof historyTurnSchema>
+
+export const historyEntrySchema = z.object({
+  id: z.string().trim().min(1).max(256),
+  savedAtMs: z.number().int().nonnegative(),
+  actionId: z.string().trim().min(1).max(128),
+  actionName: z.string().default(''),
+  actionKind: z.string().default(''),
+  providerId: z.string().max(128).optional(),
+  modelId: z.string().max(256).optional(),
+  selectionText: z.string().max(1_000_000).optional(),
+  content: z.string().max(2_000_000),
+  turns: z.array(historyTurnSchema).default([])
+}).strict()
+export type HistoryEntry = z.infer<typeof historyEntrySchema>
+
+export const historyEntryListSchema = z.array(historyEntrySchema)
+
+export const historyExportFormatSchema = z.enum(['json', 'md', 'txt', 'docx'])
+export type HistoryExportFormat = z.infer<typeof historyExportFormatSchema>
+
 const commonSettingsShape = {
   version: z.literal(SETTINGS_VERSION),
   enabled: z.boolean(),
   captureShortcut: captureShortcutSchema,
+  historyEnabled: z.boolean().default(true),
+  historyRetention: historyRetentionSchema.default('30m'),
   locale: supportedLocaleSchema,
   translate: translationSettingsSchema,
   toolbar: toolbarSettingsSchema,
@@ -621,6 +651,8 @@ export const settingsUpdateSchema = z
   .object({
     enabled: z.boolean().optional(),
     captureShortcut: captureShortcutSchema.optional(),
+    historyEnabled: z.boolean().optional(),
+    historyRetention: historyRetentionSchema.optional(),
     locale: supportedLocaleSchema.optional(),
     translate: translationSettingsSchema.optional(),
     toolbar: toolbarSettingsSchema.optional(),

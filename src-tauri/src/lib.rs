@@ -1,5 +1,6 @@
 pub mod actions;
 mod clipboard;
+mod history;
 mod local_secrets;
 pub mod models;
 mod openai_protocol;
@@ -150,6 +151,11 @@ pub fn run() {
             runtime::cancel_action,
             runtime::retry_action,
             runtime::continue_action,
+            history::save_history_entry,
+            history::list_history,
+            history::delete_history,
+            history::clear_history,
+            history::export_history,
             runtime::copy_text,
             runtime::open_external,
             runtime::hide_result,

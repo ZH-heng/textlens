@@ -37,6 +37,7 @@ import {
   detectTranslationLanguage,
   isAiActionDefinition,
   type ActionRetryOptions,
+  type HistoryEntry,
   type PublicSettings,
   type ResultSessionSnapshot,
   type TranslationLanguage
@@ -646,6 +647,51 @@ function ResultSessionApp({
       unsubscribe()
     }
   }, [sessionId])
+
+  const savedHistoryRequestsRef = useRef(new Set<string>())
+  const turnsRef = useRef(turns)
+  turnsRef.current = turns
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
+  const sessionRef = useRef(session)
+  sessionRef.current = session
+
+  // 历史保存：最终回答内容来自 actionEventStore（session 快照里的是初始内容）。
+  // 订阅事件流，在回答完成时保存一次（同一请求只保存一次）。
+  useEffect(() => {
+    const handle = (): void => {
+      const snap = getActionEventSnapshot()
+      if (snap.status !== 'completed' || !snap.content) return
+      const currentSession = sessionRef.current
+      if (!currentSession) return
+      if (!settingsRef.current?.historyEnabled) return
+      const key = `${currentSession.sessionId}:${snap.requestId}`
+      if (savedHistoryRequestsRef.current.has(key)) return
+      savedHistoryRequestsRef.current.add(key)
+      const action = settingsRef.current?.actions.find((item) => item.id === snap.actionId)
+      const entry: HistoryEntry = {
+        id: typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now()}-${key}`,
+        savedAtMs: Date.now(),
+        actionId: snap.actionId ?? currentSession.actionId,
+        actionName: action?.name ?? '',
+        actionKind: action?.kind ?? '',
+        providerId: currentSession.providerId,
+        modelId: currentSession.modelId,
+        selectionText: currentSession.selection?.text?.trim() || undefined,
+        content: snap.content,
+        turns: turnsRef.current.map((turn) => ({ role: turn.role, content: turn.content }))
+      }
+      // 稍等对话轮次落定后再写入
+      window.setTimeout(() => {
+        void window.textLens.saveHistoryEntry(entry).catch(() => {})
+      }, 300)
+    }
+    const unsubscribe = subscribeToActionEvents(handle)
+    handle()
+    return unsubscribe
+  }, [])
 
   const consumeBootstrap = useCallback(async (
     start: () => Promise<ResultSessionSnapshot | null>,

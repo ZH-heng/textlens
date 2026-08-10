@@ -57,6 +57,8 @@ import {
   searchEngineDisplayName,
   type AccessibilityStatus,
   type ActionDefinition,
+  type HistoryEntry,
+  type HistoryRetention,
   type PublicProviderSettings,
   type PublicSettings,
   type ProviderModel,
@@ -102,6 +104,7 @@ type SettingsSectionId =
   | 'result'
   | 'capture'
   | 'filter'
+  | 'history'
 
 const SETTINGS_SECTIONS: ReadonlyArray<{
   id: SettingsSectionId
@@ -142,6 +145,11 @@ const SETTINGS_SECTIONS: ReadonlyArray<{
     id: 'filter',
     label: '过滤',
     blurb: '可限制只在部分应用中启用划词，或排除干扰较多的应用。'
+  },
+  {
+    id: 'history',
+    label: '历史记录',
+    blurb: '保存 AI 回答与对话历史，可设置保留时长并批量导出。'
   }
 ]
 
@@ -272,6 +280,12 @@ export function SettingsApp(): JSX.Element {
   const [quitConfirmationOpen, setQuitConfirmationOpen] = useState(false)
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(restoredSettingsSection)
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([])
+  const [selectedHistoryIds, setSelectedHistoryIds] = useState<Set<string>>(new Set())
+  const [historyBusy, setHistoryBusy] = useState(false)
+  const [historyNotice, setHistoryNotice] = useState<string | null>(null)
+  const [exportFormat, setExportFormat] = useState<'json' | 'md' | 'txt' | 'docx'>('json')
+  const [mergeExport, setMergeExport] = useState(true)
   const activeSectionRef = useRef(activeSection)
   activeSectionRef.current = activeSection
   const dirtyRef = useRef(false)
@@ -528,6 +542,101 @@ export function SettingsApp(): JSX.Element {
       window.removeEventListener('focus', refreshAccessibility)
     }
   }, [resetProviderKeyFields, refreshRuntimeStatus])
+
+  const toggleHistorySelection = useCallback((id: string): void => {
+    setSelectedHistoryIds((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
+  const refreshHistoryPreservingSelection = useCallback(async (): Promise<void> => {
+    try {
+      const entries = await window.textLens.listHistory(draft?.historyRetention ?? '30m')
+      setHistoryEntries(entries)
+      setHistoryNotice(null)
+    } catch {
+      setHistoryNotice('读取历史记录失败')
+    }
+  }, [draft?.historyRetention])
+
+  const refreshHistory = useCallback(async (): Promise<void> => {
+    setHistoryBusy(true)
+    setHistoryNotice(null)
+    try {
+      const entries = await window.textLens.listHistory(draft?.historyRetention ?? '30m')
+      setHistoryEntries(entries)
+      setSelectedHistoryIds(new Set())
+    } catch {
+      setHistoryNotice('读取历史记录失败')
+    } finally {
+      setHistoryBusy(false)
+    }
+  }, [draft?.historyRetention])
+
+  useEffect(() => {
+    if (activeSection !== 'history') return
+    let disposed = false
+    // 进入历史记录分区时立即刷新一次（保留已勾选项）
+    void refreshHistoryPreservingSelection()
+    // 每次对话结束（有新的回答写入历史）时自动刷新
+    const unsubscribe = window.textLens.onHistoryChanged?.(() => {
+      if (!disposed) void refreshHistoryPreservingSelection()
+    })
+    return () => {
+      disposed = true
+      unsubscribe?.()
+    }
+  }, [activeSection, refreshHistoryPreservingSelection])
+
+  const exportSelectedHistory = useCallback(async (): Promise<void> => {
+    const ids = Array.from(selectedHistoryIds)
+    if (ids.length === 0) {
+      setHistoryNotice('请先勾选要导出的记录')
+      return
+    }
+    setHistoryBusy(true)
+    try {
+      const path = await window.textLens.exportHistory(ids, exportFormat, mergeExport)
+      setHistoryNotice(`已导出 ${ids.length} 条记录到：${path}`)
+    } catch {
+      setHistoryNotice('导出失败')
+    } finally {
+      setHistoryBusy(false)
+    }
+  }, [selectedHistoryIds, exportFormat, mergeExport])
+
+  const deleteSelectedHistory = useCallback(async (): Promise<void> => {
+    const ids = Array.from(selectedHistoryIds)
+    if (ids.length === 0) {
+      setHistoryNotice('请先勾选要删除的记录')
+      return
+    }
+    setHistoryBusy(true)
+    try {
+      await window.textLens.deleteHistory(ids)
+      await refreshHistory()
+    } catch {
+      setHistoryNotice('删除失败')
+    } finally {
+      setHistoryBusy(false)
+    }
+  }, [selectedHistoryIds, refreshHistory])
+
+  const clearAllHistory = useCallback(async (): Promise<void> => {
+    setHistoryBusy(true)
+    try {
+      await window.textLens.clearHistory()
+      await refreshHistory()
+      setHistoryNotice('历史记录已清空')
+    } catch {
+      setHistoryNotice('清空失败')
+    } finally {
+      setHistoryBusy(false)
+    }
+  }, [refreshHistory])
 
   const changeDraft = useCallback((updater: (current: PublicSettings) => PublicSettings): void => {
     setDraft((current) => (current ? updater(current) : current))
@@ -1219,6 +1328,102 @@ export function SettingsApp(): JSX.Element {
             </>
           )}
 
+          {activeSection === 'history' && (
+            <section className="settings-section settings-section--enter" aria-labelledby="history-title">
+              <div className="section-heading">
+                <div>
+                  <h2 id="history-title">{activeMeta.label}</h2>
+                  <p>{activeMeta.blurb}</p>
+                </div>
+              </div>
+              <div className="settings-card settings-card--rows">
+                <SettingSwitch
+                  title="保存历史"
+                  description="划词动作完成后保存 AI 回答与对话，可在本页查看、导出或删除。"
+                  checked={draft.historyEnabled}
+                  onChange={(enabled) => changeDraft((current) => ({ ...current, historyEnabled: enabled }))}
+                />
+                <div className="setting-row">
+                  <div>
+                    <strong>保留时长</strong>
+                    <p>超过该时长的历史记录会被自动清理。</p>
+                  </div>
+                  <select
+                    className="control"
+                    value={draft.historyRetention}
+                    onChange={(event) => changeDraft((current) => ({
+                      ...current,
+                      historyRetention: event.target.value as HistoryRetention
+                    }))}
+                  >
+                    <option value="5m">5 分钟</option>
+                    <option value="10m">10 分钟</option>
+                    <option value="30m">30 分钟</option>
+                    <option value="1d">1 天</option>
+                    <option value="1w">1 周</option>
+                    <option value="1M">1 个月</option>
+                    <option value="6M">6 个月</option>
+                    <option value="1Y">12 个月</option>
+                    <option value="forever">永久</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="settings-card">
+                {historyNotice && (
+                  <div className="settings-tip" role="note"><p>{historyNotice}</p></div>
+                )}
+                <div className="history-list">
+                  {historyEntries.length === 0 ? (
+                    <p className="history-empty">暂无历史记录</p>
+                  ) : (
+                    historyEntries.map((entry) => (
+                      <label key={entry.id} className="history-row">
+                        <input
+                          type="checkbox"
+                          checked={selectedHistoryIds.has(entry.id)}
+                          onChange={() => toggleHistorySelection(entry.id)}
+                        />
+                        <span className="history-row__time">{formatHistoryTime(entry.savedAtMs)}</span>
+                        <span className="history-row__name">{entry.actionName || entry.actionKind || '回答'}</span>
+                        <span className="history-row__meta">{[entry.providerId, entry.modelId].filter(Boolean).join(' · ')}</span>
+                        <span className="history-row__preview">{entry.content.slice(0, 60)}</span>
+                      </label>
+                    ))
+                  )}
+                </div>
+                <div className="history-export-options">
+                  <label className="history-export-option">
+                    <span>导出格式</span>
+                    <select
+                      className="control"
+                      value={exportFormat}
+                      onChange={(event) => setExportFormat(event.target.value as 'json' | 'md' | 'txt' | 'docx')}
+                    >
+                      <option value="json">JSON（当前格式）</option>
+                      <option value="md">Markdown</option>
+                      <option value="docx">Word</option>
+                      <option value="txt">TXT</option>
+                    </select>
+                  </label>
+                  <label className="history-export-option history-export-option--check">
+                    <input
+                      type="checkbox"
+                      checked={mergeExport}
+                      onChange={(event) => setMergeExport(event.target.checked)}
+                    />
+                    <span>合并为一个文件导出</span>
+                  </label>
+                </div>
+                <div className="history-actions">
+                  <button type="button" className="history-action-button" disabled={historyBusy} onClick={() => void exportSelectedHistory()}>导出选中</button>
+                  <button type="button" className="history-action-button" disabled={historyBusy} onClick={() => void deleteSelectedHistory()}>删除选中</button>
+                  <button type="button" className="history-action-button" disabled={historyBusy} onClick={() => void clearAllHistory()}>清空</button>
+                  <button type="button" className="history-action-button" disabled={historyBusy} onClick={() => void refreshHistoryPreservingSelection()}>刷新</button>
+                </div>
+              </div>
+            </section>
+          )}
           {activeSection === 'providers' && (
           <section className="settings-section settings-section--enter" aria-labelledby="providers-title">
         <div className="section-heading section-heading--actions">
@@ -2165,4 +2370,10 @@ function SortableActionRow({ action, enabled, dragging, onEdit, onDelete, onTogg
             <span aria-hidden="true" /><span className="sr-only">{enabled ? '停用' : '启用'}{action.name}</span></label>
         </div>
       </div>
+}
+
+function formatHistoryTime(savedAtMs: number): string {
+  const date = new Date(savedAtMs)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }

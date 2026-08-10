@@ -3,6 +3,7 @@ import { listen, type Event } from '@tauri-apps/api/event'
 
 import {
   actionStreamEventSchema,
+  historyEntryListSchema,
   providerModelSchema,
   publicSettingsSchema,
   resultReadyAckSchema,
@@ -17,6 +18,7 @@ import {
   type AccessibilityStatus,
   type ActionStreamEvent,
   type ConnectionTestResult,
+  type HistoryEntry,
   type Point,
   type ActionRetryOptions,
   type ProviderCreateInput,
@@ -267,6 +269,11 @@ export function installTauriBridge(): void {
     EVENTS.toolbarPointer,
     (payload) => toolbarPointerEventSchema.parse(payload)
   )
+  const historyChangedEvents = new EventHub<void>(
+    EVENTS.historyChanged,
+    () => undefined,
+    [0]
+  )
   const toolbarDismissedEvents = new EventHub<ToolbarDismissedEvent>(
     EVENTS.toolbarDismissed,
     (payload) => toolbarDismissedEventSchema.parse(payload)
@@ -429,6 +436,21 @@ export function installTauriBridge(): void {
         question
       }))
     },
+    async saveHistoryEntry(entry: HistoryEntry) {
+      await invoke(TAURI_COMMANDS.saveHistoryEntry, { entry })
+    },
+    async listHistory(retention: string) {
+      return historyEntryListSchema.parse(await invoke(TAURI_COMMANDS.listHistory, { retention }))
+    },
+    async deleteHistory(ids: string[]) {
+      await invoke(TAURI_COMMANDS.deleteHistory, { ids })
+    },
+    async clearHistory() {
+      await invoke(TAURI_COMMANDS.clearHistory)
+    },
+    async exportHistory(ids: string[], format: string, merge: boolean) {
+      return String(await invoke(TAURI_COMMANDS.exportHistory, { ids, format, merge }))
+    },
     async copyText(text: string) {
       await invoke(TAURI_COMMANDS.copyText, { text })
     },
@@ -472,6 +494,9 @@ export function installTauriBridge(): void {
     },
     onToolbarDismissed(listener) {
       return toolbarDismissedEvents.subscribe(listener)
+    },
+    onHistoryChanged(listener) {
+      return historyChangedEvents.subscribe(listener)
     }
   }
 

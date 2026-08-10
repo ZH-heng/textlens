@@ -1,5 +1,6 @@
 import type {
   ActionStreamEvent,
+  HistoryEntry,
   Point,
   ProviderCreateInput,
   ProviderModel,
@@ -126,6 +127,11 @@ export interface WindowTextLensApi {
   ): Promise<RunActionResult>
   continueAction?(sessionId: string, question: string): Promise<RunActionResult>
   copyText(text: string): Promise<void>
+  saveHistoryEntry(entry: HistoryEntry): Promise<void>
+  listHistory(retention: string): Promise<HistoryEntry[]>
+  deleteHistory(ids: string[]): Promise<void>
+  clearHistory(): Promise<void>
+  exportHistory(ids: string[], format: string, merge: boolean): Promise<string>
   openExternal(url: string): Promise<void>
   openSettings?(options?: OpenSettingsOptions): Promise<void>
   /** Settings window only: consume one-shot open guidance (focus + notice). */
@@ -148,6 +154,8 @@ export interface WindowTextLensApi {
    * Optional so a renderer can still hot-reload against an older backend.
    */
   onToolbarDismissed?(listener: (payload: ToolbarDismissedEvent) => void): Unsubscribe
+  /** 历史记录发生变化（有新回答保存）时触发。 */
+  onHistoryChanged?(listener: () => void): Unsubscribe
 }
 
 declare global {

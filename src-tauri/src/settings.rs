@@ -182,6 +182,12 @@ impl SettingsRepository {
             if let Some(value) = update.capture_shortcut {
                 settings.capture_shortcut = value;
             }
+            if let Some(value) = update.history_enabled {
+                settings.history_enabled = value;
+            }
+            if let Some(value) = update.history_retention {
+                settings.history_retention = value;
+            }
             if let Some(value) = update.locale {
                 settings.locale = value;
             }
@@ -230,6 +236,8 @@ impl SettingsRepository {
                 version: SETTINGS_VERSION,
                 enabled: public.enabled,
                 capture_shortcut: public.capture_shortcut,
+                history_enabled: public.history_enabled,
+                history_retention: public.history_retention.clone(),
                 locale: public.locale,
                 translate: public.translate,
                 toolbar: public.toolbar,
@@ -1010,6 +1018,8 @@ fn migrate_v1(value: serde_json::Value) -> Result<LoadedSettings, SettingsError>
         version: SETTINGS_VERSION,
         enabled: legacy.enabled,
         capture_shortcut: legacy.capture_shortcut,
+        history_enabled: true,
+        history_retention: "30m".to_owned(),
         locale: legacy.locale,
         translate: legacy.translate,
         toolbar: Default::default(),

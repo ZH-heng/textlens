@@ -7,7 +7,10 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
 const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 const tauriConfig = JSON.parse(readFileSync(join(root, 'src-tauri/tauri.conf.json'), 'utf8'))
 const productName = tauriConfig.productName ?? packageJson.productName ?? 'TextLens'
-const expectedVersion = tauriConfig.version ?? packageJson.version
+// TEXTLENS_INSTALLER_VERSION 由 apply-installer-version.mjs 的工作流设置，
+// 用于核对多段安装版本号（如 0.4.1.1）；package.json 始终核对 Tauri 基础版本。
+const baseVersion = tauriConfig.version ?? packageJson.version
+const expectedVersion = process.env.TEXTLENS_INSTALLER_VERSION?.trim() || baseVersion
 const expectedIdentifier = tauriConfig.identifier
 const expectedMinimumVersion = tauriConfig.bundle?.macOS?.minimumSystemVersion ?? '12.0'
 const expectedMenuBarOnly = true
@@ -32,8 +35,8 @@ if (tauriConfig.app?.security?.devCsp) {
 if (packageJson.productName !== productName) {
   errors.push(`package.json 与 Tauri 产品名不一致：${packageJson.productName} / ${productName}`)
 }
-if (packageJson.version !== expectedVersion) {
-  errors.push(`package.json 与 Tauri 版本不一致：${packageJson.version} / ${expectedVersion}`)
+if (packageJson.version !== baseVersion) {
+  errors.push(`package.json 与 Tauri 版本不一致：${packageJson.version} / ${baseVersion}`)
 }
 
 function requireFile(path, label) {

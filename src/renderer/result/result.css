@@ -12,14 +12,14 @@ body,
 
 .result-window {
   --result-radius: 8px;
-  --result-header-surface: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-inset));
-  --result-content-surface: color-mix(in srgb, var(--surface-solid) 42%, var(--surface-muted));
-  --result-card-surface: color-mix(in srgb, var(--surface-solid) 94%, var(--surface-muted));
-  --result-model-control-surface: color-mix(in srgb, var(--surface-muted) 72%, var(--surface-solid));
-  --result-model-menu-surface: color-mix(in srgb, var(--surface-solid) 94%, var(--surface-muted));
+  --result-header-surface: color-mix(in srgb, var(--surface-muted) 66%, var(--surface-solid));
+  --result-content-surface: color-mix(in srgb, var(--surface-solid) 72%, var(--surface-muted));
+  --result-card-surface: color-mix(in srgb, var(--surface-solid) 95%, var(--surface-muted));
+  --result-model-control-surface: color-mix(in srgb, var(--surface-muted) 64%, var(--surface-solid));
+  --result-model-menu-surface: color-mix(in srgb, var(--surface-solid) 96%, var(--surface-muted));
   --result-control-shadow: none;
-  --result-scrollbar-thumb: rgba(151, 157, 168, 0.38);
-  --result-scrollbar-thumb-hover: rgba(137, 144, 155, 0.56);
+  --result-scrollbar-thumb: rgba(160, 146, 120, 0.4);
+  --result-scrollbar-thumb-hover: rgba(150, 135, 108, 0.58);
   position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
@@ -122,6 +122,7 @@ body,
   user-select: none;
   background: var(--result-header-surface);
   border: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
   border-radius: var(--result-radius) var(--result-radius) 0 0;
 }
 
@@ -316,9 +317,9 @@ body,
   overflow-x: hidden;
   overflow-y: auto;
   background: var(--result-model-menu-surface);
-  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border-strong) 62%, transparent);
   border-radius: 8px;
-  box-shadow: none;
+  box-shadow: var(--shadow-sm);
 }
 
 .result-model-menu__group + .result-model-menu__group {
@@ -1270,8 +1271,8 @@ body,
   font-size: 11px;
   font-weight: 570;
   white-space: nowrap;
-  background: color-mix(in srgb, var(--result-header-surface) 78%, var(--surface-solid));
-  border: 1px solid transparent;
+  background: color-mix(in srgb, var(--result-header-surface) 66%, var(--surface-solid));
+  border: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
   border-radius: 8px;
   box-shadow: var(--result-control-shadow);
   transition:
@@ -1283,8 +1284,8 @@ body,
 .result-footer-button:hover:not(:disabled),
 .result-footer-button:focus-visible {
   color: var(--text);
-  background: color-mix(in srgb, var(--surface-solid) 78%, var(--accent-soft));
-  border-color: transparent;
+  background: color-mix(in srgb, var(--surface-solid) 74%, var(--accent-soft));
+  border-color: color-mix(in srgb, var(--accent) 24%, transparent);
   box-shadow: none;
 }
 

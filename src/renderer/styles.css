@@ -5,28 +5,30 @@
     "Microsoft YaHei UI", "Helvetica Neue", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --bg: #f5f6f8;
-  --surface: rgba(255, 255, 255, 0.94);
-  --surface-solid: #ffffff;
-  --surface-muted: #f0f2f5;
-  --surface-inset: #e9edf2;
-  --text: #17191d;
-  --text-secondary: #626874;
-  --text-tertiary: #8c929d;
-  --border: rgba(17, 24, 39, 0.11);
-  --border-strong: rgba(17, 24, 39, 0.19);
-  --accent: #356ae6;
-  --accent-hover: #2859cc;
-  --accent-soft: rgba(53, 106, 230, 0.12);
-  --danger: #c53b3b;
-  --danger-soft: rgba(197, 59, 59, 0.11);
-  --success: #237a4b;
-  --success-soft: rgba(35, 122, 75, 0.11);
-  --warning: #9b6415;
-  --warning-soft: rgba(155, 100, 21, 0.12);
-  --shadow-sm: 0 2px 10px rgba(20, 25, 35, 0.09);
-  --shadow-md: 0 8px 24px rgba(20, 25, 35, 0.12);
-  --shadow-lg: 0 18px 50px rgba(20, 25, 35, 0.16);
+  /* Warm paper base: ivory backgrounds, ink text, softened accent. */
+  --bg: #f6f3ec;
+  --surface: rgba(253, 251, 245, 0.94);
+  --surface-solid: #fdfbf5;
+  --surface-muted: #f2eee4;
+  --surface-inset: #eae4d7;
+  --text: #24211b;
+  --text-secondary: #6c665a;
+  --text-tertiary: #9d9689;
+  --border: rgba(89, 75, 54, 0.13);
+  --border-strong: rgba(89, 75, 54, 0.22);
+  --accent: #3568d0;
+  --accent-hover: #2a56b4;
+  --accent-soft: rgba(53, 104, 208, 0.11);
+  --danger: #b8443c;
+  --danger-soft: rgba(184, 68, 60, 0.11);
+  --success: #37794f;
+  --success-soft: rgba(55, 121, 79, 0.12);
+  --warning: #a06b15;
+  --warning-soft: rgba(160, 107, 21, 0.13);
+  --shadow-sm: 0 2px 10px rgba(78, 64, 44, 0.1);
+  --shadow-md: 0 8px 24px rgba(78, 64, 44, 0.13);
+  --shadow-lg: 0 18px 50px rgba(78, 64, 44, 0.18);
+  --highlight: rgba(255, 255, 255, 0.65);
   --focus-ring: 0 0 0 3px var(--accent-soft);
   --radius-sm: 8px;
   --radius-md: 12px;
@@ -57,6 +59,7 @@
     --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.25);
     --shadow-md: 0 8px 26px rgba(0, 0, 0, 0.3);
     --shadow-lg: 0 18px 54px rgba(0, 0, 0, 0.38);
+    --highlight: rgba(255, 255, 255, 0.045);
   }
 }
 

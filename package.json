@@ -36,6 +36,7 @@
     "verify:artifacts:windows": "node apps/windows/scripts/verify-artifacts.mjs",
     "export:dev-source": "node scripts/export-dev-source.mjs",
     "package": "pnpm build && pnpm verify:artifacts",
+    "package:installer": "pnpm build && node apps/macos/scripts/apply-installer-version.mjs",
     "package:windows": "pnpm build:windows && pnpm verify:artifacts:windows",
     "package:app": "RUSTFLAGS=\"--remap-path-prefix=$HOME=/workspace\" tauri build --target aarch64-apple-darwin --bundles app",
     "package:dmg": "RUSTFLAGS=\"--remap-path-prefix=$HOME=/workspace\" tauri build --target aarch64-apple-darwin --bundles app,dmg && pnpm verify:artifacts"

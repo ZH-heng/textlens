@@ -37,10 +37,12 @@ body {
   /* Keep the surface and shadow inside the native WebView bounds. A solid
      color also avoids the older WebView2 color-mix fallback mismatch that can
      make the pill disappear on some GPU/driver combinations. */
-  background-color: color-mix(in srgb, var(--surface-solid) 42%, var(--surface-muted));
-  border: 1px solid color-mix(in srgb, var(--border-strong) 72%, transparent);
-  border-radius: 9px;
-  box-shadow: var(--shadow-sm);
+  background-color: color-mix(in srgb, var(--surface-solid) 88%, var(--surface-muted));
+  border: 1px solid color-mix(in srgb, var(--border-strong) 55%, transparent);
+  border-radius: 10px;
+  box-shadow:
+    inset 0 1px 0 var(--highlight),
+    var(--shadow-sm);
 }
 
 .toolbar-action {
@@ -100,7 +102,7 @@ body {
 
 .toolbar-action[data-hovered='true']:not(:disabled) {
   color: var(--accent);
-  background: color-mix(in srgb, var(--accent-soft) 82%, var(--surface-solid));
+  background: color-mix(in srgb, var(--accent-soft) 72%, var(--surface-solid));
   box-shadow: none;
 }
 
@@ -127,11 +129,12 @@ body {
   padding: 7px 9px;
   color: var(--danger);
   font-size: 12px;
-  background: var(--surface-solid);
-  background: color-mix(in srgb, var(--danger-soft) 60%, var(--surface-solid));
-  border: 0;
-  border-radius: 8px;
-  box-shadow: none;
+  background: color-mix(in srgb, var(--danger-soft) 52%, var(--surface-solid));
+  border: 1px solid color-mix(in srgb, var(--danger) 18%, transparent);
+  border-radius: 10px;
+  box-shadow:
+    inset 0 1px 0 var(--highlight),
+    var(--shadow-sm);
 }
 
 .toolbar-message__icon {

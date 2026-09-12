@@ -22,8 +22,12 @@
     ]
   },
   "bundle": {
-    "targets": ["nsis"],
-    "icon": ["../apps/windows/icons/icon.ico"],
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "../apps/windows/icons/icon.ico"
+    ],
     "shortDescription": "轻量 Windows 划词助手",
     "windows": {
       "allowDowngrades": false,
@@ -35,11 +39,18 @@
         "installerIcon": "../apps/windows/icons/icon.ico",
         "uninstallerIcon": "../apps/windows/icons/icon.ico",
         "installMode": "currentUser",
-        "languages": ["SimpChinese", "English"],
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
         "displayLanguageSelector": false,
         "compression": "lzma",
         "startMenuFolder": "TextLens"
       }
+    },
+    "resources": {
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "../LICENSE.selection-hook": "LICENSE.selection-hook"
     }
   }
 }

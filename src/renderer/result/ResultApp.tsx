@@ -1341,7 +1341,7 @@ function ResultSessionApp({
           </button>
         </div>}
         <div className="result-actions">
-          {!windowsRenderer && settings?.result.dismissMode === 'manual' && (
+          {settings?.result.dismissMode === 'manual' && (
             <button className="result-footer-button" type="button" onClick={() => runDetached(closeWindow(), {
               scope: 'result',
               operation: 'close',

@@ -19,7 +19,6 @@ import {
   migratePublicSettings,
   providerModelSchema,
   publicSettingsSchema,
-  resultRendererMarkerSchema,
   resultSessionSnapshotSchema,
   settingsUpdateSchema,
   toPublicSettings
@@ -962,11 +961,5 @@ describe('action stream event schemas', () => {
         generationNotice: { ...generationNotice, unexpected: true }
       })).success
     ).toBe(false)
-  })
-
-  it('accepts only privacy-safe renderer marker values', () => {
-    expect(resultRendererMarkerSchema.safeParse('firstDomCommit').success).toBe(true)
-    expect(resultRendererMarkerSchema.safeParse('firstPresentationOpportunity').success).toBe(true)
-    expect(resultRendererMarkerSchema.safeParse('firstDelta').success).toBe(false)
   })
 })

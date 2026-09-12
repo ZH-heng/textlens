@@ -5,6 +5,7 @@ import type { SafeMarkdownProps } from './SafeMarkdown'
 import { createRetryableMarkdownLoader, type SafeMarkdownImporter } from './LazySafeMarkdown'
 import {
   ResultOutput,
+  stripLeadingBlankLines,
   type MarkdownTaskScheduler,
   type ResultOutputMilestone
 } from './ResultOutput'
@@ -62,6 +63,20 @@ function outputProps(overrides: Partial<React.ComponentProps<typeof ResultOutput
 }
 
 describe('ResultOutput', () => {
+  it('strips leading blank lines from the plain stream view without touching later blank lines', () => {
+    // Reasoning models commonly open the answer with blank lines; in the
+    // pre-wrap plain view they render as a tall gap under the thinking bar.
+    expect(stripLeadingBlankLines('\n\n\n  \nAnswer body')).toBe('Answer body')
+    expect(stripLeadingBlankLines('    indented code')).toBe('    indented code')
+    expect(stripLeadingBlankLines('First\n\n\nSecond')).toBe('First\n\n\nSecond')
+    expect(stripLeadingBlankLines('')).toBe('')
+  })
+
+  it('renders the plain stream view without leading blank lines', () => {
+    render(<ResultOutput {...outputProps({ content: '\n\n\nAnswer body' })} />)
+    expect(screen.getByText('Answer body')).toHaveClass('stream-plain-text')
+  })
+
   it('commits plain content before presentation and starts Markdown on the next frame', async () => {
     const scheduler = new DeterministicScheduler()
     const markdownImport = deferred<{ SafeMarkdown: (props: SafeMarkdownProps) => JSX.Element }>()

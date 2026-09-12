@@ -57,7 +57,7 @@ import {
   patchStreamingAssistant,
   type TranscriptTurn
 } from './conversationTranscript'
-import { ResultOutput } from './ResultOutput'
+import { ResultOutput, stripLeadingBlankLines } from './ResultOutput'
 import { useResultContentOverflow } from './resultContentOverflow'
 import type { ResultSessionBootstrap } from './resultSessionBootstrap'
 import type { ResultState } from './resultState'
@@ -287,7 +287,7 @@ function ThinkingPanel(): JSX.Element | null {
       </button>
       {expanded && (
         <div className="result-thinking__body">
-          {thinkingContent}
+          {stripLeadingBlankLines(thinkingContent)}
           {live && <span className="stream-caret" aria-hidden="true" />}
         </div>
       )}

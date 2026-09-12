@@ -154,10 +154,23 @@ export interface ResultOutputProps {
   contentScalarCount: number
   contentRevision: number
   revealCommitted: boolean
-  onOpenExternal(url: string): void
+  onOpenExternal: (url: string) => void
   loader?: RetryableMarkdownLoader
   scheduler?: MarkdownTaskScheduler
   onMilestone?: (milestone: ResultOutputMilestone, at: number) => void
+}
+
+/**
+ * Reasoning models very often emit blank lines before the first answer line.
+ * The plain stream view renders `pre-wrap`, so those lines show up as a tall
+ * blank gap between the collapsed thinking bar and the answer (rich Markdown
+ * silently swallows them, which makes the plain→rich handoff jump too).
+ * Stripping only the whitespace-only lines before the first content line
+ * keeps indented first lines intact; the raw content stays untouched for
+ * copy and revision accounting.
+ */
+export function stripLeadingBlankLines(content: string): string {
+  return content.replace(/^(?:[^\S\n]*\n)+/, '')
 }
 
 function PlainOutput({
@@ -173,7 +186,7 @@ function PlainOutput({
 }): JSX.Element {
   return (
     <>
-      <span className="stream-plain-text">{content}</span>
+      <span className="stream-plain-text">{stripLeadingBlankLines(content)}</span>
       {showCaret && <span className="stream-caret" aria-hidden="true" />}
       {failed && (
         <button className="result-footer-button" type="button" onClick={retry}>

@@ -80,7 +80,6 @@ pub(crate) struct SseDecoder {
     scan_from: usize,
     raw_bytes: usize,
     state: SseState,
-    saw_content: bool,
 }
 
 impl SseDecoder {
@@ -92,7 +91,6 @@ impl SseDecoder {
             scan_from: 0,
             raw_bytes: 0,
             state: SseState::Open,
-            saw_content: false,
         }
     }
 
@@ -168,10 +166,7 @@ impl SseDecoder {
         match self.state {
             SseState::Done => Ok(SseTermination::Done),
             SseState::FinishSeen => Ok(SseTermination::FinishReason),
-            SseState::Open => {
-                let _ = self.saw_content;
-                Ok(SseTermination::CleanEofUnverified)
-            }
+            SseState::Open => Ok(SseTermination::CleanEofUnverified),
             SseState::Error => Err(ProtocolError::MalformedJson),
         }
     }
@@ -211,9 +206,6 @@ impl SseDecoder {
             && content.as_deref().is_some_and(|value| !value.is_empty())
         {
             return Err(ProtocolError::ContentAfterFinish);
-        }
-        if content.as_deref().is_some_and(|value| !value.is_empty()) {
-            self.saw_content = true;
         }
         if finish_reason.is_some() && matches!(self.state, SseState::Open) {
             self.state = SseState::FinishSeen;

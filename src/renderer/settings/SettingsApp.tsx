@@ -1027,8 +1027,17 @@ export function SettingsApp(): JSX.Element {
   const busy = operation !== null
   const permission = accessibilityPresentation(accessibility)
   const selectionAvailable = accessibility?.available ?? accessibility?.trusted ?? false
-  const activeMeta = SETTINGS_SECTIONS.find((section) => section.id === activeSection)
-    ?? SETTINGS_SECTIONS[0]!
+  // 「划词获取」的策略路由只有 Windows 选择监视器会消费（apps/windows selection），
+  // macOS 的回退策略在原生桥内按应用硬编码。隐藏该分区，避免展示一个不生效的设置。
+  // 普通计算即可：分区只有 7 个，且必须放在 loading 提前 return 之后，不能用 hook。
+  const visibleSections = SETTINGS_SECTIONS.filter(
+    (section) => section.id !== 'capture' || accessibility?.platform === 'windows'
+  )
+  const activeSectionId = visibleSections.some((section) => section.id === activeSection)
+    ? activeSection
+    : visibleSections[0]!.id
+  const activeMeta = visibleSections.find((section) => section.id === activeSectionId)
+    ?? visibleSections[0]!
 
   return (
     <main className="settings-page settings-page--shell">
@@ -1041,12 +1050,12 @@ export function SettingsApp(): JSX.Element {
           </div>
         </header>
         <nav className="settings-nav" aria-label="设置分区">
-          {SETTINGS_SECTIONS.map((section) => (
+          {visibleSections.map((section) => (
             <button
               key={section.id}
               type="button"
-              className={`settings-nav__item ${activeSection === section.id ? 'is-selected' : ''}`}
-              aria-current={activeSection === section.id ? 'page' : undefined}
+              className={`settings-nav__item ${activeSectionId === section.id ? 'is-selected' : ''}`}
+              aria-current={activeSectionId === section.id ? 'page' : undefined}
               onClick={() => setActiveSection(section.id)}
             >
               {section.label}
@@ -1068,8 +1077,8 @@ export function SettingsApp(): JSX.Element {
           </div>
         )}
 
-        <div className="settings-shell__content" key={activeSection}>
-          {activeSection === 'general' && (
+        <div className="settings-shell__content" key={activeSectionId}>
+          {activeSectionId === 'general' && (
             <>
               <section className="settings-section settings-section--enter" aria-labelledby="general-title">
                 <div className="section-heading">
@@ -1203,8 +1212,12 @@ export function SettingsApp(): JSX.Element {
                   </div>
                   <div className="permission-copy"><strong>{permission.state}</strong>
                     <p>{permission.detail}</p></div>
-                  <button className="button" type="button" disabled={busy || accessibility?.trusted || !accessibility?.canRequest}
-                    onClick={() => void requestAccessibility()}>
+                  <button
+                    className={`button ${accessibility?.trusted ? 'button--status' : ''}`}
+                    type="button"
+                    disabled={busy || accessibility?.trusted || !accessibility?.canRequest}
+                    onClick={() => void requestAccessibility()}
+                  >
                     {operation === 'accessibility' && <LoaderCircle className="settings-spin" size={15} />}
                     {permission.button}
                   </button>
@@ -1219,7 +1232,7 @@ export function SettingsApp(): JSX.Element {
             </>
           )}
 
-          {activeSection === 'providers' && (
+          {activeSectionId === 'providers' && (
           <section className="settings-section settings-section--enter" aria-labelledby="providers-title">
         <div className="section-heading section-heading--actions">
           <div><h2 id="providers-title">AI 服务商与模型</h2><p>{activeMeta.blurb}</p></div>
@@ -1370,7 +1383,7 @@ export function SettingsApp(): JSX.Element {
       </section>
           )}
 
-          {activeSection === 'actions' && (
+          {activeSectionId === 'actions' && (
       <section className="settings-section settings-section--enter" aria-labelledby="actions-title">
         <div className="section-heading section-heading--actions">
           <div>
@@ -1409,7 +1422,7 @@ export function SettingsApp(): JSX.Element {
       </section>
           )}
 
-          {activeSection === 'language' && (
+          {activeSectionId === 'language' && (
       <section className="settings-section settings-section--enter" aria-labelledby="language-title">
         <div className="section-heading">
           <div>
@@ -1496,7 +1509,7 @@ export function SettingsApp(): JSX.Element {
       </section>
           )}
 
-          {activeSection === 'result' && (
+          {activeSectionId === 'result' && (
       <section className="settings-section settings-section--enter" aria-labelledby="result-title">
         <div className="section-heading"><div><h2 id="result-title">结果窗口</h2><p>{activeMeta.blurb}</p></div></div>
         <div className="settings-card settings-card--rows">
@@ -1527,7 +1540,7 @@ export function SettingsApp(): JSX.Element {
       </section>
           )}
 
-          {activeSection === 'capture' && (
+          {activeSectionId === 'capture' && (
       <section className="settings-section settings-section--enter" aria-labelledby="capture-title">
         <div className="section-heading"><div><h2 id="capture-title">划词获取</h2><p>{activeMeta.blurb}</p></div></div>
         <div className="settings-card settings-card--rows">
@@ -1624,7 +1637,7 @@ export function SettingsApp(): JSX.Element {
       </section>
           )}
 
-          {activeSection === 'filter' && (
+          {activeSectionId === 'filter' && (
       <section className="settings-section settings-section--enter" aria-labelledby="filter-title">
         <div className="section-heading"><div><h2 id="filter-title">应用过滤</h2><p>{activeMeta.blurb}</p></div></div>
         <div className="settings-card settings-card--rows">

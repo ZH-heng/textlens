@@ -1607,7 +1607,6 @@ impl ActionService {
         }
     }
 
-    #[allow(dead_code)]
     fn submit_notice<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -1781,6 +1780,14 @@ fn prepared_provider(
         .find(|provider| provider.id == provider_id)
         .cloned()
         .ok_or_else(|| ActionServiceError::Validation("选择的服务商不存在".to_owned()))?;
+    if !provider.enabled {
+        // The toggle only hides a provider's models from the pickers; actions
+        // that were already bound to it must also stop issuing requests,
+        // otherwise the setting is cosmetic for existing bindings.
+        return Err(ActionServiceError::Validation(
+            "该服务商已停用，请在设置中启用后再试".to_owned(),
+        ));
+    }
     if !provider.models.iter().any(|model| model.id == model_id) {
         return Err(ActionServiceError::Validation(
             "选择的模型不存在，请重新选择".to_owned(),
@@ -2436,6 +2443,28 @@ mod tests {
             cursor: None,
             target_language: None,
         }
+    }
+
+    #[test]
+    fn resolve_route_rejects_disabled_provider() {
+        let settings = configured_settings("prov-a", "model-a", ThinkingMode::Off);
+        let action = settings
+            .actions
+            .iter()
+            .find(|action| action.id == "summary")
+            .expect("summary action");
+        let resolved = resolve_route(&settings, action, "prov-a", "model-a")
+            .expect("enabled provider resolves");
+        assert_eq!(resolved.provider.id, "prov-a");
+
+        let mut disabled = settings.clone();
+        disabled.providers[0].enabled = false;
+        let error = resolve_route(&disabled, action, "prov-a", "model-a")
+            .expect_err("disabled provider must not execute");
+        assert!(
+            error.to_string().contains("已停用"),
+            "unexpected error: {error}"
+        );
     }
 
     fn request_ticket(request_id: &str) -> RequestTicket {

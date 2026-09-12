@@ -756,7 +756,6 @@ impl SessionTable {
         Ok(Some(event))
     }
 
-    #[allow(dead_code)]
     pub(super) fn enqueue_notice(
         &mut self,
         ticket: &RequestTicket,

@@ -75,6 +75,13 @@ pub enum SelectionDirection {
 pub enum SelectionMethod {
     Accessibility,
     Clipboard,
+    /// Selection read from the source app's live DOM/AppleScript interface
+    /// (Safari `do JavaScript`, Chrome-kernel `execute javascript`). macOS
+    /// only; sits between the Accessibility and Clipboard capture paths.
+    // The native bridge reports this variant as lowercase "applescript";
+    // derive(camelCase) would produce "appleScript".
+    #[serde(rename = "applescript")]
+    AppleScript,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -869,6 +876,73 @@ mod tests {
         };
         assert_eq!(dismiss.reason, "scroll");
         assert_eq!(dismiss.target_pid, 7);
+    }
+
+    #[test]
+    fn parses_applescript_method_selection() {
+        let event = parse_native_event(
+            r#"{
+                "type":"selection",
+                "text":"selected in safari",
+                "sourceApp":{"bundleId":"com.apple.Safari","name":"Safari"},
+                "bounds":null,
+                "startTop":null,
+                "startBottom":null,
+                "endTop":null,
+                "endBottom":null,
+                "mouse":{"start":null,"end":{"x":12.0,"y":34.0},"current":{"x":12.0,"y":34.0}},
+                "direction":"forward",
+                "isFullscreen":false,
+                "method":"applescript",
+                "trigger":"drag",
+                "timestampMs":11
+            }"#,
+        )
+        .expect("valid applescript selection event");
+
+        let SelectionEvent::Selection(selection) = event else {
+            panic!("expected selection");
+        };
+        assert_eq!(selection.method, SelectionMethod::AppleScript);
+        let serialized = serde_json::to_value(SelectionEvent::Selection(selection))
+            .expect("serialize public event");
+        assert_eq!(serialized["method"], "applescript");
+    }
+
+    #[test]
+    fn parses_clipboard_method_selection_without_bounds() {
+        // Clipboard-fallback captures carry no geometry: the runtime falls
+        // back to a cursor anchor for toolbar placement.
+        let event = parse_native_event(
+            r#"{
+                "type":"selection",
+                "text":"copied",
+                "sourceApp":{"bundleId":"com.kingsoft.wpsoffice.mac","name":"WPS Office"},
+                "bounds":null,
+                "startTop":null,
+                "startBottom":null,
+                "endTop":null,
+                "endBottom":null,
+                "mouse":{"start":null,"end":{"x":30.0,"y":50.0},"current":{"x":30.0,"y":50.0}},
+                "direction":"unknown",
+                "isFullscreen":false,
+                "method":"clipboard",
+                "trigger":"drag",
+                "timestampMs":7
+            }"#,
+        )
+        .expect("valid clipboard selection event");
+
+        let SelectionEvent::Selection(selection) = event else {
+            panic!("expected selection");
+        };
+        assert_eq!(selection.method, SelectionMethod::Clipboard);
+        assert_eq!(selection.bounds, None);
+        assert_eq!(selection.source_app.bundle_id, "com.kingsoft.wpsoffice.mac");
+
+        let serialized = serde_json::to_value(SelectionEvent::Selection(selection))
+            .expect("serialize public event");
+        assert_eq!(serialized["method"], "clipboard");
     }
 
     #[test]

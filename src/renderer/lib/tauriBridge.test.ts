@@ -282,37 +282,6 @@ describe('Tauri renderer bridge', () => {
     expect(actionListener).toHaveBeenCalledWith(orderedEvent)
     unsubscribeAction()
 
-    await window.textLens.recordResultRendererMarker(
-      'session-1',
-      'request-2',
-      'firstDomCommit'
-    )
-    expect(invokeMock).toHaveBeenCalledWith('record_result_renderer_marker', {
-      sessionId: 'session-1',
-      requestId: 'request-2',
-      marker: 'firstDomCommit'
-    })
-    const markerCall = invokeMock.mock.calls.find(
-      ([command]) => command === 'record_result_renderer_marker'
-    )
-    expect(markerCall?.[1]).toEqual({
-      sessionId: 'session-1',
-      requestId: 'request-2',
-      marker: 'firstDomCommit'
-    })
-    expect(Object.keys(markerCall?.[1] as Record<string, unknown>).sort()).toEqual([
-      'marker',
-      'requestId',
-      'sessionId'
-    ])
-    await expect(
-      window.textLens.recordResultRendererMarker(
-        'session-1',
-        'request-2',
-        'firstDelta' as 'firstDomCommit'
-      )
-    ).rejects.toThrow()
-
     await window.textLens.prepareResultReveal?.('session-1')
     expect(invokeMock).toHaveBeenCalledWith('prepare_result_reveal', { sessionId: 'session-1' })
     await window.textLens.commitResultReveal?.('session-1')

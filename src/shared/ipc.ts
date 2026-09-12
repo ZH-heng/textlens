@@ -23,7 +23,6 @@ export const TAURI_COMMANDS = {
   reportToolbarSize: 'report_toolbar_size',
   beginResultReady: 'begin_result_ready',
   ackResultReady: 'ack_result_ready',
-  recordResultRendererMarker: 'record_result_renderer_marker',
   prepareResultReveal: 'prepare_result_reveal',
   commitResultReveal: 'commit_result_reveal',
   failResultReveal: 'fail_result_reveal',

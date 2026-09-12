@@ -79,6 +79,9 @@ body {
 
 .settings-hero h1 {
   margin: 0;
+  /* CJK line-breaking can split "TextLens 设置" after a single character;
+     the title is short enough to keep on one line. */
+  white-space: nowrap;
   font-size: 16px;
   font-weight: 710;
   letter-spacing: -0.02em;
@@ -1659,6 +1662,15 @@ body {
   color: var(--text-secondary);
   background: transparent;
   border: 1px solid var(--border);
+}
+
+/* A trusted-permission button is a status badge, not an affordance: strip the
+   clickable look so "已启用" doesn't read as a broken control. */
+.button--status:disabled {
+  color: var(--text-secondary);
+  cursor: default;
+  background: var(--surface-muted);
+  border-color: transparent;
 }
 
 .button--ghost:hover {

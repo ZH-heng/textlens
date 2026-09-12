@@ -301,6 +301,53 @@ describe('SettingsApp provider deletion', () => {
     expect(screen.queryByRole('button', { name: '退出 TextLens' })).not.toBeInTheDocument()
   })
 
+  it('keeps the Windows-only capture strategy section out of the macOS settings UI', async () => {
+    window.textLens = {
+      getSettings: vi.fn(async () => DEFAULT_PUBLIC_SETTINGS),
+      updateSettings: vi.fn(),
+      getAccessibilityStatus: vi.fn(async () => ({
+        platform: 'darwin',
+        trusted: true,
+        canRequest: true
+      })),
+      requestAccessibility: vi.fn(),
+      onSettingsChanged: vi.fn(() => () => undefined),
+      onSettingsCloseRequested: vi.fn(() => () => undefined)
+    } as unknown as WindowTextLensApi
+
+    render(<SettingsApp />)
+
+    await screen.findByRole('heading', { name: '辅助功能权限' })
+    expect(screen.queryByRole('button', { name: '划词获取' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: '默认划词获取方式' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '通用' })).toHaveAttribute('aria-current', 'page')
+  })
+
+  it('keeps the Windows-only capture strategy section visible on Windows', async () => {
+    // 深链/记忆分区指向 capture 时 Windows 上仍能正常渲染。
+    window.sessionStorage.setItem('textlens.settings.active-section', 'capture')
+    try {
+      window.textLens = {
+        getSettings: vi.fn(async () => DEFAULT_PUBLIC_SETTINGS),
+        updateSettings: vi.fn(),
+        getAccessibilityStatus: vi.fn(async () => ({
+          platform: 'windows',
+          trusted: true,
+          canRequest: false
+        })),
+        requestAccessibility: vi.fn(),
+        onSettingsChanged: vi.fn(() => () => undefined),
+        onSettingsCloseRequested: vi.fn(() => () => undefined)
+      } as unknown as WindowTextLensApi
+
+      render(<SettingsApp />)
+
+      expect(await screen.findByRole('combobox', { name: '默认划词获取方式' })).toBeInTheDocument()
+    } finally {
+      window.sessionStorage.removeItem('textlens.settings.active-section')
+    }
+  })
+
   it('keeps settings editable when the accessibility diagnostic IPC fails', async () => {
     window.textLens = {
       getSettings: vi.fn(async () => DEFAULT_PUBLIC_SETTINGS),

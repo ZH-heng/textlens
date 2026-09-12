@@ -404,7 +404,7 @@ impl WindowState {
         self.toolbar_size
     }
 
-    #[cfg(any(test, target_os = "windows"))]
+    #[cfg(any(test, target_os = "windows", target_os = "macos"))]
     fn reserve_toolbar_recovery(&mut self, selection_id: &str) -> bool {
         if self.toolbar_recovery_selection_id.as_deref() != Some(selection_id)
             || self.toolbar_recovery_attempts >= 1
@@ -416,12 +416,12 @@ impl WindowState {
         true
     }
 
-    #[cfg(any(test, target_os = "windows"))]
+    #[cfg(any(test, target_os = "windows", target_os = "macos"))]
     fn take_toolbar_recovery_pending(&mut self) -> Option<String> {
         self.toolbar_recovery_pending_selection_id.take()
     }
 
-    #[cfg(any(test, target_os = "windows"))]
+    #[cfg(any(test, target_os = "windows", target_os = "macos"))]
     fn cancel_toolbar_recovery(&mut self, selection_id: &str) {
         if self.toolbar_recovery_pending_selection_id.as_deref() == Some(selection_id) {
             self.toolbar_recovery_pending_selection_id = None;
@@ -545,7 +545,7 @@ impl WindowCoordinator {
         Ok(window)
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub fn take_toolbar_recovery_pending(&self) -> bool {
         self.state.lock().take_toolbar_recovery_pending().is_some()
     }
@@ -554,14 +554,14 @@ impl WindowCoordinator {
     /// responding. `WindowEvent::Destroyed` recreates the singleton after the
     /// old label has been removed from Tauri's window registry; the new
     /// renderer replays the in-memory selection through `toolbar_ready`.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub fn rebuild_toolbar(&self, app: &AppHandle, selection_id: &str) -> tauri::Result<bool> {
         {
             let mut state = self.state.lock();
             if state.toolbar_recovery_pending_selection_id.is_some() {
                 return Ok(true);
             }
-            // A persistent machine-wide WebView2 failure must not create an
+            // A persistent machine-wide WebView failure must not create an
             // unbounded destroy/recreate loop. A new selection has a new ID
             // and receives its own single recovery attempt.
             if !state.reserve_toolbar_recovery(selection_id) {
@@ -721,10 +721,18 @@ impl WindowCoordinator {
     ) -> tauri::Result<()> {
         let window = self.ensure_toolbar(app)?;
         let _toolbar_operation = self.toolbar_operation.lock();
-        // Never hold WindowState across the AppKit main-thread hop (see
-        // show_toolbar's invariant above): perform the alpha change first,
-        // then take the lock only for plain in-memory bookkeeping.
-        set_native_alpha_raw(&window, 0.0)?;
+        // The alpha hop only matters when a previous toolbar frame could
+        // still be visible. Every hide path clears `toolbar_selection_id`,
+        // so None means the singleton window is already invisible and the
+        // cross-thread hop can be skipped for the most common case: a fresh
+        // selection arriving while the toolbar is hidden.
+        let was_hidden = self.state.lock().toolbar_selection_id.is_none();
+        if !was_hidden {
+            // Never hold WindowState across the AppKit main-thread hop (see
+            // show_toolbar's invariant above): perform the alpha change
+            // first, then take the lock only for plain in-memory bookkeeping.
+            set_native_alpha_raw(&window, 0.0)?;
+        }
         {
             let mut state = self.state.lock();
             state.toolbar_anchor = Some(anchor);
@@ -771,9 +779,7 @@ impl WindowCoordinator {
         if self.state.lock().toolbar_selection_id.as_deref() != Some(selection_id) {
             return Ok(false);
         }
-        apply_window_layout(&window, layout)?;
-        order_front_without_focus(&window)?;
-        set_native_alpha_raw(&window, 1.0)?;
+        commit_toolbar_presentation(&window, layout)?;
         trace_toolbar_timing("native-visible", native_started);
         // NSTrackingArea helps WKWebView receive mouse-move while non-key, but
         // it is not reliable enough alone for continuous hover across action
@@ -2557,17 +2563,6 @@ pub fn restore_source_app_activation(_app: &AppHandle, _bundle_id: &str) -> bool
     false
 }
 
-/// Backward-compatible name used by older call sites / docs.
-#[cfg(target_os = "macos")]
-pub fn activate_application_by_bundle_id(app: &AppHandle, bundle_id: &str) -> bool {
-    restore_source_app_activation(app, bundle_id)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn activate_application_by_bundle_id(app: &AppHandle, bundle_id: &str) -> bool {
-    restore_source_app_activation(app, bundle_id)
-}
-
 #[cfg(target_os = "macos")]
 fn configure_toolbar_native(window: &WebviewWindow) -> tauri::Result<()> {
     use objc2_app_kit::{NSStatusWindowLevel, NSWindow, NSWindowCollectionBehavior};
@@ -2754,6 +2749,37 @@ fn configure_toolbar_native_raw(window: &WebviewWindow) -> tauri::Result<()> {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn configure_toolbar_native(_window: &WebviewWindow) -> tauri::Result<()> {
+    Ok(())
+}
+
+/// Commits the staged macOS toolbar in a single AppKit main-thread hop:
+/// position + size, `orderFrontRegardless` and the alpha flip all run inside
+/// one dispatch. Tauri's `set_position`/`set_size` execute inline when the
+/// caller is already on the main thread, so one hop replaces the three
+/// cross-thread round trips this commit path previously paid.
+#[cfg(target_os = "macos")]
+fn commit_toolbar_presentation(window: &WebviewWindow, layout: WindowLayout) -> tauri::Result<()> {
+    use objc2_app_kit::NSWindow;
+
+    let app = window.app_handle().clone();
+    let window = window.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let result = (|| -> tauri::Result<()> {
+            apply_window_layout(&window, layout)?;
+            let pointer = window.ns_window()?;
+            unsafe {
+                let ns_window = &*(pointer as *const NSWindow);
+                ns_window.orderFrontRegardless();
+                ns_window.setAlphaValue(1.0);
+            }
+            Ok(())
+        })();
+        let _ = sender.send(result);
+    })?;
+    receiver
+        .recv()
+        .map_err(|_| tauri::Error::FailedToReceiveMessage)??;
     Ok(())
 }
 

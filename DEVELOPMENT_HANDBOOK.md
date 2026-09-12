@@ -200,6 +200,7 @@ TextLens 以 macOS 0.3.16 为功能基线，逐步完成 Windows 10/11 x64 版�
 | 0.3.55 | 服务商 `enabled` 启停；动作模型选择改为按服务商分组的统一 optgroup 列表，并按模型名自动推断思考档位（含「关闭思考」）；翻译目标语言扩展为 zh/en/ja/ko/ru/de/fr，结果标题栏短码切换；默认其他语种→中文、中文→英文；收紧翻译与解释默认提示词。 |
 | 0.3.56 | 修复 macOS 主线程死锁（持 WindowState 锁等待 orderFront 导致托盘无响应）；结果窗关闭前 blur 原生 select；文档改为 DEVELOPMENT_HANDBOOK 开发手册并精简 README。 |
 | 0.4.0 | 双端划词兼容拓宽、AX/UIA 有界捕获、Windows 跨段与长划词回退、工具栏 stage-present 与悬停交互、Markdown 稳定渲染、解释提示词和快捷键注册加固。 |
+| 0.4.1 | 补回并升级 macOS 通用剪贴板兼容捕获（denylist 门禁、安全输入检查、合成事件标记、代际可取消、changeCount 复查恢复与迟到认领），修复 WPS 与浏览器 PDF 划词无工具栏及空白处双击误弹；macOS 补齐工具栏 WebView 恢复路径；权限轮询自适应与工具栏设置加载自愈；清理重复命令与死代码。 |
 
 跨版本累计完成的其他能力包括：多服务商多模型、自定义动作、HTTP 服务地址、URL/IP 直达、结果窗拖动与尺寸记忆、置顶与多种自动关闭方式、结果正文再次划词、安全 Markdown、模型重试与临时切换。
 
@@ -896,3 +897,63 @@ Windows 安装包使用 current-user 模式，不要求管理员权限；禁止�
 - **快捷键：** 保存设置时按解析后的快捷键身份切换注册，支持失败回滚与残留注册恢复；启用状态、事件 ID、当前注册项和持久化设置保持一致，录制组合键保留全部修饰键。
 - **版本与源码包：** `package.json`、`Cargo.toml`、`tauri.conf.json`、Windows conf、`Cargo.lock` 统一为 0.4.0；`pnpm export:dev-source` 导出可迁移源码包。
 - 产品版本升至 0.4.0。
+
+### 0.4.1：划词捕获加固、取词性能与覆盖面、设置审计与 UI 打磨
+
+（整理日期：2026-09-06）
+
+**背景与根因：** 0.4.0 重写 `apps/macos/native/selection_bridge.mm` 时，0.3.x 的「临时复制并恢复剪贴板」兼容路径（0.3.14 引入，0.3.33、0.3.39、0.3.54 持续加固）未被迁移，0.4.0 条目所称「denylist 与安全输入判断」实际未落地。WPS（Qt 自绘画布）与浏览器内嵌 PDF（PDFium/PDFKit 插件）的 AX 树不暴露选中文本，划词后工具栏不出现。实机测试还暴露了第二个问题：画布类应用在空白处保留旧模型选区或对无选区的 Cmd+C 做隐式复制，导致空白处双击也会误弹工具栏。
+
+**macOS 通用剪贴板兼容捕获：**
+
+- AX 有界读取失败后，对非 denylist 应用执行受控的合成 Cmd+C 事务：快照 NSPasteboard（含「原本为空」状态；出现无法重建的惰性表示、超过 16MB 的单个表示或累计超过 32MB 时整体放弃，fail-closed；`dyn.*` 动态表示跳过读取以防跨进程懒解析阻塞）→ 按 pid 投递带 `kCGEventSourceUserData` 标记的 Cmd+C（200ms 无反应后按会话级重发一次，覆盖忽略 pid 定向事件的应用）→ 轮询 changeCount 并容忍「先清后写」两段式复制 → 读取字符串 → 以复制后的 `copiedChangeCount` 为唯一恢复边界恢复原内容。
+- 门禁三级策略：密码管理器与 Finder 一律拒绝；GPU 终端（kitty/Alacritty/Ghostty/WezTerm 等）的 Cmd+C 是纯复制语义（无选区时 no-op），全触发方式放行；Terminal.app/iTerm2 及名称含 terminal/iterm 的「智能 Cmd+C」终端在无选区时会发 SIGINT 杀掉前台进程，仅放行键盘触发（Cmd+A、Shift+方向键必然留下真实选区）；`IsSecureEventInputEnabled()` 系统级安全输入；聚焦元素 AXSecureTextField / AXProtectedContent；前台应用必须 active 且非自身；事件 tap 通过合成标记忽略自己的按键，否则会自毁 capture generation 并触发 dismiss；每次 AX 往返（含新增预检）都保持 80ms 消息超时纪律。
+- **图片查看器场景（微信拖动图片即复制的修复）：** ① 回退前检查聚焦元素 AX role，`AXImage` 时直接跳过合成复制（图片查看器对 Cmd+C 的响应是复制图片并给出可见反馈）；role 读取不可读时短重试两次（约 30ms 间隔）——兼容属性是本次捕获中刚写入的，AX 树常在首次捕获期间才建立，「首拖必复制、后续不再」的实测现象即源于此；② 复制落地后检查粘贴板类型列表，若携带数据但不含任何文本类型（public.utf8-plain-text / RTF / HTML / utf16）判定为图片/文件类响应，等待约 60ms 写入稳定窗口后按最终 changeCount 恢复粘贴板并放弃本次捕获，避免与多步写入竞态导致恢复 fail-closed 而残留图片。
+- 可取消性：等待循环持续校验 capture generation，任何新输入立即中止；剪贴板事务独立预算 480ms（不复用 AX 的 260–300ms deadline，否则成功捕获会被过期判定丢弃）；结果以 `method:"clipboard"` 上报（Rust 契约早已存在），无几何时工具栏回落到光标锚点。
+- 门禁性能与一致性优化：受保护焦点 / 文本角色空选区 / AXImage 三个门禁共享同一次聚焦元素 AX 探针（单元素单角色单范围读取，替代原先最多 5-8 次重复往返），保证所有门禁判定基于同一元素；代际检查提前到任何 AX 工作之前；快照表示改为 ARC 直接持有 NSData（免除最多 32MB 的字节复制）。
+
+**与用户复制/粘贴的冲突边界：**
+
+- 恢复边界只认合成复制产生的 changeCount，且恢复前不做任何计数重同步——等待窗口内用户的真实复制会推进 changeCount，恢复 fail-closed 跳过，用户复制永远优先。
+- 轮询停止后有 120ms 的「迟到认领」窗口，但仅在无新输入（代际未变）时启用：慢应用迟到的合成复制会被收回或正常接受；一旦有新输入立即停止认领——此刻落地的复制可能是用户自己的 Cmd+C，宁可留下我们的合成复制（用户可重拷）也不冒覆盖用户复制的数据风险。
+- Cmd+V 粘贴不写剪贴板、与回退无冲突；极窄窗口内粘贴可能读到尚未恢复的合成复制内容，属于剪贴板式捕获的固有权衡（PopClip/Bob 同类）。
+
+**空白处点击误弹工具栏的修复（预检信度收窄）：**
+
+- 空选区预检仅在「聚焦元素为文本角色（AXTextArea/AXTextField/AXTextView/AXStaticText）且触发方式为双击/Shift 点击」时信任其 `kAXSelectedTextRange == {0,0}` 并跳过合成复制——保留编辑器空双击隐式复制当前行的修复，同时不再误伤微信这类画布应用：其聊天窗口聚焦元素（容器/输入框）会报告 {0,0}，并不反映用户在消息画布上的划选，0.4.1 开发期间曾因此导致微信划词完全失效；拖动与键盘触发一律不信任该信号。
+- AXImage 焦点预检保留（图片查看器场景），role 不可读时短重试两次以覆盖 AX 树首次建立窗口。
+- 新增 stale 护栏：剪贴板结果与上一次已接受的捕获文本相同、且本次捕获位置距原位置超过 48px 时，视为应用残留的旧模型选区而拒绝（已知取舍：在远处重新划选完全相同的文本也会被拒绝）。
+- 退化片段过滤（实机定位驱动）：ZCode 聊天窗口双击空白处时，Chromium 会真实选中空 Markdown 列表项的标记文本（`1. `），AX 路径据此弹出工具栏。鼠标触发（拖动/双击/Shift 点击）的捕获若去空白后 ≤3 个字符且不含「字母类」字符（ASCII 字母、西里尔、假名、CJK、谚文）一律丢弃——`1. `、`• `、`—` 等标记/符号碎片全部拦截；键盘与快捷键触发不受影响，含单个汉字或单词的正常选词不受影响。AX 与剪贴板两条路径一致应用。已知取舍：双击 3 字符以内的纯数字（如 `42`）不会弹工具栏。
+- 双击边界容差收紧（实机定位驱动）：Chrome 里双击 KaTeX 公式所在行的右侧空白，Chromium 会把无空格的整段公式串当作一个「词」选中（一次双击捕获 107–145 字节公式）。双击选中的词必然在光标之下，因此双击触发的鼠标-选区边界容差从 56px 收紧到 20px——点空白处选中相邻 token 的捕获被拒绝；拖动与 Shift 点击保持 56px（结束位置语义不同，不动）。
+- 回退全出口 trace 日志：`TEXTLENS_SELECTION_TRACE=1` 时输出 `[selection-fallback] …` 原因行（app-policy-denied / secure-event-input / text-element-empty-range-on-click / focused-element-is-image / clipboard-unrestorable-all-lazy / chord-ignored-by-app / non-text-copy / restore-boundary-missed / stale-same-text-far-location / text-matches-app-identity / capture: ok），行首带 app bundle 与触发方式，capture 成功行附带前 24 字符前缀（换行/控制字符转义）用于区分「残留旧选区 / 隐式复制 / 垃圾内容」；同时镜像到 `~/Library/Logs/TextLens/selection-trace.log`（Finder 启动的 GUI 应用看不到 stderr；只记原因与短前缀，不落全文）。打包应用启用方式：`launchctl setenv TEXTLENS_SELECTION_TRACE 1` 后重启应用，`launchctl unsetenv TEXTLENS_SELECTION_TRACE 1` 关闭。
+- 快照策略改为「跳过不可读表示」：惰性/超大表示不再整体放弃回退（否则剪贴板历史里只要出现过一次带惰性类型的复制，回退就会被永久卡死），仅当原始剪贴板有内容但全部不可恢复时才放弃；混合场景按可读表示部分恢复（bounded 降级，带 trace）。
+- 非文本判定改为白名单：仅当粘贴板携带已知图片/文件类型（TIFF/PNG/JPEG/file-url/promise）且无任何文本类型时才判为非文本响应；未知类型组合继续等待完整预算，避免误杀用特殊 UTI 写文本的应用。
+
+**macOS 工具栏恢复路径补齐：** 将 Windows 的工具栏 WebView 重建机制（`rebuild_toolbar`、恢复预留/取消状态机、Destroyed 后重建单例）扩展到 macOS。原生 stage 失败、事件投递失败、渲染器三次呈现尝试耗尽时，销毁并重建工具栏单例，新渲染器通过 `toolbar_ready` 重放内存中的选区；每个选区有界一次恢复尝试，防止持续的 WebView 失败造成重建循环。此前 macOS 在这些路径上会直接丢弃本次划词且无恢复手段。
+
+**响应与自愈：** 辅助功能权限轮询改为自适应间隔——未授权 600ms（系统设置授权后约 0.6 秒内自动启用划词），已授权 2s（仅检测撤销，Windows 恒为 trusted 故行为不变）；工具栏启动期设置读取失败后，每次新划词自动重新拉起重试链，不再依赖无关的设置变更才能恢复动作列表。
+
+**代码清理：** `hide_result` 与 `close_result` 两个实现完全相同的 IPC 命令合并为共享的 `close_result_session`；移除从未注册后端命令的 `recordResultRendererMarker` 渲染器 API 与 schema、无调用者的 `normalize_search_engines` 与 `activate_application_by_bundle_id`、SSE 解析器中未参与判定的 `saw_content` 字段，以及 `submit_notice`/`enqueue_notice` 上过时的 `#[allow(dead_code)]`。
+
+**版本与源码包：** `package.json`、`Cargo.toml`、`tauri.conf.json`、Windows conf、`Cargo.lock` 统一为 0.4.1；`pnpm export:dev-source` 导出可迁移源码包。
+
+**取词性能与覆盖面（对标 Easydict/SelectedTextKit 调研后落地）：** ① `AXSelectedTextMarkerRange` 文本标记回退——Chromium 系网页选区两次 AX 调用直达，避免树遍历与合成复制；② 移除捕获前 12ms 固定延时，改为首读失败后的自适应单次重试（28/24/12ms）+ AXUIElement 按 pid 缓存复用；③ 浏览器 AppleScript 取词层（位于 AX 失败与剪贴板回退之间，Safari 唯一快速路径；osascript 子进程 200ms 硬超时防 TCC 授权弹窗卡死流水线；`Info.plist` 增 `NSAppleEventsUsageDescription`；`method:"applescript"` 上报，渲染器 payload 无 method 无感）；④ 剪贴板回退移入专用线程（latest-wins 队列 + generation 逐阶段取消，手动快捷键捕获保持内联同步），480ms 合成复制不再阻塞下一手势的 AX 读取；⑤ macOS 展示路径四次跨线程往返合并为单次主线程 hop（`commit_toolbar_presentation`），stage 在工具栏隐藏态跳过 alpha hop。trace 变更：`mouse-up-to-capture-complete` 拆为 `mouse-up-to-ax-complete` / `mouse-up-to-fallback-complete`，新增 `applescript`、`fallback-capture` 阶段与 `pointer-hit-test` 诊断行。
+
+**微信图片查看器拖动复制修复：** 拖动图片被判定为 Drag 划词，AX 失败后合成 Cmd+C 使微信复制图片——0.4.1 的 AXImage 焦点预检对它无效：该查看器聚焦元素不可读（整份 trace 中 `skip: focused-element-is-image` 零命中）。修复：合成复制前对鼠标手势做指针位置命中测试（`AXUIElementCopyElementAtPosition`）——角色链含 AXImage 即拒绝（通用规则）；实测微信图片查看器在光标下只暴露裸窗口（`AXWindow>AXApplication`），故再加「微信 + 鼠标手势 + 裸窗口表面」规则直接跳过回退（`skip: wechat-bare-window-drag`）。键盘触发不参与判定（光标位置无意义，避免误伤画布类应用的键盘选区捕获）。
+
+**设置项审计与两处修复：** 对 7 个分区全部叶子设置做端到端核对（UI → 落盘 → 消费方），TS↔Rust schema 无漂移，其余均真实有效。修复两处：①「划词获取」分区仅 Windows 选择监视器消费（macOS 回退策略硬编码于原生桥），UI 按平台隐藏，记忆分区指向它时回落到第一个可见分区；② `providers[].enabled` 此前只影响两个模型选择器的可见性，执行链 `prepared_provider` 现对已停用服务商拒绝执行（连接测试/获取模型不拦，保留重新启用前的配置流程）。
+
+**结果框空白修复与 UI 细节：** 「思考」折叠后的大段空白根因不在布局（真实 DOM+CSS 浏览器实测间距仅 10px），而是推理模型答案首部空行被流式纯文本 `pre-wrap` 原样渲染——新增 `stripLeadingBlankLines` 在显示层剥除（只剥首个内容行之前的空白行，原始内容与复制不受影响），应用于纯文本流视图与思考内容；思考条折叠态改紧凑胶囊（`fit-content`，展开恢复全宽）。另：设置侧栏标题不换行；权限卡片受信任态按钮改状态徽章；工具栏与其余设置分区经真实渲染逐屏巡检无需改动。
+
+**回归清单（实机验证用）：**
+
+- WPS 文字/表格划词；Chrome/Safari/Edge 打开 PDF 划词；TextEdit 与普通网页文本不进入剪贴板路径。
+- kitty/Alacritty/Ghostty 里划词可弹出工具栏，且空选拖动不会误发中断；Terminal.app/iTerm2 拖动划词走 AX 路径，Cmd+A 触发可用；1Password 不触发合成复制；此前复制过文件时在 WPS 划词（快照含惰性表示则回退放弃，AX 正常则不受影响）。
+- **空白处双击不弹工具栏**；同一位置反复双击同一单词仍可弹出；远处重新划选完全相同的文本被 stale 护栏拒绝（已知取舍）；**微信图片查看器中拖动图片不再触发复制**（AXImage 预检生效；若个别版本未暴露 AXImage，剪贴板也会在一个轮询周期内被恢复）。
+- 合成 Cmd+C 等待期间按键或点击立即取消且剪贴板无残留；等待窗口内用户按 Cmd+C 复制后剪贴板保留用户内容；划词捕获完成后剪贴板恢复为划词前的内容。
+- 连续划词、划词后复制/搜索/翻译再划词（手册「后续开发建议」九项序列照跑）。
+- macOS 辅助功能授权后约 1 秒内划词自动可用；工具栏渲染器异常时下一次划词可自动重建（recover 日志 `stage=rebuild/delivery-recovery`）。
+- Chromium 网页划词命中 marker-range（trace `capture` 阶段耗时下降、不再出现 clipboard `capture: ok`）；Safari 划词首次触发系统「自动化」授权，允许后见 `applescript-capture: ok` 且剪贴板内容不变；Chrome 开启「允许从 Apple 事件中的 JavaScript」前后各测一次。
+- 连续快速划词不再被上一次剪贴板回退阻塞；微信图片查看器拖动图片不再触发复制（`skip: wechat-bare-window-drag`），聊天窗口文字拖动行为不变。
+- 设置页 macOS 不显示「划词获取」分区；停用服务商后其绑定动作执行报「该服务商已停用，请在设置中启用后再试」。
+- 结果框：思考折叠后正文紧贴紧凑思考条、无首部空行空洞；思考展开恢复全宽滚动。

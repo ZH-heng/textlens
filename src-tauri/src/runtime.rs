@@ -743,7 +743,7 @@ impl RuntimeState {
             .fetch_add(1, Ordering::AcqRel);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn recover_toolbar_delivery(&self, app: &AppHandle, selection_id: &str) {
         if !self.current_selection_matches(selection_id) {
             return;
@@ -835,10 +835,10 @@ impl RuntimeState {
         // Publish before touching the native window. If the toolbar is being
         // replaced, a stage/emit failure must leave this validated selection
         // available for the replacement renderer's `toolbar_ready` replay.
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         self.windows.begin_toolbar_selection(&toolbar_selection_id);
         *self.current_selection.lock() = Some(current);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let stage_failed = match self.windows.stage_toolbar_with_placement(
             app,
             &toolbar_selection_id,
@@ -855,18 +855,6 @@ impl RuntimeState {
                 true
             }
         };
-        // macOS has no WebView2-style renderer-crash recovery path, so a
-        // stage failure here is handled the same way show_toolbar's failure
-        // always was: fail fast and clear the selection instead of retrying.
-        #[cfg(target_os = "macos")]
-        if let Err(error) =
-            self.windows
-                .stage_toolbar_with_placement(app, &toolbar_selection_id, anchor, placement)
-        {
-            self.clear_and_hide_current_selection_if(app, &toolbar_selection_id);
-            eprintln!("[window] 无法显示划词工具栏：{error}");
-            return;
-        }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         if let Err(error) =
             self.windows
@@ -879,7 +867,7 @@ impl RuntimeState {
         if !self.current_selection_matches(&toolbar_selection_id) {
             return;
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         if stage_failed {
             eprintln!(
                 "[toolbar] stage=selection-stage selection_id={} error_class=window",
@@ -894,15 +882,18 @@ impl RuntimeState {
         let emitted = app.emit_to(TOOLBAR_LABEL, SELECTION_EVENT, public).is_ok();
         trace_selection_timing("runtime", runtime_started);
         if !emitted {
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
                 eprintln!(
                     "[toolbar] stage=selection-emit selection_id={} error_class=window",
                     toolbar_selection_id
                 );
+                // The selection stays published on purpose: the rebuilt
+                // renderer replays it through `toolbar_ready`, so a dead
+                // WebView costs one rebuild instead of this whole mouse-up.
                 self.recover_toolbar_delivery(app, &toolbar_selection_id);
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             self.clear_and_hide_current_selection_if(app, &toolbar_selection_id);
             return;
         }
@@ -1579,7 +1570,10 @@ impl RuntimeState {
 
     pub fn handle_window_event(&self, app: &AppHandle, label: &str, event: &WindowEvent) {
         if label == TOOLBAR_LABEL {
-            #[cfg(target_os = "windows")]
+            // A renderer-initiated rebuild destroys the singleton toolbar; the
+            // Destroyed event recreates it so the replacement renderer can
+            // replay the in-memory selection through `toolbar_ready`.
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             if matches!(event, WindowEvent::Destroyed)
                 && !self.shutting_down.load(Ordering::Acquire)
                 && self.windows.take_toolbar_recovery_pending()
@@ -1819,10 +1813,26 @@ fn selection_loop(app: AppHandle, receiver: Receiver<SelectionEvent>) {
     }
 }
 
+/// While untrusted (typical first run), poll quickly so granting Accessibility
+/// in System Settings enables selection capture almost immediately. Once
+/// trusted, the poll only detects revocation, so the original slower cadence
+/// is enough. Windows is always trusted and keeps the trusted cadence.
+const PERMISSION_POLL_TRUSTED_MS: u64 = 2_000;
+const PERMISSION_POLL_UNTRUSTED_MS: u64 = 600;
+
+fn permission_poll_interval(trusted: bool) -> Duration {
+    if trusted {
+        Duration::from_millis(PERMISSION_POLL_TRUSTED_MS)
+    } else {
+        Duration::from_millis(PERMISSION_POLL_UNTRUSTED_MS)
+    }
+}
+
 pub fn start_permission_poll(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            let trusted = SelectionMonitor::is_accessibility_trusted();
+            tokio::time::sleep(permission_poll_interval(trusted)).await;
             let state = app.state::<RuntimeState>();
             if state.shutting_down.load(Ordering::Acquire) {
                 break;
@@ -2418,7 +2428,7 @@ pub fn recover_toolbar(
         return Ok(false);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         let rebuilt = state
             .windows
@@ -2432,7 +2442,7 @@ pub fn recover_toolbar(
             })?;
         Ok(rebuilt)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = app;
         Ok(false)
@@ -3121,14 +3131,7 @@ pub fn hide_result(
     state: State<'_, RuntimeState>,
     session_id: String,
 ) -> Result<(), String> {
-    ensure_result_caller(&window, &session_id)?;
-    state.persist_result_size_now(&app, window.label());
-    state
-        .windows
-        .close_result(&app, window.label())
-        .map_err(|error| error.to_string())?;
-    state.cleanup_result_session(&app, &session_id);
-    Ok(())
+    close_result_session(&app, &window, &state, &session_id)
 }
 
 #[tauri::command]
@@ -3138,13 +3141,25 @@ pub fn close_result(
     state: State<'_, RuntimeState>,
     session_id: String,
 ) -> Result<(), String> {
-    ensure_result_caller(&window, &session_id)?;
-    state.persist_result_size_now(&app, window.label());
+    close_result_session(&app, &window, &state, &session_id)
+}
+
+/// Shared body of `hide_result` (pointer-leave dismissal) and `close_result`
+/// (explicit close): both persist size, close the window and tear down the
+/// session identically.
+fn close_result_session(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    state: &State<'_, RuntimeState>,
+    session_id: &str,
+) -> Result<(), String> {
+    ensure_result_caller(window, session_id)?;
+    state.persist_result_size_now(app, window.label());
     state
         .windows
-        .close_result(&app, window.label())
+        .close_result(app, window.label())
         .map_err(|error| error.to_string())?;
-    state.cleanup_result_session(&app, &session_id);
+    state.cleanup_result_session(app, session_id);
     Ok(())
 }
 
@@ -4162,6 +4177,20 @@ mod tests {
         // Wrapping is supported so generation never panics at u64::MAX.
         assert_eq!(next_host_clear_token(u64::MAX), 0);
         assert!(!should_fire_pending_host_clear(u64::MAX, 0));
+    }
+
+    #[test]
+    fn permission_poll_polls_faster_while_untrusted() {
+        let trusted = permission_poll_interval(true);
+        let untrusted = permission_poll_interval(false);
+        // Grant pickup after the user approves Accessibility must feel
+        // immediate; revocation detection once trusted can stay relaxed.
+        assert_eq!(trusted, Duration::from_millis(PERMISSION_POLL_TRUSTED_MS));
+        assert_eq!(
+            untrusted,
+            Duration::from_millis(PERMISSION_POLL_UNTRUSTED_MS)
+        );
+        assert!(untrusted < trusted);
     }
 
     #[test]

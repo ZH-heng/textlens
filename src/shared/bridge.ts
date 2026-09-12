@@ -6,7 +6,6 @@ import type {
   ProviderUpdateInput,
   PublicSettings,
   ResultReadyAck,
-  ResultRendererMarker,
   ResultSessionSnapshot,
   SelectionPayload,
   SettingsUpdate,
@@ -103,11 +102,6 @@ export interface WindowTextLensApi {
   reportToolbarSize(size: ToolbarSize, selectionId?: string): Promise<void>
   beginResultReady(sessionId: string): Promise<ResultSessionSnapshot>
   ackResultReady(ack: ResultReadyAck): Promise<boolean>
-  recordResultRendererMarker(
-    sessionId: string,
-    requestId: string,
-    marker: ResultRendererMarker
-  ): Promise<void>
   /** Internal result-window reveal handshake. */
   prepareResultReveal?(sessionId: string): Promise<void>
   /** Internal result-window reveal handshake. */

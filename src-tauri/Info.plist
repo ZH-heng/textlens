@@ -4,5 +4,7 @@
 <dict>
   <key>LSUIElement</key>
   <true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>TextLens sends Apple Events to browsers to read the text you just selected, so the selection toolbar can appear without touching your clipboard.</string>
 </dict>
 </plist>

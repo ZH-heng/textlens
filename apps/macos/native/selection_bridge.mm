@@ -32,6 +32,7 @@
 #include <new>
 #include <limits>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -59,11 +60,48 @@ constexpr uint64_t kAXCaptureBudgetMs = 260;
 constexpr uint64_t kDocumentAXCaptureBudgetMs = 300;
 constexpr uint64_t kAXCompatibilityRetryDelayMs = 28;
 constexpr uint64_t kAXLateSelectionRetryDelayMs = 24;
+// Grace period for the single unconditional AX retry when the first read
+// found nothing: the provider may not have committed the selection when the
+// first read lands. This replaces the old unconditional 12ms pre-capture
+// sleep, which taxed every successful fast-path capture.
+constexpr uint64_t kAXSelectionCommitRetryDelayMs = 12;
 // Proactive self-healing check for the event tap, mirroring Windows' hook
 // health-check cadence; the reactive re-enable in eventTapCallback only
 // fires on the next incoming event, which never arrives if the tap was
 // disabled during a quiet period.
 constexpr CFTimeInterval kEventTapHealthCheckIntervalSeconds = 5.0;
+// Clipboard compatibility fallback: canvas-based apps (WPS/Qt documents,
+// browser PDF plugins, some Electron views) expose no selected text over AX.
+// A synthetic Cmd+C reads what the app itself would copy, then the original
+// pasteboard is restored. The fallback is denylisted, secure-input aware and
+// generation-cancellable so it only ever reads what the user just selected.
+constexpr int64_t kSyntheticEventMarker = 0x544c4d41434f534cLL; // "TLMACOSL"
+constexpr uint64_t kClipboardFallbackBudgetMs = 480;
+constexpr uint64_t kClipboardPollIntervalMs = 12;
+// Apps that ignore pid-targeted events get one retry posted at session level.
+constexpr uint64_t kClipboardSessionRetryAfterMs = 200;
+// Extra window after polling stopped for a slow or interrupted copy to land,
+// so the restore can reclaim our chord instead of polluting the clipboard.
+constexpr uint64_t kClipboardLateCopyClaimMs = 120;
+constexpr uint64_t kClipboardMaxTextBytes = 2'000'000;
+constexpr NSUInteger kClipboardSnapshotMaxRepresentationBytes = 16u << 20;
+constexpr NSUInteger kClipboardSnapshotMaxTotalBytes = 32u << 20;
+// Stability window (in poll ticks) required before reclaiming a non-text
+// copy, so multi-step pasteboard writes finish inside the boundary.
+constexpr NSInteger kClipboardNonTextStablePolls = 5;
+// Canvas apps can keep their previous selection alive when the user clicks
+// empty space, so a synthetic copy may return that old text unchanged. A
+// result identical to the previous accepted capture, but captured far away
+// from it, is treated as stale instead of a fresh selection.
+constexpr double kStaleClipboardSelectionDistancePx = 48.0;
+// Browser AppleScript layer: reads the live DOM selection via `osascript`
+// without synthesizing input or touching the pasteboard. It sits between the
+// AX path and the clipboard fallback. Safari exposes no AXSelectedText at
+// all, so this is its only fast non-intrusive path; Chrome-kernel browsers
+// need the user-facing "Allow JavaScript from Apple Events" switch, and a
+// missing switch fails fast into the clipboard fallback. The layer is
+// bounded by kAppleScriptProcessTimeoutMs.
+constexpr uint64_t kAppleScriptProcessTimeoutMs = 200;
 
 enum class Trigger {
     Drag,
@@ -73,8 +111,20 @@ enum class Trigger {
     Manual,
 };
 
+static const char *TriggerTag(Trigger trigger) {
+    switch (trigger) {
+        case Trigger::Drag: return "drag";
+        case Trigger::DoubleClick: return "doubleClick";
+        case Trigger::ShiftClick: return "shiftClick";
+        case Trigger::Keyboard: return "keyboard";
+        case Trigger::Manual: return "manual";
+    }
+}
+
 enum class SelectionMethod {
     Accessibility,
+    Clipboard,
+    AppleScript,
 };
 
 struct SelectionInfo {
@@ -126,6 +176,18 @@ struct Task {
     uint64_t enqueuedAtMs = 0;
 };
 
+// Deferred clipboard/AppleScript capture: the AX pipeline ran on the capture
+// worker and found nothing, so the (potentially multi-hundred-ms) fallback
+// chain continues on its own thread without blocking the next gesture's AX
+// read. `targetPid` identifies the app the AX half observed.
+struct FallbackTask {
+    SelectionInfo info;
+    pid_t targetPid = 0;
+    uint64_t generation = 0;
+    bool clipboardAllowed = false;
+    uint64_t enqueuedAtMs = 0;
+};
+
 static uint64_t MonotonicMilliseconds() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now().time_since_epoch()).count());
@@ -157,9 +219,22 @@ static void ConfigureAccessibilityElement(AXUIElementRef element) {
 static bool SelectionTimingEnabled() {
     static const bool enabled = [] {
         const char *value = std::getenv("TEXTLENS_SELECTION_TRACE");
-        return value != nullptr &&
+        if (value != nullptr &&
             (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
-             std::strcmp(value, "TRUE") == 0);
+             std::strcmp(value, "TRUE") == 0)) {
+            return true;
+        }
+        // File-based switch so a Finder-launched (packaged) app can enable
+        // tracing without launchctl env propagation: the marker must exist
+        // before the app starts.
+        const char *home = std::getenv("HOME");
+        if (home == nullptr) {
+            return false;
+        }
+        const std::string marker =
+            std::string(home) + "/Library/Logs/TextLens/selection-trace.enabled";
+        struct stat info {};
+        return ::stat(marker.c_str(), &info) == 0 && S_ISREG(info.st_mode);
     }();
     return enabled;
 }
@@ -172,6 +247,36 @@ static void TraceSelectionTiming(const char *stage, uint64_t durationMs) {
             stage,
             static_cast<unsigned long long>(durationMs));
     }
+}
+
+// One line per clipboard-fallback gate decision; enables field diagnosis of
+// "why did/didn't a synthetic copy fire" without changing default behavior.
+// Mirrored to ~/Library/Logs/TextLens/selection-trace.log because a
+// Finder-launched app's stderr is not visible. Never logs text content —
+// lengths and reasons only.
+static void TraceClipboardGate(const char *decision) {
+    if (!SelectionTimingEnabled()) {
+        return;
+    }
+    std::fprintf(stderr, "[selection-fallback] %s\n", decision);
+    static std::mutex fileMutex;
+    std::lock_guard<std::mutex> lock(fileMutex);
+    const char *home = std::getenv("HOME");
+    if (home == nullptr) {
+        return;
+    }
+    const std::string directory = std::string(home) + "/Library/Logs/TextLens";
+    ::mkdir(directory.c_str(), 0755);
+    FILE *file = std::fopen((directory + "/selection-trace.log").c_str(), "a");
+    if (file == nullptr) {
+        return;
+    }
+    std::fprintf(
+        file,
+        "%llu %s\n",
+        static_cast<unsigned long long>(MonotonicMilliseconds()),
+        decision);
+    std::fclose(file);
 }
 
 static uint64_t TimestampMilliseconds() {
@@ -327,6 +432,40 @@ static bool ReadSelectionBounds(
     return info.hasBounds;
 }
 
+// Reads the selection via the text-marker APIs used by web-content AX trees.
+static bool ReadSelectedTextByMarkerRange(
+    AXUIElementRef element,
+    std::string &text,
+    const AccessibilityReadContext &context) {
+    if (element == nullptr || !context.IsCurrent()) {
+        return false;
+    }
+    CFTypeRef markerRange = nullptr;
+    AXError error = AXUIElementCopyAttributeValue(
+        element,
+        CFSTR("AXSelectedTextMarkerRange"),
+        &markerRange);
+    if (error != kAXErrorSuccess || markerRange == nullptr) {
+        return false;
+    }
+    CFTypeRef markerText = nullptr;
+    AXError textError = context.IsCurrent()
+        ? AXUIElementCopyParameterizedAttributeValue(
+              element,
+              CFSTR("AXStringForTextMarkerRange"),
+              markerRange,
+              reinterpret_cast<CFTypeRef *>(&markerText))
+        : kAXErrorFailure;
+    CFRelease(markerRange);
+    const bool success = textError == kAXErrorSuccess && markerText != nullptr &&
+        CFGetTypeID(markerText) == CFStringGetTypeID() &&
+        StringFromCFString(static_cast<CFStringRef>(markerText), text) && !IsBlank(text);
+    if (markerText != nullptr) {
+        CFRelease(markerText);
+    }
+    return success;
+}
+
 static bool ReadSelectedText(
     AXUIElementRef element,
     std::string &text,
@@ -350,6 +489,15 @@ static bool ReadSelectedText(
 
     if (!context.IsCurrent()) {
         return false;
+    }
+
+    // Chromium/Electron/WebKit expose web selections through text-marker
+    // ranges even when kAXSelectedTextAttribute is unavailable (or reports
+    // an empty string) on the focused element. Two AX calls read the exact
+    // selected string, avoiding both the kAXValue whole-document read and
+    // the bounded tree descent in the most common web scenario.
+    if (ReadSelectedTextByMarkerRange(element, text, context)) {
+        return true;
     }
 
     CFTypeRef value = nullptr;
@@ -482,12 +630,84 @@ static bool SelectionTextMatchesSourceIdentity(const SelectionInfo &info) {
         WindowTitleComponentMatches(info.windowTitle, normalizedText);
 }
 
-static bool PointNearSelectionBounds(CGPoint point, CGRect bounds) {
-    constexpr CGFloat tolerance = 56.0;
+// A double-click selects the word under the cursor, so the reported
+// selection must essentially contain the click. A larger tolerance would
+// admit "clicked the blank right side of a line, got the adjacent unbroken
+// token/formula" captures. Drags end exactly at the cursor and shift-clicks
+// sit inside the selection, but providers round coordinates, so they keep
+// the looser historical tolerance.
+static CGFloat PointNearSelectionBoundsTolerance(Trigger trigger) {
+    return trigger == Trigger::DoubleClick ? 20.0 : 56.0;
+}
+
+static bool PointNearSelectionBounds(CGPoint point, CGRect bounds, CGFloat tolerance) {
     return point.x >= CGRectGetMinX(bounds) - tolerance &&
         point.x <= CGRectGetMaxX(bounds) + tolerance &&
         point.y >= CGRectGetMinY(bounds) - tolerance &&
         point.y <= CGRectGetMaxY(bounds) + tolerance;
+}
+
+// A double-click on rendered-but-empty content (markdown bullets "• ", empty
+// list markers "1. ", gutter fragments) yields a tiny "selection" the user
+// never perceives as text. Mouse-triggered captures of such degenerate
+// fragments — at most three characters and none of them letter-like — are
+// dropped; keyboard/manual gestures stay deliberate and unaffected, and any
+// CJK/kana/Hangul or Latin letter keeps the capture.
+static bool CodePointIsLetterish(uint32_t codePoint) {
+    return (codePoint >= 'a' && codePoint <= 'z') ||
+        (codePoint >= 'A' && codePoint <= 'Z') ||
+        (codePoint >= 0x0400 && codePoint <= 0x04FF) ||   // Cyrillic
+        (codePoint >= 0x3040 && codePoint <= 0x30FF) ||   // kana
+        (codePoint >= 0x3400 && codePoint <= 0x4DBF) ||   // CJK ext A
+        (codePoint >= 0x4E00 && codePoint <= 0x9FFF) ||   // CJK unified
+        (codePoint >= 0xAC00 && codePoint <= 0xD7AF) ||   // Hangul
+        (codePoint >= 0xF900 && codePoint <= 0xFAFF) ||   // CJK compat
+        (codePoint >= 0x20000 && codePoint <= 0x3FFFF);   // CJK ext B+
+}
+
+static bool SelectionTextIsDegenerateFragment(const std::string &text) {
+    size_t start = 0;
+    size_t end = text.size();
+    while (start < end && std::isspace(static_cast<unsigned char>(text[start])) != 0) {
+        ++start;
+    }
+    while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
+        --end;
+    }
+    if (end == start) {
+        return true;
+    }
+    size_t codePoints = 0;
+    bool hasLetterish = false;
+    size_t index = start;
+    while (index < end) {
+        const unsigned char lead = static_cast<unsigned char>(text[index]);
+        size_t length = 1;
+        uint32_t codePoint = lead;
+        if ((lead & 0xE0) == 0xC0 && index + 1 < end) {
+            length = 2;
+            codePoint = lead & 0x1F;
+        } else if ((lead & 0xF0) == 0xE0 && index + 2 < end) {
+            length = 3;
+            codePoint = lead & 0x0F;
+        } else if ((lead & 0xF8) == 0xF0 && index + 3 < end) {
+            length = 4;
+            codePoint = lead & 0x07;
+        }
+        for (size_t offset = 1; offset < length; ++offset) {
+            codePoint = (codePoint << 6) |
+                (static_cast<unsigned char>(text[index + offset]) & 0x3F);
+        }
+        if (CodePointIsLetterish(codePoint)) {
+            hasLetterish = true;
+        }
+        index += length;
+        codePoints += 1;
+        if (codePoints > 3) {
+            return false;
+        }
+    }
+    return !hasLetterish;
 }
 
 static bool SelectionCandidateMatchesInput(const SelectionInfo &candidate) {
@@ -497,6 +717,9 @@ static bool SelectionCandidateMatchesInput(const SelectionInfo &candidate) {
     if (candidate.trigger == Trigger::Keyboard || candidate.trigger == Trigger::Manual) {
         return true;
     }
+    if (SelectionTextIsDegenerateFragment(candidate.text)) {
+        return false;
+    }
     if (!candidate.hasBounds) {
         // Some PDF and Office providers expose a real AXSelectedText range
         // but do not implement AXBoundsForRange. The text was read from an
@@ -505,8 +728,10 @@ static bool SelectionCandidateMatchesInput(const SelectionInfo &candidate) {
         // a destructive fallback.
         return true;
     }
-    return PointNearSelectionBounds(candidate.mouseCurrent, candidate.bounds) ||
-        (candidate.hasMouseEnd && PointNearSelectionBounds(candidate.mouseEnd, candidate.bounds));
+    const CGFloat tolerance = PointNearSelectionBoundsTolerance(candidate.trigger);
+    return PointNearSelectionBounds(candidate.mouseCurrent, candidate.bounds, tolerance) ||
+        (candidate.hasMouseEnd &&
+         PointNearSelectionBounds(candidate.mouseEnd, candidate.bounds, tolerance));
 }
 
 static bool ReadValidatedSelectedText(
@@ -814,6 +1039,51 @@ private:
     std::unordered_map<pid_t, CachedProcessState> appliedPids_;
 };
 
+// Reuses the per-application AXUIElement across captures. The read path, the
+// clipboard focus probe and other helpers previously allocated a fresh
+// element for every call; the cache keeps repeated captures of one app
+// allocation-free. PIDs may be recycled: an element created for pid X always
+// addresses whoever owns pid X now, which stays correct because every caller
+// re-derives the element for the current frontmost pid.
+class ApplicationElementCache {
+public:
+    AXUIElementRef CopyElement(pid_t pid) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = elements_.find(pid);
+        if (it != elements_.end()) {
+            CFRetain(it->second);
+            return it->second;
+        }
+        AXUIElementRef element = AXUIElementCreateApplication(pid);
+        if (element == nullptr) {
+            return nullptr;
+        }
+        if (elements_.size() >= kMaxEntries) {
+            // FIFO eviction; entries are interchangeable, so no LRU needed.
+            elements_.erase(order_.front());
+            order_.pop_front();
+        }
+        elements_[pid] = element;
+        order_.push_back(pid);
+        CFRetain(element);
+        return element;
+    }
+
+    ~ApplicationElementCache() {
+        for (const auto &entry : elements_) {
+            CFRelease(entry.second);
+        }
+    }
+
+private:
+    static constexpr size_t kMaxEntries = 16;
+    std::mutex mutex_;
+    std::unordered_map<pid_t, AXUIElementRef> elements_;
+    std::deque<pid_t> order_;
+};
+
+static ApplicationElementCache gApplicationElementCache;
+
 static bool ReadViaAccessibility(
     NSRunningApplication *application,
     SelectionInfo &info,
@@ -824,7 +1094,8 @@ static bool ReadViaAccessibility(
     if (application == nil || !context.IsCurrent()) {
         return false;
     }
-    AXUIElementRef applicationElement = AXUIElementCreateApplication(application.processIdentifier);
+    AXUIElementRef applicationElement =
+        gApplicationElementCache.CopyElement(application.processIdentifier);
     if (applicationElement == nullptr) {
         return false;
     }
@@ -944,6 +1215,1046 @@ static bool IsDocumentOrOfficeSelectionApplication(
         normalizedAppName.find("libreoffice") != std::string::npos;
 }
 
+// Declared in <HIServices/SecureInput.h>; redeclared here because that SDK
+// header is not present in every toolchain's module map. Password fields
+// enable secure event input system-wide, which must disable the synthetic
+// copy fallback even when the AX tree cannot identify the focused element.
+extern "C" Boolean IsSecureEventInputEnabled(void);
+
+struct PasteboardRepresentation {
+    std::string type;
+    // ARC-retained immutable bytes from the pasteboard. Retaining instead of
+    // copying avoids duplicating up to the full snapshot budget per capture.
+    NSData *data = nil;
+};
+
+struct PasteboardItemSnapshot {
+    std::vector<PasteboardRepresentation> representations;
+};
+
+struct PasteboardSnapshot {
+    // `valid` also represents an originally empty pasteboard. This distinction
+    // is required to restore an empty clipboard after a synthetic Cmd+C.
+    bool valid = false;
+    std::vector<PasteboardItemSnapshot> items;
+};
+
+// Last accepted clipboard-fallback capture, used by the stale-model guard.
+// Guarded by `gLastClipboardCaptureMutex`: the clipboard fallback runs on the
+// dedicated fallback worker while the manual capture path still touches it
+// from the caller's thread.
+struct LastClipboardCapture {
+    bool valid = false;
+    std::string bundleId;
+    std::string normalizedText;
+    CGPoint location = CGPointZero;
+};
+
+static std::mutex gPasteboardFallbackMutex;
+static std::mutex gLastClipboardCaptureMutex;
+
+static PasteboardSnapshot SnapshotPasteboard(NSPasteboard *pasteboard) {
+    PasteboardSnapshot snapshot;
+    if (pasteboard == nil) {
+        return snapshot;
+    }
+    snapshot.valid = true;
+    NSArray<NSPasteboardItem *> *items = pasteboard.pasteboardItems;
+    NSUInteger totalSnapshotBytes = 0;
+    NSUInteger skippedRepresentations = 0;
+    for (NSPasteboardItem *item in items) {
+        PasteboardItemSnapshot itemSnapshot;
+        for (NSPasteboardType type in item.types) {
+            // Dynamic ("dyn.*") representations are derived forms of the
+            // static ones and reading one can force a cross-process lazy
+            // fetch from the source app. Skip them.
+            if ([type hasPrefix:@"dyn."]) {
+                continue;
+            }
+            NSData *data = [item dataForType:type];
+            if (data == nil || data.length > kClipboardSnapshotMaxRepresentationBytes) {
+                // A promised/lazy (or oversized) representation cannot be
+                // faithfully reconstructed after clearContents. Skipping it
+                // instead of aborting the whole fallback: the capture must
+                // stay available regardless of the clipboard's HISTORY, and
+                // the restore below keeps every readable representation.
+                skippedRepresentations += 1;
+                continue;
+            }
+            if (totalSnapshotBytes + data.length > kClipboardSnapshotMaxTotalBytes) {
+                skippedRepresentations += 1;
+                continue;
+            }
+            totalSnapshotBytes += data.length;
+            PasteboardRepresentation representation;
+            representation.type = StringFromNSString(type);
+            representation.data = data;
+            itemSnapshot.representations.push_back(std::move(representation));
+        }
+        if (itemSnapshot.representations.empty()) {
+            // The item exposed only unreadable/lazy representations. Drop the
+            // whole item rather than restoring a hollow shell for it.
+            continue;
+        }
+        snapshot.items.push_back(std::move(itemSnapshot));
+    }
+    if (snapshot.items.empty() && items.count > 0) {
+        // The original clipboard had content but none of it is restorable;
+        // restoring would wipe the user's clipboard. Abort this fallback.
+        snapshot.valid = false;
+        TraceClipboardGate("skip: clipboard-unrestorable-all-lazy");
+    } else if (skippedRepresentations > 0) {
+        char line[96];
+        std::snprintf(
+            line,
+            sizeof(line),
+            "snapshot: %u representations skipped (restore partial)",
+            static_cast<unsigned>(skippedRepresentations));
+        TraceClipboardGate(line);
+    }
+    return snapshot;
+}
+
+static bool RestorePasteboard(
+    NSPasteboard *pasteboard,
+    const PasteboardSnapshot &snapshot,
+    NSInteger expectedChangeCount) {
+    if (pasteboard == nil || !snapshot.valid) {
+        return false;
+    }
+    // Fail closed: another writer already changed the pasteboard. A user copy
+    // that happened after ours wins and must never be overwritten.
+    if (pasteboard.changeCount != expectedChangeCount) {
+        return false;
+    }
+    [pasteboard prepareForNewContentsWithOptions:NSPasteboardContentsCurrentHostOnly];
+    if (snapshot.items.empty()) {
+        return true;
+    }
+
+    NSMutableArray<NSPasteboardItem *> *items =
+        [NSMutableArray arrayWithCapacity:snapshot.items.size()];
+    for (const PasteboardItemSnapshot &itemSnapshot : snapshot.items) {
+        NSPasteboardItem *item = [[NSPasteboardItem alloc] init];
+        for (const PasteboardRepresentation &representation : itemSnapshot.representations) {
+            NSString *type = NSStringFromString(representation.type);
+            if (type == nil || representation.data == nil) {
+                continue;
+            }
+            [item setData:representation.data forType:type];
+        }
+        if (item.types.count > 0) {
+            [items addObject:item];
+        }
+    }
+    BOOL wrote = items.count == 0 || [pasteboard writeObjects:items];
+    return wrote == YES;
+}
+
+static bool PostCopyShortcut(pid_t processIdentifier, bool toSession) {
+    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+    CGEventRef keyDown = CGEventCreateKeyboardEvent(source, kVK_ANSI_C, true);
+    CGEventRef keyUp = CGEventCreateKeyboardEvent(source, kVK_ANSI_C, false);
+    if (source != nullptr) CFRelease(source);
+    if (keyDown == nullptr || keyUp == nullptr) {
+        if (keyDown != nullptr) CFRelease(keyDown);
+        if (keyUp != nullptr) CFRelease(keyUp);
+        return false;
+    }
+    CGEventSetFlags(keyDown, kCGEventFlagMaskCommand);
+    CGEventSetFlags(keyUp, kCGEventFlagMaskCommand);
+    // Mark both events so the event tap ignores them: an unmarked synthetic
+    // chord would bump the capture generation and dismiss the toolbar as if
+    // the user had typed.
+    CGEventSetIntegerValueField(keyDown, kCGEventSourceUserData, kSyntheticEventMarker);
+    CGEventSetIntegerValueField(keyUp, kCGEventSourceUserData, kSyntheticEventMarker);
+    if (toSession) {
+        CGEventPost(kCGSessionEventTap, keyDown);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CGEventPost(kCGSessionEventTap, keyUp);
+    } else {
+        CGEventPostToPid(processIdentifier, keyDown);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        CGEventPostToPid(processIdentifier, keyUp);
+    }
+    CFRelease(keyDown);
+    CFRelease(keyUp);
+    return true;
+}
+
+// One bounded AX probe of the frontmost app's focused element, shared by all
+// clipboard-fallback gates. Reading once — instead of every gate re-creating
+// the application element and re-reading focus — removes up to half a dozen
+// redundant round trips per capture and guarantees every gate reasons about
+// the SAME element even if the app changes focus mid-flight. The short retry
+// window covers the tree-build delay right after the compatibility
+// attributes were written during this same capture.
+struct ClipboardFocusProbe {
+    AXUIElementRef focused = nullptr;   // retained; null when never readable
+    std::string role;
+    bool hasRole = false;
+    bool isProtected = false;
+    CFRange selectedRange = CFRangeMake(-1, -1);
+    bool hasSelectedRange = false;
+
+    ClipboardFocusProbe() = default;
+    ClipboardFocusProbe(const ClipboardFocusProbe &) = delete;
+    ClipboardFocusProbe &operator=(const ClipboardFocusProbe &) = delete;
+    ClipboardFocusProbe(ClipboardFocusProbe &&other) noexcept
+        : focused(std::exchange(other.focused, nullptr)),
+          role(std::move(other.role)),
+          hasRole(std::exchange(other.hasRole, false)),
+          isProtected(std::exchange(other.isProtected, false)),
+          selectedRange(std::exchange(other.selectedRange, CFRangeMake(-1, -1))),
+          hasSelectedRange(std::exchange(other.hasSelectedRange, false)) {}
+    ClipboardFocusProbe &operator=(ClipboardFocusProbe &&other) noexcept {
+        if (this != &other) {
+            if (focused != nullptr) {
+                CFRelease(focused);
+            }
+            focused = std::exchange(other.focused, nullptr);
+            role = std::move(other.role);
+            hasRole = std::exchange(other.hasRole, false);
+            isProtected = std::exchange(other.isProtected, false);
+            selectedRange = std::exchange(other.selectedRange, CFRangeMake(-1, -1));
+            hasSelectedRange = std::exchange(other.hasSelectedRange, false);
+        }
+        return *this;
+    }
+    ~ClipboardFocusProbe() {
+        if (focused != nullptr) {
+            CFRelease(focused);
+        }
+    }
+};
+
+static ClipboardFocusProbe ProbeClipboardFocus(NSRunningApplication *application) {
+    ClipboardFocusProbe probe;
+    if (application == nil) {
+        return probe;
+    }
+    AXUIElementRef applicationElement =
+        gApplicationElementCache.CopyElement(application.processIdentifier);
+    if (applicationElement == nullptr) {
+        return probe;
+    }
+    // Every AX round trip stays inside the shared capture budget: a provider
+    // that answered the text read can still hang on these follow-up reads.
+    ConfigureAccessibilityElement(applicationElement);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (attempt > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+        AXUIElementRef focused = CopyFocusedElement(applicationElement);
+        if (focused == nullptr) {
+            continue;
+        }
+        ConfigureAccessibilityElement(focused);
+
+        CFTypeRef role = nullptr;
+        if (AXUIElementCopyAttributeValue(focused, kAXRoleAttribute, &role) ==
+                kAXErrorSuccess &&
+            role != nullptr) {
+            probe.hasRole = CFGetTypeID(role) == CFStringGetTypeID() &&
+                StringFromCFString(static_cast<CFStringRef>(role), probe.role);
+            CFRelease(role);
+        }
+
+        bool isProtected = false;
+        CFTypeRef subrole = nullptr;
+        if (AXUIElementCopyAttributeValue(focused, kAXSubroleAttribute, &subrole) ==
+                kAXErrorSuccess &&
+            subrole != nullptr) {
+            isProtected = CFGetTypeID(subrole) == CFStringGetTypeID() &&
+                CFStringCompare(
+                    static_cast<CFStringRef>(subrole),
+                    CFSTR("AXSecureTextField"),
+                    0) == kCFCompareEqualTo;
+            CFRelease(subrole);
+        }
+        if (!isProtected) {
+            CFTypeRef protectedContent = nullptr;
+            if (AXUIElementCopyAttributeValue(
+                    focused,
+                    CFSTR("AXProtectedContent"),
+                    &protectedContent) == kAXErrorSuccess &&
+                protectedContent != nullptr) {
+                isProtected = CFGetTypeID(protectedContent) == CFBooleanGetTypeID() &&
+                    CFBooleanGetValue(static_cast<CFBooleanRef>(protectedContent));
+                CFRelease(protectedContent);
+            }
+        }
+        probe.isProtected = isProtected;
+
+        AXValueRef rangeValue = nullptr;
+        if (AXUIElementCopyAttributeValue(
+                focused,
+                kAXSelectedTextRangeAttribute,
+                reinterpret_cast<CFTypeRef *>(&rangeValue)) == kAXErrorSuccess &&
+            rangeValue != nullptr) {
+            CFRange range = CFRangeMake(-1, -1);
+            if (AXValueGetValue(rangeValue, kAXValueTypeCFRange, &range)) {
+                probe.selectedRange = range;
+                probe.hasSelectedRange = true;
+            }
+            CFRelease(rangeValue);
+        }
+
+        probe.focused = focused;   // the probe owns the element now
+        break;
+    }
+    CFRelease(applicationElement);
+    return probe;
+}
+
+static bool FocusProbeIsImage(const ClipboardFocusProbe &probe) {
+    return probe.hasRole && probe.role == "AXImage";
+}
+
+// Result of probing the AX element under the cursor before a synthetic copy.
+// Image viewers (WeChat 图片查看器) frequently hide the image behind an
+// opaque container whose focused-element role cannot be read, so the
+// focused-element gate never fires for them; a synthetic Cmd+C in that
+// context copies the image with visible app feedback (the drag on an image
+// reads as a Drag gesture). The hit test queries a different AX path
+// (element-at-position) and is bounded by the geometry messaging timeout.
+struct PointerHitTestOutcome {
+    // element-at-position answered with an element (false = unsupported or
+    // no element; the caller keeps today's behavior).
+    bool resolved = false;
+    // The hit element or one of its two closest ancestors is an AXImage.
+    bool isImage = false;
+    // The hit element IS the bare window/application — the app exposes no
+    // content under the cursor at all (opaque canvas surface).
+    bool bareWindowSurface = false;
+    int axError = 0;
+    std::string roleChain;
+};
+
+static PointerHitTestOutcome PointerHitTestAtPosition(
+    NSRunningApplication *application,
+    CGPoint point) {
+    PointerHitTestOutcome outcome;
+    if (application == nil) {
+        return outcome;
+    }
+    AXUIElementRef applicationElement =
+        gApplicationElementCache.CopyElement(application.processIdentifier);
+    if (applicationElement == nullptr) {
+        return outcome;
+    }
+    AXUIElementSetMessagingTimeout(applicationElement, kAXGeometryMessagingTimeoutSeconds);
+    AXUIElementRef hit = nullptr;
+    AXError error = AXUIElementCopyElementAtPosition(
+        applicationElement, point.x, point.y, &hit);
+    CFRelease(applicationElement);
+    if (error != kAXErrorSuccess || hit == nullptr) {
+        outcome.axError = static_cast<int>(error);
+        return outcome;
+    }
+    outcome.resolved = true;
+
+    static const char *const kRoleSeparator = ">";
+    AXUIElementRef current = hit;
+    CFRetain(current);
+    for (int level = 0; level < 3 && !outcome.isImage && current != nullptr; ++level) {
+        std::string role;
+        CFTypeRef roleValue = nullptr;
+        if (AXUIElementCopyAttributeValue(current, kAXRoleAttribute, &roleValue) ==
+                kAXErrorSuccess &&
+            roleValue != nullptr) {
+            if (CFGetTypeID(roleValue) == CFStringGetTypeID()) {
+                StringFromCFString(static_cast<CFStringRef>(roleValue), role);
+            }
+            CFRelease(roleValue);
+        }
+        if (!outcome.roleChain.empty()) {
+            outcome.roleChain += kRoleSeparator;
+        }
+        outcome.roleChain += role.empty() ? "?" : role;
+        if (level == 0) {
+            // Bare window surface: no content element under the cursor.
+            outcome.bareWindowSurface =
+                role == "AXWindow" || role == "AXApplication";
+        }
+        if (role == "AXImage") {
+            outcome.isImage = true;
+            break;
+        }
+        AXUIElementRef parent = nullptr;
+        if (AXUIElementCopyAttributeValue(
+                current,
+                kAXParentAttribute,
+                reinterpret_cast<CFTypeRef *>(&parent)) != kAXErrorSuccess ||
+            parent == nullptr) {
+            break;
+        }
+        AXUIElementRef previous = current;
+        current = parent;
+        if (previous != hit) {
+            CFRelease(previous);
+        }
+    }
+    if (current != nullptr && current != hit) {
+        CFRelease(current);
+    }
+    CFRelease(hit);
+    return outcome;
+}
+
+// True when a TEXT-role focused element explicitly reports an empty selected
+// range. Only text roles are trusted: generic containers and chat canvases
+// (WeChat) report {0,0} regardless of the user's canvas selection, and
+// trusting them killed WeChat text capture. Combined with the click-only
+// trigger gate at the call site this keeps the editor "implicit copy on
+// empty double-click" fix (JetBrains-style Cmd+C copies the current line)
+// while canvas selections keep using the fallback.
+static bool FocusProbeTextElementExplicitlyEmpty(const ClipboardFocusProbe &probe) {
+    if (!probe.hasRole || !probe.hasSelectedRange) {
+        return false;
+    }
+    const bool textRole = probe.role == "AXTextArea" ||
+        probe.role == "AXTextField" ||
+        probe.role == "AXTextView" ||
+        probe.role == "AXStaticText";
+    return textRole && probe.selectedRange.location == 0 && probe.selectedRange.length == 0;
+}
+
+// Apps where a synthetic Cmd+C is destructive or sensitive must never use the
+// fallback; apps whose AX selection already works never reach it either.
+// GPU-rendered terminals (kitty/Alacritty/Ghostty/WezTerm) implement Cmd+C as
+// pure copy — a selection-less copy is a no-op there — so they are allowed.
+enum class ClipboardFallbackPolicy {
+    Allowed,
+    // Smart-Cmd+C terminals send SIGINT when nothing is selected. Only
+    // keyboard gestures (Cmd+A, shift+arrows) qualify: they always leave a
+    // real selection behind, so the chord can only ever copy.
+    KeyboardOnly,
+    Denied,
+};
+
+static ClipboardFallbackPolicy ClipboardFallbackPolicyForApplication(
+    const std::string &bundleId,
+    const std::string &appName,
+    Trigger trigger) {
+    const std::string normalizedBundle = LowercaseAscii(bundleId);
+    static const char *const deniedBundlePrefixes[] = {
+        // Password managers: a synthetic copy could lift a secret into the
+        // selection pipeline and on into an AI request.
+        "com.1password.1password",
+        "com.agilebits.",
+        "org.keepassxc.keepassxc",
+        "com.bitwarden.desktop",
+        // Finder drag-select is an icon rubber-band; Cmd+C would copy files.
+        "com.apple.finder",
+    };
+    for (const char *prefix : deniedBundlePrefixes) {
+        if (normalizedBundle.rfind(prefix, 0) == 0) {
+            return ClipboardFallbackPolicy::Denied;
+        }
+    }
+    const std::string normalizedName = LowercaseAscii(appName);
+    const bool smartInterruptTerminal =
+        normalizedBundle.rfind("com.apple.terminal", 0) == 0 ||
+        normalizedBundle.rfind("com.googlecode.iterm2", 0) == 0 ||
+        normalizedName.find("terminal") != std::string::npos ||
+        normalizedName.find("iterm") != std::string::npos;
+    if (smartInterruptTerminal) {
+        return trigger == Trigger::Keyboard
+            ? ClipboardFallbackPolicy::KeyboardOnly
+            : ClipboardFallbackPolicy::Denied;
+    }
+    return ClipboardFallbackPolicy::Allowed;
+}
+
+// True when the current pasteboard contents carry KNOWN non-text data
+// (image/file) and no text type at all — the app answered the synthetic copy
+// with an image/file payload (image viewers do this), so waiting longer
+// cannot yield a text selection. Deliberately a whitelist: an app writing
+// text under an unusual UTI must not be misread as non-text, so unknown
+// type sets keep waiting for the full budget. Type-list inspection only:
+// fetching data could lazily block on a provider.
+static bool PasteboardChangeIsNonText(NSPasteboard *pasteboard) {
+    NSArray<NSPasteboardType> *types = pasteboard.types;
+    if (types.count == 0) {
+        // Empty contents are the clear phase of a two-step write; keep
+        // waiting for the string to land.
+        return false;
+    }
+    bool hasKnownNonTextData = false;
+    for (NSPasteboardType type in types) {
+        if ([type isEqualToString:NSPasteboardTypeString] ||
+            [type isEqualToString:NSPasteboardTypeRTF] ||
+            [type isEqualToString:NSPasteboardTypeHTML] ||
+            [type isEqualToString:@"public.utf16-plain-text"]) {
+            return false;
+        }
+        if ([type isEqualToString:NSPasteboardTypeTIFF] ||
+            [type isEqualToString:NSPasteboardTypePNG] ||
+            [type isEqualToString:@"public.jpeg"] ||
+            [type isEqualToString:@"public.file-url"] ||
+            [type isEqualToString:@"NSFilesPromisePboardType"]) {
+            hasKnownNonTextData = true;
+        }
+    }
+    return hasKnownNonTextData;
+}
+
+// Trace lines carry the app + trigger so one log file can be attributed per
+// application when hunting capture regressions.
+static void TraceClipboardGateFor(const SelectionInfo &info, const char *detail) {
+    char line[224];
+    std::snprintf(
+        line,
+        sizeof(line),
+        "app=%s trigger=%s %s",
+        info.bundleId.c_str(),
+        TriggerTag(info.trigger),
+        detail);
+    TraceClipboardGate(line);
+}
+
+// First characters of the captured text for the opt-in trace file only —
+// enough to tell WHAT an empty-space copy returned (stale selection vs
+// current line vs junk) without dumping user content. Newlines and control
+// characters are masked.
+static std::string TraceTextPrefix(const std::string &text) {
+    NSString *raw = NSStringFromString(text);
+    if (raw == nil) {
+        return {};
+    }
+    NSString *oneLine =
+        [raw stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    oneLine = [oneLine stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
+    if (oneLine.length > 24) {
+        oneLine = [oneLine substringToIndex:24];
+    }
+    NSMutableString *clean = [oneLine mutableCopy];
+    NSUInteger index = 0;
+    while (index < clean.length) {
+        if ([clean characterAtIndex:index] < 0x20 ||
+            [clean characterAtIndex:index] == 0x7F) {
+            [clean replaceCharactersInRange:NSMakeRange(index, 1) withString:@"·"];
+        }
+        index += 1;
+    }
+    return StringFromNSString(clean);
+}
+
+static bool CaptureViaClipboard(
+    NSRunningApplication *application,
+    SelectionInfo &info,
+    LastClipboardCapture &lastClipboardCapture,
+    const std::atomic<uint64_t> *captureGeneration,
+    uint64_t expectedGeneration,
+    uint64_t deadlineMs) {
+    if (application == nil || application.processIdentifier == getpid() ||
+        !application.active) {
+        TraceClipboardGateFor(info, "skip: app-inactive-or-own-process");
+        return false;
+    }
+    auto generationCurrent = [&]() {
+        return captureGeneration == nullptr ||
+            captureGeneration->load(std::memory_order_acquire) == expectedGeneration;
+    };
+    if (!generationCurrent()) {
+        // Cheapest gate first: no AX work should happen for a gesture that
+        // new input already superseded.
+        TraceClipboardGateFor(info, "skip: superseded-by-new-input");
+        return false;
+    }
+
+    ClipboardFocusProbe focus = ProbeClipboardFocus(application);
+    if (focus.isProtected) {
+        TraceClipboardGateFor(info, "skip: protected-focus");
+        return false;
+    }
+    if (IsSecureEventInputEnabled()) {
+        TraceClipboardGateFor(info, "skip: secure-event-input");
+        return false;
+    }
+    if ((info.trigger == Trigger::DoubleClick || info.trigger == Trigger::ShiftClick) &&
+        FocusProbeTextElementExplicitlyEmpty(focus)) {
+        // A text-role element (editor text area) explicitly reports "nothing
+        // selected": the chord could only produce an implicit copy (current
+        // line). Drag/keyboard gestures never trust this signal — canvas apps
+        // (WeChat) report {0,0} on containers that do not reflect the user's
+        // canvas selection.
+        TraceClipboardGateFor(info, "skip: text-element-empty-range-on-click");
+        return false;
+    }
+    if (FocusProbeIsImage(focus)) {
+        // Image-viewer context: the chord would copy the image (with visible
+        // app feedback) instead of a text selection.
+        TraceClipboardGateFor(info, "skip: focused-element-is-image");
+        return false;
+    }
+    if (info.trigger == Trigger::Drag || info.trigger == Trigger::DoubleClick ||
+        info.trigger == Trigger::ShiftClick) {
+        // Mouse gestures carry a meaningful cursor position; keyboard
+        // gestures keep the fallback because the cursor may be parked
+        // anywhere while the user selects by keyboard.
+        const PointerHitTestOutcome hitTest =
+            PointerHitTestAtPosition(application, info.mouseCurrent);
+        char hitLine[160];
+        if (hitTest.resolved) {
+            std::snprintf(
+                hitLine,
+                sizeof(hitLine),
+                "pointer-hit-test: roles=%s",
+                hitTest.roleChain.c_str());
+        } else {
+            std::snprintf(
+                hitLine,
+                sizeof(hitLine),
+                "pointer-hit-test: unavailable (axError=%d)",
+                hitTest.axError);
+        }
+        TraceClipboardGate(hitLine);
+        if (hitTest.isImage) {
+            TraceClipboardGateFor(info, "skip: pointer-element-is-image");
+            return false;
+        }
+        // WeChat's image viewer exposes no AX content under the cursor — the
+        // hit test lands straight on the bare AXWindow — while its chat
+        // window does expose content groups for text drags. A drag on that
+        // bare surface can only be the image viewer (or empty canvas
+        // background), where the chord copies the image with visible
+        // feedback and never yields text.
+        if (info.bundleId == "com.tencent.xinWeChat" && hitTest.bareWindowSurface) {
+            TraceClipboardGateFor(info, "skip: wechat-bare-window-drag");
+            return false;
+        }
+    }
+
+    std::lock_guard<std::mutex> processGuard(gPasteboardFallbackMutex);
+    @autoreleasepool {
+        NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+        if (pasteboard == nil) {
+            return false;
+        }
+        const NSInteger originalChangeCount = pasteboard.changeCount;
+        PasteboardSnapshot snapshot = SnapshotPasteboard(pasteboard);
+        if (!snapshot.valid) {
+            return false;
+        }
+        if (!PostCopyShortcut(application.processIdentifier, false)) {
+            return false;
+        }
+
+        const uint64_t startedAt = MonotonicMilliseconds();
+        const uint64_t fallbackDeadlineMs = deadlineMs;
+        NSInteger copiedChangeCount = originalChangeCount;
+        bool changed = false;
+        bool postedSessionRetry = false;
+        NSInteger nonTextStablePolls = 0;
+        std::string copiedText;
+        while (generationCurrent() && MonotonicMilliseconds() < fallbackDeadlineMs) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kClipboardPollIntervalMs));
+            const NSInteger changeCount = pasteboard.changeCount;
+            if (changeCount == originalChangeCount) {
+                if (!postedSessionRetry &&
+                    MonotonicMilliseconds() - startedAt >= kClipboardSessionRetryAfterMs) {
+                    // Some apps ignore pid-targeted events. The generation
+                    // check above still guarantees no user input happened,
+                    // so the session-level chord reaches the same app.
+                    postedSessionRetry = true;
+                    PostCopyShortcut(application.processIdentifier, true);
+                }
+                continue;
+            }
+            changed = true;
+            if (changeCount != copiedChangeCount) {
+                // A fresh write arrived (first response or a follow-up step);
+                // the stability clock restarts so the restore boundary below
+                // lands on the FINAL contents.
+                copiedChangeCount = changeCount;
+                nonTextStablePolls = 0;
+            }
+            NSString *string = [pasteboard stringForType:NSPasteboardTypeString];
+            copiedText = StringFromNSString(string);
+            if (!IsBlank(copiedText)) {
+                break;
+            }
+            if (PasteboardChangeIsNonText(pasteboard)) {
+                // The app answered the chord with image/file data only.
+                // Waiting longer cannot yield text, but some apps publish in
+                // several steps; require a short stable window so the restore
+                // below reclaims the final contents instead of racing a
+                // mid-write boundary.
+                nonTextStablePolls += 1;
+                if (nonTextStablePolls >= kClipboardNonTextStablePolls) {
+                    break;
+                }
+                continue;
+            }
+            // Providers such as PDF viewers clear-then-write in two steps;
+            // keep polling for the string within the same budget.
+        }
+        if (!changed && generationCurrent()) {
+            // The chord can also land after polling stopped: a slow app past
+            // the deadline. Claim it briefly so the restore below reclaims
+            // our copy instead of leaving it behind in the user's clipboard.
+            // Skipped once new input arrived (generation changed): a landing
+            // copy could then be the user's own Cmd+C, and restoring over it
+            // would clobber their clipboard. Leaving our late copy behind is
+            // the recoverable mistake; overwriting their copy is not.
+            const uint64_t lateDeadlineMs =
+                MonotonicMilliseconds() + kClipboardLateCopyClaimMs;
+            while (MonotonicMilliseconds() < lateDeadlineMs && generationCurrent()) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(kClipboardPollIntervalMs));
+                if (pasteboard.changeCount != originalChangeCount) {
+                    changed = true;
+                    copiedChangeCount = pasteboard.changeCount;
+                    NSString *string = [pasteboard stringForType:NSPasteboardTypeString];
+                    copiedText = StringFromNSString(string);
+                    break;
+                }
+            }
+        }
+        if (changed) {
+            // `copiedChangeCount` stays the count our synthetic copy produced.
+            // RestorePasteboard fail-closes unless the pasteboard still holds
+            // exactly that write, so a real user copy made during the wait
+            // (changeCount advanced) always wins and is never overwritten.
+            const bool restored = RestorePasteboard(pasteboard, snapshot, copiedChangeCount);
+            if (!restored) {
+                TraceClipboardGateFor(
+                    info, "reclaim: restore-boundary-missed (pasteboard moved on)");
+            } else if (IsBlank(copiedText)) {
+                TraceClipboardGateFor(info, "reclaim: non-text-copy");
+            }
+        }
+        if (!changed) {
+            TraceClipboardGateFor(info, "abort: chord-ignored-by-app");
+            return false;
+        }
+        if (!generationCurrent() ||
+            IsBlank(copiedText) || copiedText.size() > kClipboardMaxTextBytes) {
+            TraceClipboardGateFor(info, "abort: interrupted-or-blank-oversized");
+            return false;
+        }
+        SelectionInfo candidate = info;
+        ClearSelectionGeometry(candidate);
+        candidate.text = std::move(copiedText);
+        candidate.method = SelectionMethod::Clipboard;
+        if (SelectionTextMatchesSourceIdentity(candidate)) {
+            TraceClipboardGateFor(info, "reject: text-matches-app-identity");
+            return false;
+        }
+        if (SelectionTextIsDegenerateFragment(candidate.text)) {
+            TraceClipboardGateFor(info, "reject: degenerate-fragment");
+            return false;
+        }
+        const std::string normalizedCapture = NormalizeSelectionIdentity(candidate.text);
+        bool stale = false;
+        {
+            std::lock_guard<std::mutex> lock(gLastClipboardCaptureMutex);
+            if (lastClipboardCapture.valid &&
+                lastClipboardCapture.bundleId == info.bundleId &&
+                lastClipboardCapture.normalizedText == normalizedCapture &&
+                std::hypot(
+                    lastClipboardCapture.location.x - info.mouseCurrent.x,
+                    lastClipboardCapture.location.y - info.mouseCurrent.y) >
+                    kStaleClipboardSelectionDistancePx) {
+                // Same text captured far from where it was originally selected:
+                // the app kept its old model selection and the synthetic copy
+                // returned it. Treat as stale instead of presenting a toolbar for
+                // content the user did not just select.
+                stale = true;
+            } else {
+                lastClipboardCapture.valid = true;
+                lastClipboardCapture.bundleId = info.bundleId;
+                lastClipboardCapture.normalizedText = normalizedCapture;
+                lastClipboardCapture.location = info.mouseCurrent;
+            }
+        }
+        if (stale) {
+            TraceClipboardGateFor(info, "reject: stale-same-text-far-location");
+            return false;
+        }
+        char okLine[256];
+        std::snprintf(
+            okLine,
+            sizeof(okLine),
+            "app=%s trigger=%s capture: ok bytes=%zu prefix=\"%s\"",
+            info.bundleId.c_str(),
+            TriggerTag(info.trigger),
+            candidate.text.size(),
+            TraceTextPrefix(candidate.text).c_str());
+        TraceClipboardGate(okLine);
+        info = std::move(candidate);
+        return true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Browser AppleScript fallback
+// ---------------------------------------------------------------------------
+
+// Browsers where reading the live DOM selection via AppleScript is worth a
+// subprocess round trip before any synthetic-copy fallback. Safari is the
+// main beneficiary: it never exposes AXSelectedText, so without this layer
+// every Safari selection paid for a synthetic Cmd+C. Chrome-kernel browsers
+// only answer when "Allow JavaScript from Apple Events" is enabled; when it
+// is not, osascript fails fast and the clipboard fallback proceeds.
+static bool IsAppleScriptSelectionBrowser(const std::string &bundleId) {
+    static const char *const browsers[] = {
+        "com.apple.Safari",
+        "com.google.Chrome",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "Company.TheBrowser.Arc",
+    };
+    for (const char *candidate : browsers) {
+        if (bundleId == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::string AppleScriptSelectionScript(const std::string &bundleId) {
+    if (bundleId == "com.apple.Safari") {
+        return "tell application \"Safari\" to do JavaScript "
+               "\"window.getSelection().toString();\" in current tab of front window";
+    }
+    return "tell application id \"" + bundleId +
+           "\" to tell active tab of front window to execute javascript "
+           "\"window.getSelection().toString();\"";
+}
+
+// Runs /usr/bin/osascript with a hard timeout. A subprocess keeps
+// NSAppleScript (not thread-safe) off our worker threads and bounds the
+// worst case: the first Apple Event to a target app can block on a system
+// Automation (TCC) consent prompt, which must never stall the capture
+// pipeline — the timeout kills the client while the user decides.
+static bool RunSelectionAppleScript(const std::string &script, std::string &output) {
+    @autoreleasepool {
+        NSTask *task = [[NSTask alloc] init];
+        task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/osascript"];
+        NSString *scriptString = NSStringFromString(script);
+        if (scriptString == nil) {
+            return false;
+        }
+        task.arguments = @[ @"-e", scriptString ];
+        NSPipe *outputPipe = [NSPipe pipe];
+        task.standardOutput = outputPipe;
+        task.standardError = [NSPipe pipe];
+        task.standardInput = [NSPipe pipe];
+        NSError *launchError = nil;
+        if (![task launchAndReturnError:&launchError]) {
+            return false;
+        }
+        __block NSData *data = nil;
+        dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+        NSFileHandle *readHandle = outputPipe.fileHandleForReading;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            data = [readHandle readDataToEndOfFile];
+            dispatch_semaphore_signal(finished);
+        });
+        const bool completed = dispatch_semaphore_wait(
+            finished,
+            dispatch_time(
+                DISPATCH_TIME_NOW,
+                static_cast<int64_t>(kAppleScriptProcessTimeoutMs) * NSEC_PER_MSEC)) == 0;
+        if (!completed) {
+            [task terminate];
+            [task waitUntilExit];
+            return false;
+        }
+        [task waitUntilExit];
+        NSString *result =
+            [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        output = StringFromNSString(result);
+        return task.terminationStatus == 0 && !IsBlank(output);
+    }
+}
+
+// Non-intrusive browser capture: no synthetic keystrokes, no pasteboard
+// access. Runs after AX failed and before the clipboard fallback. The result
+// passes the same candidate validation as the AX path (identity match,
+// degenerate fragments for mouse triggers, bounds proximity when available).
+static bool CaptureViaAppleScript(NSRunningApplication *application, SelectionInfo &info) {
+    if (application == nil || application.processIdentifier == getpid() ||
+        !application.active) {
+        return false;
+    }
+    if (!IsAppleScriptSelectionBrowser(info.bundleId)) {
+        return false;
+    }
+    const uint64_t startedAt = MonotonicMilliseconds();
+    std::string text;
+    const bool ok = RunSelectionAppleScript(AppleScriptSelectionScript(info.bundleId), text) &&
+        text.size() <= kClipboardMaxTextBytes;
+    TraceSelectionTiming("applescript", MonotonicMilliseconds() - startedAt);
+    if (!ok) {
+        TraceClipboardGateFor(info, "applescript: failed-or-denied");
+        return false;
+    }
+    SelectionInfo candidate = info;
+    ClearSelectionGeometry(candidate);
+    candidate.text = std::move(text);
+    candidate.method = SelectionMethod::AppleScript;
+    if (!SelectionCandidateMatchesInput(candidate)) {
+        TraceClipboardGateFor(info, "reject: applescript-candidate-invalid");
+        return false;
+    }
+    char okLine[256];
+    std::snprintf(
+        okLine,
+        sizeof(okLine),
+        "app=%s trigger=%s applescript-capture: ok bytes=%zu prefix=\"%s\"",
+        info.bundleId.c_str(),
+        TriggerTag(info.trigger),
+        candidate.text.size(),
+        TraceTextPrefix(candidate.text).c_str());
+    TraceClipboardGate(okLine);
+    info = std::move(candidate);
+    return true;
+}
+
+// The AX half of a capture: bounded reads, compatibility attributes and one
+// cancellable retry. Returns true when a selection was captured. When false,
+// `fallbackAllowed` reports whether the fallback chain (AppleScript, then the
+// synthetic-copy clipboard fallback) may still run for this app — false also
+// covers "AX returned a blank capture", which deliberately never escalates to
+// a fallback. Callers must fill `info`'s mouse fields before calling.
+static bool CaptureViaAccessibilityPipeline(
+    NSRunningApplication *application,
+    SelectionInfo &info,
+    Trigger trigger,
+    EnhancedUiCache &enhancedUiCache,
+    const std::atomic<uint64_t> *captureGeneration,
+    uint64_t expectedGeneration,
+    bool &fallbackAllowed) {
+    fallbackAllowed = false;
+    info.bundleId = StringFromNSString(application.bundleIdentifier);
+    info.appName = StringFromNSString(application.localizedName);
+    info.trigger = trigger;
+
+    const pid_t pid = application.processIdentifier;
+    const uint64_t launchToken = ProcessLaunchToken(application);
+    const uint8_t appliedAttributes = enhancedUiCache.Attributes(pid, launchToken);
+    uint8_t compatibilityAttributesJustApplied = 0;
+    const bool documentOrOffice = IsDocumentOrOfficeSelectionApplication(
+        info.bundleId,
+        info.appName);
+    const uint64_t budgetMs = documentOrOffice
+        ? kDocumentAXCaptureBudgetMs
+        : kAXCaptureBudgetMs;
+    const AccessibilityReadContext context{
+        captureGeneration,
+        expectedGeneration,
+        MonotonicMilliseconds() + budgetMs,
+    };
+    if (!context.IsCurrent()) return false;
+
+    bool found = ReadViaAccessibility(
+        application,
+        info,
+        appliedAttributes,
+        compatibilityAttributesJustApplied,
+        context);
+    if (!found && context.IsCurrent()) {
+        // One cancellable retry for every provider: the first read can land
+        // before the app has committed the selection, Chromium/Electron needs
+        // a short turn after its compatibility attributes are set, and
+        // document canvases commonly publish their selection a frame after
+        // mouse-up. The retry stays inside this request's existing AX budget.
+        const uint64_t retryDelay = compatibilityAttributesJustApplied != 0
+            ? kAXCompatibilityRetryDelayMs
+            : documentOrOffice
+                ? kAXLateSelectionRetryDelayMs
+                : kAXSelectionCommitRetryDelayMs;
+        const uint64_t retryAt = std::min(
+            context.deadlineMs,
+            MonotonicMilliseconds() + retryDelay);
+        while (context.IsCurrent() && MonotonicMilliseconds() < retryAt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        }
+        if (context.IsCurrent()) {
+            uint8_t retryJustApplied = 0;
+            found = ReadViaAccessibility(
+                application,
+                info,
+                static_cast<uint8_t>(appliedAttributes | compatibilityAttributesJustApplied),
+                retryJustApplied,
+                context);
+            compatibilityAttributesJustApplied |= retryJustApplied;
+        }
+    }
+    if (compatibilityAttributesJustApplied != 0) {
+        enhancedUiCache.MarkApplied(pid, launchToken, compatibilityAttributesJustApplied);
+    }
+    if (found) {
+        if (IsBlank(info.text)) {
+            TraceClipboardGateFor(info, "abort: blank-ax-selection");
+            return false;
+        }
+        char okLine[256];
+        std::snprintf(
+            okLine,
+            sizeof(okLine),
+            "app=%s trigger=%s ax-capture: ok bytes=%zu prefix=\"%s\"",
+            info.bundleId.c_str(),
+            TriggerTag(trigger),
+            info.text.size(),
+            TraceTextPrefix(info.text).c_str());
+        TraceClipboardGate(okLine);
+        return true;
+    }
+    if (!context.IsCurrent()) {
+        return false;
+    }
+    const auto policy = ClipboardFallbackPolicyForApplication(
+        info.bundleId,
+        info.appName,
+        trigger);
+    if (policy == ClipboardFallbackPolicy::Denied) {
+        TraceClipboardGate("skip: app-policy-denied");
+        return false;
+    }
+    fallbackAllowed = true;
+    return false;
+}
+
+// AppleScript first (non-intrusive, browser-only), then the synthetic-copy
+// clipboard fallback. Shared by the synchronous manual capture path and the
+// dedicated clipboard worker.
+static bool CaptureViaFallbackChain(
+    NSRunningApplication *application,
+    SelectionInfo &info,
+    LastClipboardCapture &lastClipboardCapture,
+    const std::atomic<uint64_t> *captureGeneration,
+    uint64_t expectedGeneration,
+    bool clipboardAllowed) {
+    if (CaptureViaAppleScript(application, info)) {
+        return true;
+    }
+    if (!clipboardAllowed) {
+        return false;
+    }
+    // Canvas-based apps (WPS documents, browser PDF plugins, some Electron
+    // panes) publish no AX selected text. The synthetic copy reads what the
+    // app itself would copy, then restores the original pasteboard contents.
+    // The clipboard wait gets its own budget: the AX deadline above only
+    // bounds AX messaging.
+    const uint64_t clipboardDeadlineMs =
+        MonotonicMilliseconds() + kClipboardFallbackBudgetMs;
+    return CaptureViaClipboard(
+        application,
+        info,
+        lastClipboardCapture,
+        captureGeneration,
+        expectedGeneration,
+        clipboardDeadlineMs);
+}
+
 static bool CaptureSelection(
     const std::string &excludedBundleId,
     Trigger trigger,
@@ -954,6 +2265,7 @@ static bool CaptureSelection(
     CGPoint currentMouse,
     SelectionInfo &info,
     EnhancedUiCache &enhancedUiCache,
+    LastClipboardCapture &lastClipboardCapture,
     const std::atomic<uint64_t> *captureGeneration = nullptr,
     uint64_t expectedGeneration = 0) {
     @autoreleasepool {
@@ -965,69 +2277,34 @@ static bool CaptureSelection(
             return false;
         }
 
-        info.bundleId = StringFromNSString(application.bundleIdentifier);
-        info.appName = StringFromNSString(application.localizedName);
-        info.trigger = trigger;
         info.mouseStart = mouseStart;
         info.mouseEnd = mouseEnd;
         info.mouseCurrent = currentMouse;
         info.hasMouseStart = hasMouseStart;
         info.hasMouseEnd = hasMouseEnd;
 
-        pid_t pid = application.processIdentifier;
-        uint64_t launchToken = ProcessLaunchToken(application);
-        uint8_t appliedAttributes = enhancedUiCache.Attributes(pid, launchToken);
-        uint8_t compatibilityAttributesJustApplied = 0;
-        const bool documentOrOffice = IsDocumentOrOfficeSelectionApplication(
-            info.bundleId,
-            info.appName);
-        const uint64_t budgetMs = documentOrOffice
-            ? kDocumentAXCaptureBudgetMs
-            : kAXCaptureBudgetMs;
-        const AccessibilityReadContext context{
-            captureGeneration,
-            expectedGeneration,
-            MonotonicMilliseconds() + budgetMs,
-        };
-        if (!context.IsCurrent()) return false;
-
-        bool found = ReadViaAccessibility(
+        bool fallbackAllowed = false;
+        bool captured = CaptureViaAccessibilityPipeline(
             application,
             info,
-            appliedAttributes,
-            compatibilityAttributesJustApplied,
-            context);
-        const bool shouldRetry = !found && context.IsCurrent() &&
-            (compatibilityAttributesJustApplied != 0 || documentOrOffice);
-        if (shouldRetry) {
-            // Chromium/Electron needs a short turn after compatibility
-            // attributes are set. Document canvases likewise commonly publish
-            // their selection a frame after mouse-up. Keep the retry
-            // cancellable and inside this request's existing AX budget.
-            const uint64_t retryDelay = compatibilityAttributesJustApplied != 0
-                ? kAXCompatibilityRetryDelayMs
-                : kAXLateSelectionRetryDelayMs;
-            const uint64_t retryAt = std::min(
-                context.deadlineMs,
-                MonotonicMilliseconds() + retryDelay);
-            while (context.IsCurrent() && MonotonicMilliseconds() < retryAt) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(4));
-            }
-            if (context.IsCurrent()) {
-                uint8_t retryJustApplied = 0;
-                found = ReadViaAccessibility(
-                    application,
-                    info,
-                    static_cast<uint8_t>(appliedAttributes | compatibilityAttributesJustApplied),
-                    retryJustApplied,
-                    context);
-                compatibilityAttributesJustApplied |= retryJustApplied;
-            }
+            trigger,
+            enhancedUiCache,
+            captureGeneration,
+            expectedGeneration,
+            fallbackAllowed);
+        if (!captured && fallbackAllowed) {
+            captured = CaptureViaFallbackChain(
+                application,
+                info,
+                lastClipboardCapture,
+                captureGeneration,
+                expectedGeneration,
+                true);
         }
-        if (compatibilityAttributesJustApplied != 0) {
-            enhancedUiCache.MarkApplied(pid, launchToken, compatibilityAttributesJustApplied);
+        if (!captured) {
+            TraceClipboardGateFor(info, "abort: no-selection-found");
         }
-        return found && context.IsCurrent() && !IsBlank(info.text);
+        return captured;
     }
 }
 
@@ -1046,6 +2323,14 @@ static NSString *TriggerName(Trigger trigger) {
         case Trigger::ShiftClick: return @"shiftClick";
         case Trigger::Keyboard: return @"keyboard";
         case Trigger::Manual: return @"manual";
+    }
+}
+
+static NSString *MethodName(SelectionMethod method) {
+    switch (method) {
+        case SelectionMethod::Accessibility: return @"accessibility";
+        case SelectionMethod::Clipboard: return @"clipboard";
+        case SelectionMethod::AppleScript: return @"applescript";
     }
 }
 
@@ -1110,7 +2395,7 @@ static std::string SelectionJSON(const SelectionInfo &info) {
         },
         @"direction": SelectionDirection(info),
         @"isFullscreen": @(info.fullscreen),
-        @"method": @"accessibility",
+        @"method": MethodName(info.method),
         @"trigger": TriggerName(info.trigger),
         @"timestampMs": @(TimestampMilliseconds()),
     };
@@ -1299,14 +2584,17 @@ struct TextLensSelectionMonitor {
 
         try {
             workerThread = std::thread(&TextLensSelectionMonitor::workerMain, this);
+            fallbackThread = std::thread(&TextLensSelectionMonitor::fallbackMain, this);
             dismissThread = std::thread(&TextLensSelectionMonitor::dismissMain, this);
             eventThread = std::thread(&TextLensSelectionMonitor::eventMain, this);
         } catch (...) {
             running.store(false, std::memory_order_release);
             taskCondition.notify_all();
+            fallbackCondition.notify_all();
             dismissCondition.notify_all();
             if (eventThread.joinable()) eventThread.join();
             if (dismissThread.joinable()) dismissThread.join();
+            if (fallbackThread.joinable()) fallbackThread.join();
             if (workerThread.joinable()) workerThread.join();
             return TEXTLENS_SELECTION_INTERNAL_ERROR;
         }
@@ -1320,9 +2608,11 @@ struct TextLensSelectionMonitor {
         if (status != TEXTLENS_SELECTION_OK) {
             running.store(false, std::memory_order_release);
             taskCondition.notify_all();
+            fallbackCondition.notify_all();
             dismissCondition.notify_all();
             if (eventThread.joinable()) eventThread.join();
             if (dismissThread.joinable()) dismissThread.join();
+            if (fallbackThread.joinable()) fallbackThread.join();
             if (workerThread.joinable()) workerThread.join();
         }
         return status;
@@ -1339,13 +2629,19 @@ struct TextLensSelectionMonitor {
             }
         }
         taskCondition.notify_all();
+        fallbackCondition.notify_all();
         dismissCondition.notify_all();
         if (eventThread.joinable()) eventThread.join();
         if (dismissThread.joinable()) dismissThread.join();
+        if (fallbackThread.joinable()) fallbackThread.join();
         if (workerThread.joinable()) workerThread.join();
         {
             std::lock_guard<std::mutex> taskLock(taskMutex);
             tasks.clear();
+        }
+        {
+            std::lock_guard<std::mutex> fallbackLock(fallbackMutex);
+            fallbackTasks.clear();
         }
         {
             std::lock_guard<std::mutex> dismissLock(dismissMutex);
@@ -1366,7 +2662,8 @@ struct TextLensSelectionMonitor {
             false,
             mouse,
             info,
-            enhancedUiCache);
+            enhancedUiCache,
+            lastClipboardCapture);
     }
 
     static CGEventRef eventTapCallback(
@@ -1376,6 +2673,12 @@ struct TextLensSelectionMonitor {
         void *context) {
         auto *monitor = static_cast<TextLensSelectionMonitor *>(context);
         if (monitor == nullptr || !monitor->running.load(std::memory_order_acquire)) {
+            return event;
+        }
+        // Synthetic copy chords from the clipboard fallback carry this marker.
+        // Without the filter they would bump the capture generation (cancelling
+        // the very capture that posted them) and dismiss the toolbar.
+        if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == kSyntheticEventMarker) {
             return event;
         }
         if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
@@ -1604,37 +2907,128 @@ struct TextLensSelectionMonitor {
                     continue;
                 }
 
-                // Let the target application commit its selection after the
-                // input event without ever blocking the event-tap callback.
-                std::this_thread::sleep_for(std::chrono::milliseconds(12));
-                if (task.generation != captureGeneration.load(std::memory_order_acquire)) {
-                    continue;
-                }
                 const uint64_t captureStartedAt = MonotonicMilliseconds();
                 SelectionInfo info;
+                info.mouseStart = task.mouseStart;
+                info.mouseEnd = task.mouseEnd;
+                info.mouseCurrent = task.mouseCurrent;
+                info.hasMouseStart = task.hasMouseStart;
+                info.hasMouseEnd = task.hasMouseEnd;
                 bool captured = false;
+                bool fallbackAllowed = false;
+                NSRunningApplication *application = nil;
                 {
                     std::lock_guard<std::mutex> captureLock(captureMutex);
-                    captured = CaptureSelection(
-                        excludedBundleId,
-                        task.trigger,
-                        task.mouseStart,
-                        task.hasMouseStart,
-                        task.mouseEnd,
-                        task.hasMouseEnd,
-                        task.mouseCurrent,
-                        info,
-                        enhancedUiCache,
-                        &captureGeneration,
-                        task.generation);
+                    application = AXIsProcessTrusted() ? FrontmostApplication() : nil;
+                    if (application != nil &&
+                        !IsExcludedApplication(application, excludedBundleId)) {
+                        captured = CaptureViaAccessibilityPipeline(
+                            application,
+                            info,
+                            task.trigger,
+                            enhancedUiCache,
+                            &captureGeneration,
+                            task.generation,
+                            fallbackAllowed);
+                    }
                 }
                 const uint64_t completedAt = MonotonicMilliseconds();
                 TraceSelectionTiming("capture", completedAt - captureStartedAt);
                 TraceSelectionTiming(
-                    "mouse-up-to-capture-complete",
+                    "mouse-up-to-ax-complete",
                     completedAt - task.enqueuedAtMs);
-                if (captured && task.generation == captureGeneration.load(std::memory_order_acquire)) {
+                if (captured) {
+                    if (task.generation == captureGeneration.load(std::memory_order_acquire)) {
+                        emit(SelectionJSON(info));
+                    }
+                    continue;
+                }
+                if (!fallbackAllowed ||
+                    task.generation != captureGeneration.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                // The multi-hundred-ms fallback chain must not hold the
+                // capture worker (and with it the next gesture's AX read)
+                // hostage: defer it to the dedicated clipboard worker. The
+                // queue is latest-wins and every phase re-checks the
+                // generation, so a superseded fallback discards itself.
+                FallbackTask fallbackTask;
+                fallbackTask.info = std::move(info);
+                fallbackTask.targetPid = application.processIdentifier;
+                fallbackTask.generation = task.generation;
+                fallbackTask.clipboardAllowed = true;
+                fallbackTask.enqueuedAtMs = task.enqueuedAtMs;
+                enqueueFallbackTask(std::move(fallbackTask));
+            }
+        }
+    }
+
+    void enqueueFallbackTask(FallbackTask task) {
+        if (!running.load(std::memory_order_acquire)) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(fallbackMutex);
+            // Latest-wins, mirroring the capture queue: a stale fallback must
+            // never delay the newest gesture's clipboard/AppleScript read.
+            fallbackTasks.clear();
+            fallbackTasks.push_back(std::move(task));
+        }
+        fallbackCondition.notify_one();
+    }
+
+    void fallbackMain() {
+        while (true) {
+            FallbackTask task;
+            {
+                std::unique_lock<std::mutex> lock(fallbackMutex);
+                fallbackCondition.wait(lock, [this] {
+                    return !running.load(std::memory_order_acquire) || !fallbackTasks.empty();
+                });
+                if (!running.load(std::memory_order_acquire)) {
+                    fallbackTasks.clear();
+                    return;
+                }
+                task = std::move(fallbackTasks.front());
+                fallbackTasks.pop_front();
+            }
+
+            @autoreleasepool {
+                if (task.generation != captureGeneration.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                // Re-resolve by pid (not frontmostApplication): the fallback
+                // must read the same app the AX half observed. An app that
+                // quit in between resolves to nil here, which aborts the
+                // fallback quietly.
+                NSRunningApplication *application = nil;
+                for (NSRunningApplication *candidate in
+                     [NSWorkspace sharedWorkspace].runningApplications) {
+                    if (candidate.processIdentifier == task.targetPid) {
+                        application = candidate;
+                        break;
+                    }
+                }
+                const uint64_t startedAt = MonotonicMilliseconds();
+                SelectionInfo info = std::move(task.info);
+                const bool captured = application != nil && CaptureViaFallbackChain(
+                    application,
+                    info,
+                    lastClipboardCapture,
+                    &captureGeneration,
+                    task.generation,
+                    task.clipboardAllowed);
+                const uint64_t completedAt = MonotonicMilliseconds();
+                TraceSelectionTiming("fallback-capture", completedAt - startedAt);
+                TraceSelectionTiming(
+                    "mouse-up-to-fallback-complete",
+                    completedAt - task.enqueuedAtMs);
+                const bool stillCurrent =
+                    task.generation == captureGeneration.load(std::memory_order_acquire);
+                if (captured && stillCurrent) {
                     emit(SelectionJSON(info));
+                } else if (!captured && stillCurrent) {
+                    TraceClipboardGateFor(info, "abort: no-selection-found");
                 }
             }
         }
@@ -1746,6 +3140,7 @@ struct TextLensSelectionMonitor {
     void *callbackContext = nullptr;
     std::mutex callbackMutex;
     EnhancedUiCache enhancedUiCache;
+    LastClipboardCapture lastClipboardCapture;
 
     std::atomic<bool> running{false};
     std::atomic<uint64_t> captureGeneration{0};
@@ -1754,6 +3149,7 @@ struct TextLensSelectionMonitor {
 
     std::thread eventThread;
     std::thread workerThread;
+    std::thread fallbackThread;
     std::thread dismissThread;
     CFMachPortRef eventTap = nullptr;
     CFRunLoopSourceRef runLoopSource = nullptr;
@@ -1769,6 +3165,9 @@ struct TextLensSelectionMonitor {
     std::mutex taskMutex;
     std::condition_variable taskCondition;
     std::deque<Task> tasks;
+    std::mutex fallbackMutex;
+    std::condition_variable fallbackCondition;
+    std::deque<FallbackTask> fallbackTasks;
     std::mutex dismissMutex;
     std::condition_variable dismissCondition;
     std::deque<Task> dismissTasks;

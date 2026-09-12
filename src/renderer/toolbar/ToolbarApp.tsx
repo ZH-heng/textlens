@@ -107,6 +107,7 @@ export function ToolbarApp(): JSX.Element {
   const [copySuccessActionId, setCopySuccessActionId] = useState<string | null>(null)
   const [hoveredControlId, setHoveredControlId] = useState<string | null>(null)
   const [message, setMessage] = useState('')
+  const settingsLoadedRef = useRef(false)
   const operationGenerationRef = useRef(0)
   const selectionGenerationRef = useRef(0)
   const selectionTimingStartedAtRef = useRef<number | null>(null)
@@ -166,7 +167,10 @@ export function ToolbarApp(): JSX.Element {
     const loadSettings = async (attempt: number): Promise<void> => {
       try {
         const value = await window.textLens.getSettings()
-        if (!disposed) setSettings(value)
+        if (!disposed) {
+          settingsLoadedRef.current = true
+          setSettings(value)
+        }
       } catch (error: unknown) {
         if (disposed) return
         logToolbarDiagnostic('settings-read', undefined, attempt + 1, error)
@@ -182,9 +186,18 @@ export function ToolbarApp(): JSX.Element {
       }
     }
     void loadSettings(0)
+    // A failed startup read must not strand the toolbar without actions until
+    // some unrelated settings change happens. Every new selection re-arms the
+    // bounded retry chain while no settings have ever loaded successfully.
+    const requestSettings = (): void => {
+      if (settingsLoadedRef.current) return
+      window.clearTimeout(settingsRetryTimer)
+      void loadSettings(0)
+    }
 
     const unsubscribeSelection = window.textLens.onSelection((nextSelection) => {
       selectionTimingStartedAtRef.current = performance.now()
+      requestSettings()
       resetCopySuccess()
       clearRetainedToolbarFocus()
       selectionGenerationRef.current += 1
@@ -208,6 +221,7 @@ export function ToolbarApp(): JSX.Element {
       if (!disposed) logToolbarDiagnostic('selection-replay', undefined, 1, error)
     })
     const unsubscribeSettings = window.textLens.onSettingsChanged((nextSettings) => {
+      settingsLoadedRef.current = true
       resetCopySuccess()
       clearRetainedToolbarFocus()
       setSettings(nextSettings)

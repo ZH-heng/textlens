@@ -6,8 +6,6 @@ import {
   providerModelSchema,
   publicSettingsSchema,
   resultReadyAckSchema,
-  rendererMarkerIdSchema,
-  resultRendererMarkerSchema,
   resultSessionSnapshotSchema,
   selectionPayloadSchema,
   toolbarDismissedEventSchema,
@@ -24,7 +22,6 @@ import {
   type ProviderUpdateInput,
   type PublicSettings,
   type ResultReadyAck,
-  type ResultRendererMarker,
   type ResultSessionSnapshot,
   type RunActionResult,
   type SelectionPayload,
@@ -371,17 +368,6 @@ export function installTauriBridge(): void {
     async ackResultReady(ack: ResultReadyAck): Promise<boolean> {
       const parsed = resultReadyAckSchema.parse(ack)
       return await invoke<boolean>(TAURI_COMMANDS.ackResultReady, { ack: parsed })
-    },
-    async recordResultRendererMarker(
-      sessionId: string,
-      requestId: string,
-      marker: ResultRendererMarker
-    ): Promise<void> {
-      await invoke(TAURI_COMMANDS.recordResultRendererMarker, {
-        sessionId: rendererMarkerIdSchema.parse(sessionId),
-        requestId: rendererMarkerIdSchema.parse(requestId),
-        marker: resultRendererMarkerSchema.parse(marker)
-      })
     },
     async prepareResultReveal(sessionId: string) {
       await invoke(TAURI_COMMANDS.prepareResultReveal, { sessionId: requiredSessionId(sessionId) })

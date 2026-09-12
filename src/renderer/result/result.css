@@ -633,6 +633,11 @@ body,
 
 /* Collapsible chain-of-thought above the answer body. Collapsed chrome is tight. */
 .result-thinking {
+  /* Compact chip while collapsed: a full-width bar reads as an empty form
+     control. Expanded state restores the full row for the scrollable body. */
+  width: fit-content;
+  max-width: 100%;
+  min-width: 96px;
   margin: 0 0 10px;
   padding: 2px 8px;
   border-radius: 8px;
@@ -647,6 +652,7 @@ body,
 }
 
 .result-thinking--open {
+  width: 100%;
   padding: 6px 10px;
 }
 

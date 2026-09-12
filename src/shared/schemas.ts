@@ -666,13 +666,6 @@ export const actionNoticeSchema = z
   .strict()
 export type ActionNotice = z.infer<typeof actionNoticeSchema>
 
-export const resultRendererMarkerSchema = z.enum([
-  'firstDomCommit',
-  'firstPresentationOpportunity'
-])
-export const rendererMarkerIdSchema = z.string().trim().min(1).max(128)
-export type ResultRendererMarker = z.infer<typeof resultRendererMarkerSchema>
-
 const actionEventBaseShape = {
   sessionId: z.string().trim().min(1).max(128),
   sessionGeneration: wireCounterSchema,

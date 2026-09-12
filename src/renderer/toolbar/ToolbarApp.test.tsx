@@ -829,6 +829,54 @@ describe('ToolbarApp', () => {
     expect(translate).not.toHaveAttribute('data-hovered')
   })
 
+  it('retries the settings read when a selection arrives after a startup failure', async () => {
+    let getSettingsCalls = 0
+    const getSettings = vi.fn(() => {
+      getSettingsCalls += 1
+      // Fail the whole startup retry chain (up to three attempts) so only a
+      // selection-triggered re-arm can succeed.
+      if (getSettingsCalls <= 3) {
+        return Promise.reject(new Error('settings ipc not ready'))
+      }
+      return Promise.resolve(DEFAULT_PUBLIC_SETTINGS)
+    })
+    let selectionListener: ((payload: SelectionPayload) => void) | undefined
+    const api = {
+      getSettings,
+      getCurrentSelection: vi.fn().mockResolvedValue(null),
+      presentToolbar: vi.fn().mockResolvedValue(true),
+      hideToolbar: vi.fn().mockResolvedValue(undefined),
+      reportToolbarSize: vi.fn().mockResolvedValue(undefined),
+      onSelection: vi.fn((listener: (payload: SelectionPayload) => void) => {
+        selectionListener = listener
+        return () => undefined
+      }),
+      onSettingsChanged: vi.fn().mockReturnValue(() => undefined)
+    } as unknown as WindowTextLensApi
+
+    Object.defineProperty(window, 'textLens', { configurable: true, value: api })
+    render(<ToolbarApp />)
+
+    // The startup read fails; the bounded retry chain exhausts itself and
+    // the toolbar renders without any actions.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    })
+    const callsAfterStartupFailure = getSettings.mock.calls.length
+    expect(callsAfterStartupFailure).toBeGreaterThanOrEqual(1)
+    expect(screen.queryByRole('button', { name: '复制' })).toBeNull()
+
+    // The next selection re-arms the retry chain and this time the read
+    // succeeds, so the toolbar still becomes usable without an app restart.
+    act(() => {
+      selectionListener?.({ ...selection })
+    })
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '复制' })).not.toBeNull()
+    )
+    expect(getSettings.mock.calls.length).toBeGreaterThan(callsAfterStartupFailure)
+  })
+
   it('keeps focus and active states visually neutral and reserves feedback for hover', () => {
     expect(toolbarCss).not.toMatch(/outline:\s*2px/)
     expect(toolbarCss).toContain('background: var(--surface-muted)')

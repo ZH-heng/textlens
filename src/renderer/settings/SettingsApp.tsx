@@ -50,6 +50,7 @@ import {
   MAX_ENABLED_ACTIONS,
   RESULT_FONT_SIZE_MAX,
   RESULT_FONT_SIZE_MIN,
+  THEME_OPTIONS,
   TRANSLATION_LANGUAGES,
   TRANSLATION_LANGUAGE_NAMES,
   actionDefinitionSchema,
@@ -67,6 +68,7 @@ import {
 import { ActionIcon } from '../components/ActionIcon'
 import { runDetached } from '../lib/asyncEffects'
 import { getErrorMessage } from '../lib/errors'
+import { applyTheme } from '../lib/theme'
 import { CustomActionDialog, type ActionEditorValue } from './CustomActionDialog'
 import { mergeProviderModelsOnPick } from './providerModels'
 import {
@@ -535,6 +537,13 @@ export function SettingsApp(): JSX.Element {
     setDirty(true)
     setBanner(null)
   }, [])
+
+  // Preview the drafted theme on the settings window itself; cancelling or
+  // resetting the draft reverts the attribute through the same effect.
+  const draftTheme = draft?.appearance.theme
+  useEffect(() => {
+    if (draftTheme) applyTheme(draftTheme)
+  }, [draftTheme])
 
   const enabledActions = useMemo(
     () => sortAndNumberActions(draft?.actions ?? []).filter((action) => action.enabled),
@@ -1533,6 +1542,38 @@ export function SettingsApp(): JSX.Element {
           {draft.result.dismissMode === 'pointer-leave' && <div className="setting-row"><div><strong>移出延迟</strong><p>短暂移出不会误关窗口。</p></div>
             <div className="range-control"><input type="range" min={100} max={2000} step={50} value={draft.result.dismissDelayMs}
               onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, dismissDelayMs: Number(event.target.value) } }))} /><span>{draft.result.dismissDelayMs} ms</span></div></div>}
+          <div className="setting-row setting-row--stackable">
+            <div><strong>界面主题</strong><p>工具栏、结果框与设置窗口同时换装；预览按当前系统明暗外观渲染。</p></div>
+            <div className="theme-options" role="radiogroup" aria-label="界面主题">
+              {THEME_OPTIONS.map((option) => {
+                const selected = draft.appearance.theme === option.id
+                return (
+                  <button key={option.id} type="button" role="radio" aria-checked={selected}
+                    className={`theme-option${selected ? ' theme-option--selected' : ''}`} data-theme={option.id}
+                    onClick={() => changeDraft((current) => ({ ...current, appearance: { theme: option.id } }))}>
+                    <span className="theme-preview" aria-hidden="true">
+                      <span className="theme-preview__toolbar">
+                        <i className="theme-preview__chip" />
+                        <i className="theme-preview__chip theme-preview__chip--accent" />
+                        <i className="theme-preview__chip" />
+                      </span>
+                      <span className="theme-preview__window">
+                        <span className="theme-preview__header">
+                          <i className="theme-preview__badge" />
+                          <i className="theme-preview__line theme-preview__line--meta" />
+                        </span>
+                        <i className="theme-preview__line" />
+                        <i className="theme-preview__line theme-preview__line--short" />
+                        <i className="theme-preview__button" />
+                      </span>
+                    </span>
+                    <span className="theme-option__name">{option.name}</span>
+                    {selected && <Check className="theme-option__check" size={13} aria-hidden="true" />}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
           <div className="setting-row"><div><strong>窗口透明度</strong><p>内容和控件会保持统一透明度。</p></div>
             <div className="range-control"><input type="range" min={20} max={100} value={Math.round(draft.result.opacity * 100)}
               onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, opacity: Number(event.target.value) / 100 } }))} /><span>{Math.round(draft.result.opacity * 100)}%</span></div></div>

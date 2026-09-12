@@ -1,0 +1,168 @@
+/* Appearance themes. The base tokens in styles.css define the default "warm"
+   theme; each block here overrides shared tokens for one theme. The attribute
+   is set on the document element from settings, and the settings page reuses
+   the same attribute on preview cards, so one rule set serves both.
+
+   Every theme block is written as `:root[data-theme=…]` plus the bare
+   attribute selector, and each appearance lives in its own media query: the
+   :root form out-specifies the plain `:root` token blocks in styles.css so
+   themes win regardless of bundle order, while confining light overrides to
+   the light appearance lets themes without a dark variant (warm, classic)
+   fall through to the shared dark tokens. */
+
+@media (prefers-color-scheme: light) {
+  [data-theme='classic'],
+  :root[data-theme='classic'] {
+    --bg: #f5f6f8;
+    --surface: rgba(255, 255, 255, 0.94);
+    --surface-solid: #ffffff;
+    --surface-muted: #f0f2f5;
+    --surface-inset: #e9edf2;
+    --text: #17191d;
+    --text-secondary: #626874;
+    --text-tertiary: #8c929d;
+    --border: rgba(17, 24, 39, 0.11);
+    --border-strong: rgba(17, 24, 39, 0.19);
+    --accent: #356ae6;
+    --accent-hover: #2859cc;
+    --accent-soft: rgba(53, 106, 230, 0.12);
+    --danger: #c53b3b;
+    --danger-soft: rgba(197, 59, 59, 0.11);
+    --success: #237a4b;
+    --success-soft: rgba(35, 122, 75, 0.11);
+    --warning: #9b6415;
+    --warning-soft: rgba(155, 100, 21, 0.12);
+    --shadow-sm: 0 2px 10px rgba(20, 25, 35, 0.09);
+    --shadow-md: 0 8px 24px rgba(20, 25, 35, 0.12);
+    --shadow-lg: 0 18px 50px rgba(20, 25, 35, 0.16);
+    --highlight: rgba(255, 255, 255, 0.65);
+  }
+
+  [data-theme='sand'],
+  :root[data-theme='sand'] {
+    --bg: #f2e9d8;
+    --surface: rgba(252, 247, 236, 0.95);
+    --surface-solid: #fcf7ec;
+    --surface-muted: #ede3cd;
+    --surface-inset: #e3d6b9;
+    --text: #2b251a;
+    --text-secondary: #6f6650;
+    --text-tertiary: #a29881;
+    --border: rgba(96, 80, 50, 0.16);
+    --border-strong: rgba(96, 80, 50, 0.26);
+    --accent: #2e7a6d;
+    --accent-hover: #25645a;
+    --accent-soft: rgba(46, 122, 109, 0.12);
+    --danger: #b04a35;
+    --danger-soft: rgba(176, 74, 53, 0.12);
+    --success: #4a7a3a;
+    --success-soft: rgba(74, 122, 58, 0.12);
+    --warning: #96620f;
+    --warning-soft: rgba(150, 98, 15, 0.13);
+    --shadow-sm: 0 2px 10px rgba(96, 74, 40, 0.12);
+    --shadow-md: 0 8px 24px rgba(96, 74, 40, 0.15);
+    --shadow-lg: 0 18px 50px rgba(96, 74, 40, 0.2);
+    --highlight: rgba(255, 253, 246, 0.6);
+  }
+
+  [data-theme='sage'],
+  :root[data-theme='sage'] {
+    --bg: #edf1e8;
+    --surface: rgba(250, 252, 247, 0.95);
+    --surface-solid: #fafcf7;
+    --surface-muted: #e4ebdd;
+    --surface-inset: #d6dfcb;
+    --text: #20261d;
+    --text-secondary: #646c5c;
+    --text-tertiary: #949c88;
+    --border: rgba(60, 74, 48, 0.14);
+    --border-strong: rgba(60, 74, 48, 0.23);
+    --accent: #45774f;
+    --accent-hover: #386441;
+    --accent-soft: rgba(69, 119, 79, 0.13);
+    --shadow-sm: 0 2px 10px rgba(52, 66, 44, 0.11);
+    --shadow-md: 0 8px 24px rgba(52, 66, 44, 0.14);
+    --shadow-lg: 0 18px 50px rgba(52, 66, 44, 0.19);
+    --highlight: rgba(253, 255, 250, 0.65);
+  }
+
+  [data-theme='ocean'],
+  :root[data-theme='ocean'] {
+    --bg: #ebf0f5;
+    --surface: rgba(249, 251, 253, 0.95);
+    --surface-solid: #f9fbfd;
+    --surface-muted: #e2eaf2;
+    --surface-inset: #d3dfe9;
+    --text: #1a222c;
+    --text-secondary: #5c6a7a;
+    --text-tertiary: #8b98a8;
+    --border: rgba(38, 58, 82, 0.14);
+    --border-strong: rgba(38, 58, 82, 0.23);
+    --accent: #2b6fa8;
+    --accent-hover: #225b8c;
+    --accent-soft: rgba(43, 111, 168, 0.12);
+    --shadow-sm: 0 2px 10px rgba(30, 48, 70, 0.1);
+    --shadow-md: 0 8px 24px rgba(30, 48, 70, 0.13);
+    --shadow-lg: 0 18px 50px rgba(30, 48, 70, 0.17);
+    --highlight: rgba(252, 254, 255, 0.7);
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  [data-theme='sand'],
+  :root[data-theme='sand'] {
+    --bg: #201b12;
+    --surface: rgba(41, 35, 24, 0.94);
+    --surface-solid: #29231a;
+    --surface-muted: #322b1e;
+    --surface-inset: #171208;
+    --text: #f3eee2;
+    --text-secondary: #c2b8a0;
+    --text-tertiary: #8d8571;
+    --accent: #d9a25f;
+    --accent-hover: #e4b578;
+    --accent-soft: rgba(217, 162, 95, 0.16);
+    --danger: #ff9d8a;
+    --danger-soft: rgba(255, 157, 138, 0.14);
+    --success: #a4d08e;
+    --success-soft: rgba(164, 208, 142, 0.14);
+    --warning: #e8bd6d;
+    --warning-soft: rgba(232, 189, 109, 0.15);
+  }
+
+  [data-theme='sage'],
+  :root[data-theme='sage'] {
+    --bg: #171d16;
+    --surface: rgba(36, 44, 35, 0.94);
+    --surface-solid: #242c23;
+    --surface-muted: #2d362b;
+    --surface-inset: #10140e;
+    --text: #eef3ec;
+    --text-secondary: #b4c2b0;
+    --text-tertiary: #7f8d7b;
+    --accent: #93cba2;
+    --accent-hover: #a9d8b5;
+    --accent-soft: rgba(147, 203, 162, 0.15);
+    --danger: #ff9d8a;
+    --danger-soft: rgba(255, 157, 138, 0.14);
+    --success: #a4d08e;
+    --success-soft: rgba(164, 208, 142, 0.14);
+    --warning: #e8bd6d;
+    --warning-soft: rgba(232, 189, 109, 0.15);
+  }
+
+  [data-theme='ocean'],
+  :root[data-theme='ocean'] {
+    --bg: #141a21;
+    --surface: rgba(31, 40, 50, 0.94);
+    --surface-solid: #1f2832;
+    --surface-muted: #273240;
+    --surface-inset: #0e141b;
+    --text: #ecf1f6;
+    --text-secondary: #adbcc9;
+    --text-tertiary: #78879a;
+    --accent: #82b6dd;
+    --accent-hover: #9ac7e6;
+    --accent-soft: rgba(130, 182, 221, 0.15);
+  }
+}

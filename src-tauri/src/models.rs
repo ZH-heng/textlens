@@ -237,6 +237,41 @@ impl Default for ToolbarSettings {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Theme {
+    #[serde(rename = "warm")]
+    Warm,
+    #[serde(rename = "classic")]
+    Classic,
+    #[serde(rename = "sand")]
+    Sand,
+    #[serde(rename = "sage")]
+    Sage,
+    #[serde(rename = "ocean")]
+    Ocean,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::Warm
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppearanceSettings {
+    #[serde(default)]
+    pub theme: Theme,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::Warm,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ResultDismissMode {
     #[serde(rename = "manual")]
     Manual,
@@ -641,6 +676,8 @@ pub struct AppSettings {
     pub locale: Locale,
     pub translate: TranslationSettings,
     pub toolbar: ToolbarSettings,
+    #[serde(default)]
+    pub appearance: AppearanceSettings,
     pub result: ResultSettings,
     pub trigger: TriggerSettings,
     #[serde(default)]
@@ -662,6 +699,8 @@ pub struct PublicSettings {
     pub locale: Locale,
     pub translate: TranslationSettings,
     pub toolbar: ToolbarSettings,
+    #[serde(default)]
+    pub appearance: AppearanceSettings,
     pub result: ResultSettings,
     pub trigger: TriggerSettings,
     pub application: ApplicationSettings,
@@ -684,6 +723,7 @@ impl PublicSettings {
             locale: settings.locale,
             translate: settings.translate.clone(),
             toolbar: settings.toolbar.clone(),
+            appearance: settings.appearance.clone(),
             result: settings.result.clone(),
             trigger: settings.trigger.clone(),
             application: settings.application.clone(),
@@ -712,6 +752,7 @@ pub struct SettingsUpdate {
     pub locale: Option<Locale>,
     pub translate: Option<TranslationSettings>,
     pub toolbar: Option<ToolbarSettings>,
+    pub appearance: Option<AppearanceSettings>,
     pub result: Option<ResultSettings>,
     pub trigger: Option<TriggerSettings>,
     pub application: Option<ApplicationSettings>,
@@ -978,6 +1019,7 @@ impl Default for AppSettings {
             locale: Locale::ZhCn,
             translate: TranslationSettings::default(),
             toolbar: ToolbarSettings::default(),
+            appearance: AppearanceSettings::default(),
             result: ResultSettings::default(),
             trigger: TriggerSettings::default(),
             application: ApplicationSettings::default(),

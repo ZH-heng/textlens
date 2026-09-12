@@ -473,6 +473,14 @@ export const toolbarSettingsSchema = z
   .strict()
 export type ToolbarSettings = z.infer<typeof toolbarSettingsSchema>
 
+export const themeSchema = z.enum(['warm', 'classic', 'sand', 'sage', 'ocean'])
+export type Theme = z.infer<typeof themeSchema>
+
+export const appearanceSettingsSchema = z
+  .object({ theme: themeSchema })
+  .strict()
+export type AppearanceSettings = z.infer<typeof appearanceSettingsSchema>
+
 export const resultDismissModeSchema = z.enum(['manual', 'blur', 'pointer-leave'])
 export const resultSettingsSchema = z
   .object({
@@ -561,6 +569,7 @@ const commonSettingsShape = {
   locale: supportedLocaleSchema,
   translate: translationSettingsSchema,
   toolbar: toolbarSettingsSchema,
+  appearance: appearanceSettingsSchema.default({ theme: 'warm' }),
   result: resultSettingsSchema,
   trigger: triggerSettingsSchema,
   application: applicationSettingsSchema,
@@ -624,6 +633,7 @@ export const settingsUpdateSchema = z
     locale: supportedLocaleSchema.optional(),
     translate: translationSettingsSchema.optional(),
     toolbar: toolbarSettingsSchema.optional(),
+    appearance: appearanceSettingsSchema.optional(),
     result: resultSettingsSchema.optional(),
     trigger: triggerSettingsSchema.optional(),
   application: applicationSettingsSchema.optional(),

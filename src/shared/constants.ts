@@ -61,6 +61,19 @@ export const DEFAULT_TOOLBAR_SETTINGS = {
   displayMode: 'icon-label'
 } as const
 
+export const DEFAULT_APPEARANCE_SETTINGS = {
+  theme: 'warm'
+} as const
+
+/** Selectable appearance themes, in settings-UI order. */
+export const THEME_OPTIONS = [
+  { id: 'warm', name: '暖白' },
+  { id: 'classic', name: '经典' },
+  { id: 'sand', name: '米杏' },
+  { id: 'sage', name: '苔绿' },
+  { id: 'ocean', name: '海雾' }
+] as const
+
 export const DEFAULT_RESULT_SETTINGS = {
   followCursor: true,
   rememberSize: true,

@@ -17,6 +17,7 @@ import {
 import { ActionIcon } from '../components/ActionIcon'
 import { runDetached } from '../lib/asyncEffects'
 import { getErrorMessage } from '../lib/errors'
+import { applyTheme } from '../lib/theme'
 
 const SETTINGS_RETRY_DELAYS_MS = [0, 16, 64] as const
 const TOOLBAR_PRESENTATION_ATTEMPTS = 3
@@ -293,6 +294,10 @@ export function ToolbarApp(): JSX.Element {
         .slice(0, MAX_ENABLED_ACTIONS),
     [settings]
   )
+
+  useEffect(() => {
+    applyTheme(settings?.appearance.theme)
+  }, [settings?.appearance.theme])
 
   useLayoutEffect(() => {
     const element = toolbarRef.current

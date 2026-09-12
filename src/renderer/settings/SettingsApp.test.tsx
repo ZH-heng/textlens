@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { StrictMode } from 'react'
 
 import {
@@ -209,6 +209,43 @@ describe('SettingsApp provider deletion', () => {
     expect(updateSettings.mock.calls[0]?.[0].application).toEqual({ closeBehavior: 'quit' })
 
     expect(screen.queryByRole('button', { name: '退出 TextLens' })).not.toBeInTheDocument()
+  })
+
+  it('previews appearance themes and persists the selected theme', async () => {
+    const updateSettings = vi.fn(async (update: SettingsUpdate): Promise<PublicSettings> => ({
+      ...DEFAULT_PUBLIC_SETTINGS,
+      appearance: update.appearance ?? DEFAULT_PUBLIC_SETTINGS.appearance
+    }))
+    window.textLens = {
+      getSettings: vi.fn(async () => DEFAULT_PUBLIC_SETTINGS),
+      updateSettings,
+      getAccessibilityStatus: vi.fn(async () => ({
+        platform: 'windows',
+        trusted: true,
+        canRequest: false
+      })),
+      requestAccessibility: vi.fn(),
+      onSettingsChanged: vi.fn(() => () => undefined),
+      onSettingsCloseRequested: vi.fn(() => () => undefined)
+    } as unknown as WindowTextLensApi
+
+    render(<SettingsApp />)
+    await goToSettingsSection('结果')
+
+    const group = await screen.findByRole('radiogroup', { name: '界面主题' })
+    const options = within(group).getAllByRole('radio')
+    expect(options).toHaveLength(5)
+    expect(within(group).getByRole('radio', { name: '暖白' })).toHaveAttribute('aria-checked', 'true')
+    expect(document.documentElement).not.toHaveAttribute('data-theme')
+
+    fireEvent.click(within(group).getByRole('radio', { name: '苔绿' }))
+    expect(within(group).getByRole('radio', { name: '苔绿' })).toHaveAttribute('aria-checked', 'true')
+    expect(within(group).getByRole('radio', { name: '暖白' })).toHaveAttribute('aria-checked', 'false')
+    expect(document.documentElement).toHaveAttribute('data-theme', 'sage')
+
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1))
+    expect(updateSettings.mock.calls[0]?.[0].appearance).toEqual({ theme: 'sage' })
   })
 
   it('fades a successful save after 1.4 seconds and removes it after 2 seconds', async () => {

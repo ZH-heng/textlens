@@ -191,6 +191,9 @@ impl SettingsRepository {
             if let Some(value) = update.toolbar {
                 settings.toolbar = value;
             }
+            if let Some(value) = update.appearance {
+                settings.appearance = value;
+            }
             if let Some(mut value) = update.result {
                 // Window dimensions are runtime-owned state. A settings page
                 // can stay open with a stale public snapshot while a result
@@ -233,6 +236,7 @@ impl SettingsRepository {
                 locale: public.locale,
                 translate: public.translate,
                 toolbar: public.toolbar,
+                appearance: public.appearance,
                 result: public.result,
                 trigger: public.trigger,
                 application: public.application,
@@ -1013,6 +1017,7 @@ fn migrate_v1(value: serde_json::Value) -> Result<LoadedSettings, SettingsError>
         locale: legacy.locale,
         translate: legacy.translate,
         toolbar: Default::default(),
+        appearance: Default::default(),
         result: Default::default(),
         trigger: Default::default(),
         application: Default::default(),

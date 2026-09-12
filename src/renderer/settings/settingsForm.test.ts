@@ -38,6 +38,16 @@ describe('settings form helpers', () => {
     if (result.valid) expect(result.value.application).toEqual({ closeBehavior: 'quit' })
   })
 
+  it('includes the appearance theme in ordinary settings updates', () => {
+    const result = buildSettingsUpdate({
+      ...DEFAULT_PUBLIC_SETTINGS,
+      appearance: { theme: 'sage' }
+    })
+
+    expect(result.valid).toBe(true)
+    if (result.valid) expect(result.value.appearance).toEqual({ theme: 'sage' })
+  })
+
   it('includes per-application capture strategies in ordinary settings updates', () => {
     const result = buildSettingsUpdate({
       ...DEFAULT_PUBLIC_SETTINGS,

@@ -78,6 +78,33 @@ describe('settings schemas and defaults', () => {
     for (const action of DEFAULT_ACTIONS.filter((candidate) => 'prompt' in candidate)) {
       expect(action.prompt).toContain(TEXT_PLACEHOLDER)
     }
+    expect(DEFAULT_APP_SETTINGS.appearance).toEqual({ theme: 'warm' })
+    expect(DEFAULT_PUBLIC_SETTINGS.appearance).toEqual({ theme: 'warm' })
+  })
+
+  it('applies appearance theme defaults and validates theme ids', () => {
+    const appWithoutAppearance = (({ appearance: _appearance, ...rest }) => rest)(DEFAULT_APP_SETTINGS)
+    expect(appSettingsSchema.parse(appWithoutAppearance).appearance).toEqual({ theme: 'warm' })
+
+    const publicWithoutAppearance = (({ appearance: _appearance, ...rest }) => rest)(DEFAULT_PUBLIC_SETTINGS)
+    expect(publicSettingsSchema.parse(publicWithoutAppearance).appearance).toEqual({ theme: 'warm' })
+
+    const themed = appSettingsSchema.parse({
+      ...appWithoutAppearance,
+      appearance: { theme: 'sage' }
+    })
+    expect(themed.appearance).toEqual({ theme: 'sage' })
+
+    expect(() => appSettingsSchema.parse({
+      ...appWithoutAppearance,
+      appearance: { theme: 'neon' }
+    }).appearance).toThrow()
+
+    const update = settingsUpdateSchema.parse({ appearance: { theme: 'ocean' } })
+    expect(update.appearance).toEqual({ theme: 'ocean' })
+
+    const migrated = migrateAppSettings({ ...DEFAULT_APP_SETTINGS, version: 11 })
+    expect(migrated.appearance).toEqual({ theme: 'warm' })
   })
 
   it('migrates v11 settings to visible capture compatibility rules', () => {

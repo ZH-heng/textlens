@@ -44,6 +44,7 @@ import {
 import { ActionIcon } from '../components/ActionIcon'
 import { runDetached } from '../lib/asyncEffects'
 import { getErrorMessage } from '../lib/errors'
+import { applyTheme } from '../lib/theme'
 import {
   flushPendingActionEvents,
   getActionEventSnapshot,
@@ -371,6 +372,11 @@ function ResultSessionApp({
   const hasThinking = useResultField((state) => state.thinkingContent.length > 0)
   const [settings, setSettings] = useState<PublicSettings>(DEFAULT_PUBLIC_SETTINGS)
   const settingsRevisionRef = useRef(0)
+
+  useEffect(() => {
+    applyTheme(settings.appearance.theme)
+  }, [settings.appearance.theme])
+
   const [session, setSession] = useState<ResultSessionSnapshot | null>(null)
   const [pinned, setPinned] = useState(false)
   const [showOriginal, setShowOriginal] = useState(false)

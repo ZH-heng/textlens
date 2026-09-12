@@ -139,6 +139,7 @@ export function buildSettingsUpdate(settings: PublicSettings):
     locale: settings.locale,
     translate: settings.translate,
     toolbar: settings.toolbar,
+    appearance: settings.appearance,
     result: settings.result,
     trigger: settings.trigger,
     application: settings.application,

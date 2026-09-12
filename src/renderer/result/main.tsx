@@ -2,6 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 
 import '../styles.css'
+import '../themes.css'
 import './result.css'
 import { installTauriBridge } from '../lib/tauriBridge'
 import { runDetached } from '../lib/asyncEffects'

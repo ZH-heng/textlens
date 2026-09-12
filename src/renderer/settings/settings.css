@@ -1678,3 +1678,144 @@ body {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
+
+/* Appearance theme picker: preview cards re-scope the shared tokens through
+   the same data-theme attribute the windows use, so each card renders with
+   its theme's real palette in the current system appearance. */
+.theme-options {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+}
+
+.theme-option {
+  position: relative;
+  display: grid;
+  gap: 7px;
+  justify-items: center;
+  padding: 10px 8px 9px;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.theme-option:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.theme-option--selected {
+  color: var(--accent);
+  font-weight: 620;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.theme-option__check {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+}
+
+.theme-option__name {
+  line-height: 1;
+}
+
+.theme-preview {
+  display: grid;
+  gap: 5px;
+  width: 100%;
+}
+
+.theme-preview__toolbar {
+  display: inline-flex;
+  gap: 3px;
+  justify-content: center;
+  width: max-content;
+  margin: 0 auto;
+  padding: 3px 4px;
+  background: color-mix(in srgb, var(--surface-solid) 88%, var(--surface-muted));
+  border: 1px solid color-mix(in srgb, var(--border-strong) 55%, transparent);
+  border-radius: 6px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+.theme-preview__chip {
+  width: 10px;
+  height: 8px;
+  background: var(--surface-muted);
+  border-radius: 2.5px;
+}
+
+.theme-preview__chip--accent {
+  background: var(--accent);
+}
+
+.theme-preview__window {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 6px;
+  background: color-mix(in srgb, var(--surface-solid) 72%, var(--surface-muted));
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.theme-preview__header {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  min-height: 10px;
+  padding: 2px 4px;
+  margin: -2px -2px 1px;
+  background: color-mix(in srgb, var(--surface-muted) 66%, var(--surface-solid));
+  border-radius: 4px;
+}
+
+.theme-preview__badge {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+}
+
+.theme-preview__line {
+  display: block;
+  height: 4px;
+  background: color-mix(in srgb, var(--text-secondary) 55%, transparent);
+  border-radius: 999px;
+}
+
+.theme-preview__line--meta {
+  flex: 1;
+  max-width: 52px;
+  background: color-mix(in srgb, var(--text-tertiary) 60%, transparent);
+}
+
+.theme-preview__line--short {
+  width: 62%;
+  background: color-mix(in srgb, var(--text-tertiary) 50%, transparent);
+}
+
+.theme-preview__button {
+  display: block;
+  width: 34px;
+  height: 8px;
+  margin-top: 2px;
+  margin-left: auto;
+  background: color-mix(in srgb, var(--result-header-surface, var(--surface-muted)) 66%, var(--surface-solid));
+  border: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
+  border-radius: 3px;
+}
+
+@media (max-width: 720px) {
+  .theme-options {
+    grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  }
+}

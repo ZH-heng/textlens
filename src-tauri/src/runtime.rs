@@ -35,6 +35,7 @@ use crate::{
         SettingsUpdate, SyncModelsResult, TriggerMode, UpdateProviderInput,
         WindowSize as SettingsWindowSize,
     },
+    settings::SettingsError,
     selection::{
         SelectionDirection, SelectionEvent, SelectionEventReceiver, SelectionMethod,
         SelectionMonitor, SelectionMouse, SelectionPayload, SelectionPoint, SelectionTrigger,
@@ -1721,15 +1722,63 @@ impl RuntimeState {
             }
             return;
         }
-        if let Ok(public) = self.settings.update_result_last_size(pending.size) {
+        // The transaction holds the settings write lock across an fsync, so
+        // keep it off the main thread even when a close/destroy event hands
+        // us here, and off shared async workers via the blocking pool.
+        let settings = self.settings.clone();
+        let app_handle = app.clone();
+        let tracked_session = session_id.to_owned();
+        let tracked_revision = pending.revision;
+        tauri::async_runtime::spawn(async move {
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                settings
+                    .update_result_last_size(pending.size)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap_or_else(|join_error| Err(format!("设置任务调度失败：{join_error}")));
+            let settle_session = tracked_session.clone();
+            let app_for_main = app_handle.clone();
+            let _ = app_handle.run_on_main_thread(move || {
+                app_for_main
+                    .state::<RuntimeState>()
+                    .settle_result_size_persist(
+                        &app_for_main,
+                        &settle_session,
+                        tracked_revision,
+                        result,
+                    );
+            });
+        });
+    }
+
+    fn settle_result_size_persist(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        revision: u64,
+        result: Result<PublicSettings, String>,
+    ) {
+        {
             let mut sizes = self.pending_result_sizes.lock();
-            if sizes
+            // A newer resize supersedes this write regardless of its outcome;
+            // without removal a failed transaction would leak the entry until
+            // process exit.
+            if !sizes
                 .get(session_id)
-                .is_some_and(|current| current.revision == pending.revision)
+                .is_some_and(|current| current.revision == revision)
             {
-                sizes.remove(session_id);
+                return;
             }
-            let _ = app.emit(SETTINGS_CHANGED_EVENT, public);
+            sizes.remove(session_id);
+        }
+        match result {
+            Ok(public) => {
+                let _ = app.emit(SETTINGS_CHANGED_EVENT, public);
+            }
+            Err(error) => {
+                eprintln!("[TextLens] 结果窗尺寸持久化失败：{error}");
+            }
         }
     }
 
@@ -2133,15 +2182,13 @@ fn accessibility_platform() -> &'static str {
 }
 
 #[tauri::command]
-pub fn get_settings(
+pub async fn get_settings(
     window: WebviewWindow,
     state: State<'_, RuntimeState>,
 ) -> Result<PublicSettings, String> {
     ensure_known_caller(&window)?;
-    state
-        .settings
-        .get_public_settings()
-        .map_err(|error| error.to_string())
+    let settings = state.settings.clone();
+    run_repository(move || settings.get_public_settings()).await
 }
 
 #[tauri::command]
@@ -2151,8 +2198,41 @@ pub fn settings_ready(window: WebviewWindow, state: State<'_, RuntimeState>) -> 
     Ok(())
 }
 
+/// Runs an operation on the main thread and waits for its result. Settings
+/// commands are async so disk IO runs on the blocking pool, but global
+/// shortcut registration and window-facing broadcasts keep their original
+/// main-thread execution context through this hop.
+fn run_on_main_thread<T, F>(app: &AppHandle, operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let _ignored = sender.send(operation());
+    })
+    .map_err(|error| error.to_string())?;
+    receiver
+        .recv()
+        .map_err(|_| "主线程调度器已退出".to_owned())
+}
+
+/// Runs repository work on the blocking pool. Transactions hold the settings
+/// write lock across an fsync, so they must never occupy the main thread or a
+/// shared async worker.
+async fn run_repository<T, F>(operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, SettingsError> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|error| format!("设置任务调度失败：{error}"))?
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
-pub fn update_settings(
+pub async fn update_settings(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, RuntimeState>,
@@ -2173,25 +2253,53 @@ pub fn update_settings(
             .as_ref()
             .map_or(current.trigger.mode, |trigger| trigger.mode);
         let requested = shortcut_registration_target(enabled, mode, configured);
-        Some(state.switch_shortcut(&app, &requested)?)
+        let app_for_shortcut = app.clone();
+        Some(
+            run_on_main_thread(&app, move || {
+                app_for_shortcut
+                    .state::<RuntimeState>()
+                    .switch_shortcut(&app_for_shortcut, &requested)
+            })??,
+        )
     } else {
         None
     };
-    let public = match state.settings.update(update) {
+    let settings = state.settings.clone();
+    let public = match run_repository(move || settings.update(update)).await {
         Ok(public) => public,
         Err(error) => {
             if let Some(previous) = previous_shortcut {
-                let _ = state.switch_shortcut(&app, &previous);
+                let app_for_rollback = app.clone();
+                if let Err(rollback_error) = run_on_main_thread(&app, move || {
+                    app_for_rollback
+                        .state::<RuntimeState>()
+                        .switch_shortcut(&app_for_rollback, &previous)
+                }) {
+                    // The registration is now neither the requested nor the
+                    // previous shortcut while the settings file still holds
+                    // the previous value. Surface the loss instead of letting
+                    // the capture hotkey disappear silently.
+                    let _ = app.emit(SHORTCUT_ERROR_EVENT, rollback_error.clone());
+                    return Err(format!(
+                        "{error}；捕获快捷键恢复失败（{rollback_error}），请重新在设置中保存快捷键"
+                    ));
+                }
             }
-            return Err(error.to_string());
+            return Err(error);
         }
     };
-    state.after_settings_changed(&app, &public);
+    let public_for_broadcast = public.clone();
+    let app_for_broadcast = app.clone();
+    run_on_main_thread(&app, move || {
+        app_for_broadcast
+            .state::<RuntimeState>()
+            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
+    })?;
     Ok(public)
 }
 
 #[tauri::command]
-pub fn reset_result_size(
+pub async fn reset_result_size(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, RuntimeState>,
@@ -2201,32 +2309,40 @@ pub fn reset_result_size(
     // this removes the ambiguity between an explicit reset and a stale draft.
     state.pending_result_sizes.lock().clear();
     *state.latest_result_size.lock() = None;
-    let public = state
-        .settings
-        .clear_result_last_size()
-        .map_err(|error| error.to_string())?;
-    state.after_settings_changed(&app, &public);
+    let settings = state.settings.clone();
+    let public = run_repository(move || settings.clear_result_last_size()).await?;
+    let public_for_broadcast = public.clone();
+    let app_for_broadcast = app.clone();
+    run_on_main_thread(&app, move || {
+        app_for_broadcast
+            .state::<RuntimeState>()
+            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
+    })?;
     Ok(public)
 }
 
 #[tauri::command]
-pub fn create_provider(
+pub async fn create_provider(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, RuntimeState>,
     input: CreateProviderInput,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
-    let public = state
-        .settings
-        .create_provider(input)
-        .map_err(|error| error.to_string())?;
-    state.after_settings_changed(&app, &public);
+    let settings = state.settings.clone();
+    let public = run_repository(move || settings.create_provider(input)).await?;
+    let public_for_broadcast = public.clone();
+    let app_for_broadcast = app.clone();
+    run_on_main_thread(&app, move || {
+        app_for_broadcast
+            .state::<RuntimeState>()
+            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
+    })?;
     Ok(public)
 }
 
 #[tauri::command]
-pub fn update_provider(
+pub async fn update_provider(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, RuntimeState>,
@@ -2234,32 +2350,40 @@ pub fn update_provider(
     update: UpdateProviderInput,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
-    let public = state
-        .settings
-        .update_provider(&provider_id, update)
-        .map_err(|error| error.to_string())?;
-    state.after_settings_changed(&app, &public);
+    let settings = state.settings.clone();
+    let public = run_repository(move || settings.update_provider(&provider_id, update)).await?;
+    let public_for_broadcast = public.clone();
+    let app_for_broadcast = app.clone();
+    run_on_main_thread(&app, move || {
+        app_for_broadcast
+            .state::<RuntimeState>()
+            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
+    })?;
     Ok(public)
 }
 
 #[tauri::command]
-pub fn delete_provider(
+pub async fn delete_provider(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, RuntimeState>,
     provider_id: String,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
-    let public = state
-        .settings
-        .delete_provider(&provider_id)
-        .map_err(|error| error.to_string())?;
-    state.after_settings_changed(&app, &public);
+    let settings = state.settings.clone();
+    let public = run_repository(move || settings.delete_provider(&provider_id)).await?;
+    let public_for_broadcast = public.clone();
+    let app_for_broadcast = app.clone();
+    run_on_main_thread(&app, move || {
+        app_for_broadcast
+            .state::<RuntimeState>()
+            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
+    })?;
     Ok(public)
 }
 
 #[tauri::command]
-pub fn set_provider_api_key(
+pub async fn set_provider_api_key(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, RuntimeState>,
@@ -2267,43 +2391,49 @@ pub fn set_provider_api_key(
     api_key: String,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
-    let public = state
-        .settings
-        .set_provider_api_key(&provider_id, &api_key)
-        .map_err(|error| error.to_string())?;
-    state.after_settings_changed(&app, &public);
+    let settings = state.settings.clone();
+    let public = run_repository(move || settings.set_provider_api_key(&provider_id, &api_key)).await?;
+    let public_for_broadcast = public.clone();
+    let app_for_broadcast = app.clone();
+    run_on_main_thread(&app, move || {
+        app_for_broadcast
+            .state::<RuntimeState>()
+            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
+    })?;
     Ok(public)
 }
 
 #[tauri::command]
-pub fn clear_provider_api_key(
+pub async fn clear_provider_api_key(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, RuntimeState>,
     provider_id: String,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
-    let public = state
-        .settings
-        .clear_provider_api_key(&provider_id)
-        .map_err(|error| error.to_string())?;
-    state.after_settings_changed(&app, &public);
+    let settings = state.settings.clone();
+    let public = run_repository(move || settings.clear_provider_api_key(&provider_id)).await?;
+    let public_for_broadcast = public.clone();
+    let app_for_broadcast = app.clone();
+    run_on_main_thread(&app, move || {
+        app_for_broadcast
+            .state::<RuntimeState>()
+            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
+    })?;
     Ok(public)
 }
 
 /// Settings-window only: reveal a saved provider API key for display/editing.
 /// Keys are intentionally never included in `get_settings` / PublicSettings.
 #[tauri::command]
-pub fn get_provider_api_key(
+pub async fn get_provider_api_key(
     window: WebviewWindow,
     state: State<'_, RuntimeState>,
     provider_id: String,
 ) -> Result<Option<String>, String> {
     ensure_settings_caller(&window)?;
-    state
-        .settings
-        .get_api_key(&provider_id)
-        .map_err(|error| error.to_string())
+    let settings = state.settings.clone();
+    run_repository(move || settings.get_api_key(&provider_id)).await
 }
 
 #[tauri::command]

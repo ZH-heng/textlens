@@ -1,3 +1,5 @@
+import { countUnicodeScalars } from '../../shared'
+
 export type TranscriptRole = 'user' | 'assistant'
 
 export interface TranscriptTurn {
@@ -5,6 +7,10 @@ export interface TranscriptTurn {
   role: TranscriptRole
   content: string
   streaming: boolean
+  /** Unicode scalar count of `content`. Streaming patches supply it from the
+      typewriter controller so per-frame renders stay O(1); absent values fall
+      back to a one-shot scan at render time. */
+  scalarCount?: number
 }
 
 function nextTurnId(): string {
@@ -47,7 +53,8 @@ export function beginAssistantTurn(turns: TranscriptTurn[], turnId: string): Tra
 export function patchStreamingAssistant(
   turns: TranscriptTurn[],
   content: string,
-  streaming: boolean
+  streaming: boolean,
+  scalarCount?: number
 ): TranscriptTurn[] {
   if (turns.length === 0) return turns
   let lastAssistantIndex = -1
@@ -65,7 +72,8 @@ export function patchStreamingAssistant(
   next[lastAssistantIndex] = {
     ...current,
     content,
-    streaming
+    streaming,
+    scalarCount: scalarCount ?? countUnicodeScalars(content)
   }
   return next
 }

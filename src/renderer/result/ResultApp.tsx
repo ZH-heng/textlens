@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  memo,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
   type JSX
@@ -201,22 +202,16 @@ function ResultStreamBody({
   const requestGeneration = useResultField((state) => state.requestGeneration)
   const requestId = useResultField((state) => state.requestId)
   const requestKey = `${sessionGeneration ?? 'none'}:${requestGeneration ?? 'none'}:${requestId ?? 'none'}`
-  const streamContent = useSmoothStreamText(
-    content,
-    status === 'streaming',
-    requestKey
-  )
+  const stream = useSmoothStreamText(content, status === 'streaming', requestKey)
 
   return (
     <article className="markdown-body">
       <ResultOutput
         requestKey={requestKey}
         status={status}
-        content={streamContent}
+        content={stream.text}
         contentScalarCount={
-          status === 'streaming'
-            ? countUnicodeScalars(streamContent)
-            : contentScalarCount
+          status === 'streaming' ? stream.scalarCount : contentScalarCount
         }
         contentRevision={contentRevision}
         revealCommitted={revealCommitted}
@@ -306,30 +301,71 @@ function AskStreamBridge({
   onStream
 }: {
   enabled: boolean
-  onStream: (status: ResultState['status'], content: string) => void
+  onStream: (
+    status: ResultState['status'],
+    content: string,
+    scalarCount: number
+  ) => void
 }): null {
   const status = useResultField((state) => state.status)
   const content = useResultField((state) => state.content)
+  const contentScalarCount = useResultField((state) => state.contentScalarCount)
   const sessionGeneration = useResultField((state) => state.sessionGeneration)
   const requestGeneration = useResultField((state) => state.requestGeneration)
   const requestId = useResultField((state) => state.requestId)
   const requestKey = `${sessionGeneration ?? 'none'}:${requestGeneration ?? 'none'}:${requestId ?? 'none'}`
-  const streamContent = useSmoothStreamText(
-    content,
-    status === 'streaming',
-    requestKey
-  )
-  // Terminal states use store content so a lagging typewriter frame cannot
-  // seal the assistant turn with a truncated string.
-  const streamPatch = status === 'streaming' ? streamContent : content
+  const stream = useSmoothStreamText(content, status === 'streaming', requestKey)
+  // Terminal states use store content and the store's authoritative scalar
+  // count, so a lagging typewriter frame cannot seal the assistant turn with
+  // truncated values.
+  const streamPatch = status === 'streaming' ? stream.text : content
+  const streamScalarCount =
+    status === 'streaming' ? stream.scalarCount : contentScalarCount
 
   useEffect(() => {
     if (!enabled) return
-    onStream(status, streamPatch)
-  }, [enabled, onStream, status, streamPatch])
+    onStream(status, streamPatch, streamScalarCount)
+  }, [enabled, onStream, status, streamPatch, streamScalarCount])
 
   return null
 }
+
+/**
+ * Memoized per-turn output. The ask stream pumps the latest assistant turn
+ * once per typewriter frame; a stable-props memo keeps every completed turn's
+ * subtree (including its scalar scan) out of those frames.
+ */
+const AssistantTurnOutput = memo(function AssistantTurnOutput({
+  requestKey,
+  streaming,
+  content,
+  scalarCount,
+  revealCommitted,
+  onOpenExternal
+}: {
+  requestKey: string
+  streaming: boolean
+  content: string
+  scalarCount: number | undefined
+  revealCommitted: boolean
+  onOpenExternal: (url: string) => void
+}): JSX.Element {
+  const fallbackCount = useMemo(
+    () => (scalarCount === undefined ? countUnicodeScalars(content) : 0),
+    [scalarCount, content]
+  )
+  return (
+    <ResultOutput
+      requestKey={requestKey}
+      status={streaming ? 'streaming' : 'completed'}
+      content={content}
+      contentScalarCount={scalarCount ?? fallbackCount}
+      contentRevision={content.length}
+      revealCommitted={revealCommitted}
+      onOpenExternal={onOpenExternal}
+    />
+  )
+})
 
 export interface ResultAppProps {
   bootstrap?: ResultSessionBootstrap | null
@@ -485,22 +521,33 @@ function ResultSessionApp({
     []
   )
 
-  const handleAskStream = useCallback((streamStatus: ResultState['status'], content: string): void => {
-    if (streamStatus === 'streaming') {
-      askSawStreaming.current = true
-      setTurns((current) => patchStreamingAssistant(current, content, true))
-      return
-    }
-    if (
-      askSawStreaming.current &&
-      (streamStatus === 'completed' ||
-        streamStatus === 'cancelled' ||
-        streamStatus === 'error')
-    ) {
-      setTurns((current) => patchStreamingAssistant(current, content, false))
-      askSawStreaming.current = false
-    }
-  }, [])
+  const handleAskStream = useCallback(
+    (
+      streamStatus: ResultState['status'],
+      content: string,
+      scalarCount: number
+    ): void => {
+      if (streamStatus === 'streaming') {
+        askSawStreaming.current = true
+        setTurns((current) =>
+          patchStreamingAssistant(current, content, true, scalarCount)
+        )
+        return
+      }
+      if (
+        askSawStreaming.current &&
+        (streamStatus === 'completed' ||
+          streamStatus === 'cancelled' ||
+          streamStatus === 'error')
+      ) {
+        setTurns((current) =>
+          patchStreamingAssistant(current, content, false, scalarCount)
+        )
+        askSawStreaming.current = false
+      }
+    },
+    []
+  )
 
   const closeWindow = useCallback(async (): Promise<void> => {
     dismissNativeOverlays()
@@ -1186,12 +1233,11 @@ function ResultSessionApp({
                         {isLatestAssistant && <ThinkingPanel />}
                         {turn.content ? (
                           <article className="markdown-body result-turn__content">
-                            <ResultOutput
+                            <AssistantTurnOutput
                               requestKey={`${sessionId}:${turn.id}`}
-                              status={turn.streaming ? 'streaming' : 'completed'}
+                              streaming={turn.streaming}
                               content={turn.content}
-                              contentScalarCount={countUnicodeScalars(turn.content)}
-                              contentRevision={turn.content.length}
+                              scalarCount={turn.scalarCount}
                               revealCommitted={revealCommitted}
                               onOpenExternal={openExternal}
                             />

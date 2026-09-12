@@ -37,7 +37,10 @@ body {
   /* Keep the surface and shadow inside the native WebView bounds. A solid
      color also avoids the older WebView2 color-mix fallback mismatch that can
      make the pill disappear on some GPU/driver combinations. */
+  /* Keep the pill visible on engines that drop color-mix declarations. */
+  background-color: var(--surface-solid);
   background-color: color-mix(in srgb, var(--surface-solid) 88%, var(--surface-muted));
+  border: 1px solid var(--border-strong);
   border: 1px solid color-mix(in srgb, var(--border-strong) 55%, transparent);
   border-radius: 10px;
   box-shadow:

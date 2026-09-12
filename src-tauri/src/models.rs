@@ -1126,7 +1126,7 @@ impl AppSettings {
         let mut application_set = HashSet::new();
         for item in self.filter.applications {
             let item = item.trim().to_lowercase();
-            if item.is_empty() || item.len() > 512 {
+            if item.is_empty() || item.chars().count() > 512 {
                 return Err("应用过滤名单包含无效项目".to_owned());
             }
             if application_set.insert(item.clone()) {
@@ -1142,7 +1142,7 @@ impl AppSettings {
         let mut capture_rule_set = HashSet::new();
         for mut rule in self.selection_capture.applications {
             rule.application = rule.application.trim().replace('/', "\\").to_lowercase();
-            if rule.application.is_empty() || rule.application.len() > 512 {
+            if rule.application.is_empty() || rule.application.chars().count() > 512 {
                 return Err("划词获取应用规则包含无效程序名".to_owned());
             }
             if capture_rule_set.insert(rule.application.clone()) {
@@ -1173,10 +1173,10 @@ impl AppSettings {
             for model in &mut provider.models {
                 model.id = model.id.trim().to_owned();
                 model.name = model.name.trim().to_owned();
-                if model.id.is_empty() || model.id.len() > 256 {
+                if model.id.is_empty() || model.id.chars().count() > 256 {
                     return Err("模型 ID 应为 1–256 个字符".to_owned());
                 }
-                if model.name.is_empty() || model.name.len() > 256 {
+                if model.name.is_empty() || model.name.chars().count() > 256 {
                     return Err("模型名称应为 1–256 个字符".to_owned());
                 }
                 if !model_ids.insert(model.id.clone()) {
@@ -1221,7 +1221,9 @@ impl AppSettings {
                     .as_mut()
                     .ok_or_else(|| format!("AI 动作“{}”缺少提示词", action.name))?;
                 *prompt = prompt.trim().to_owned();
-                if prompt.is_empty() || prompt.len() > 10_000 || !prompt.contains(TEXT_PLACEHOLDER)
+                if prompt.is_empty()
+                    || prompt.chars().count() > 10_000
+                    || !prompt.contains(TEXT_PLACEHOLDER)
                 {
                     return Err(format!(
                         "AI 动作“{}”的提示词必须包含 {TEXT_PLACEHOLDER}，且不超过 10000 个字符",

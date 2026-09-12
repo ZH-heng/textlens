@@ -18,13 +18,16 @@ body,
   --result-model-control-surface: color-mix(in srgb, var(--surface-muted) 64%, var(--surface-solid));
   --result-model-menu-surface: color-mix(in srgb, var(--surface-solid) 96%, var(--surface-muted));
   --result-control-shadow: none;
-  --result-scrollbar-thumb: rgba(160, 146, 120, 0.4);
-  --result-scrollbar-thumb-hover: rgba(150, 135, 108, 0.58);
+  --result-scrollbar-thumb: color-mix(in srgb, var(--text-tertiary) 40%, transparent);
+  --result-scrollbar-thumb-hover: color-mix(in srgb, var(--text-tertiary) 58%, transparent);
   position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100vh;
   overflow: hidden;
+  /* Literal fallback first: engines that drop the color-mix var() value
+     render a plain warm-white window instead of nothing. */
+  background: var(--surface-solid);
   background: var(--result-content-surface);
   border: 0;
   border-radius: var(--result-radius);
@@ -120,6 +123,7 @@ body,
   padding: 4px 8px 4px 10px;
   cursor: default;
   user-select: none;
+  background: var(--surface-muted);
   background: var(--result-header-surface);
   border: 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
@@ -1401,8 +1405,6 @@ body,
     --result-model-control-surface: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-solid));
     --result-model-menu-surface: color-mix(in srgb, var(--surface-solid) 78%, var(--surface-muted));
     --result-control-shadow: none;
-    --result-scrollbar-thumb: rgba(184, 190, 200, 0.3);
-    --result-scrollbar-thumb-hover: rgba(196, 202, 212, 0.48);
   }
 
   .result-footer-button:hover:not(:disabled),

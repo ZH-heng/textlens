@@ -14,9 +14,27 @@ export type SmoothStreamFrameCanceller = (handle: number) => void
 
 export type SmoothStreamClock = () => number
 
+// Stable module-level identities: inline default arrows would change every
+// render and re-run the pump effect below on each frame.
+const defaultRequestFrame: SmoothStreamFrameScheduler = (callback) =>
+  window.requestAnimationFrame(callback)
+const defaultCancelFrame: SmoothStreamFrameCanceller = (handle) =>
+  window.cancelAnimationFrame(handle)
+const defaultNow: SmoothStreamClock = () => performance.now()
+
+export interface SmoothStreamSnapshot {
+  text: string
+  /** Scalar count of `text`, maintained incrementally by the controller.
+      Only meaningful while `streaming` is true; terminal states must fall
+      back to the store's authoritative `contentScalarCount`. */
+  scalarCount: number
+}
+
+const EMPTY_STREAM_SNAPSHOT: SmoothStreamSnapshot = { text: '', scalarCount: 0 }
+
 /**
  * Display-layer adaptive typewriter. `target` stays the full logical stream
- * text from the store; returned string lags slightly so bursts paint smoothly.
+ * text from the store; returned text lags slightly so bursts paint smoothly.
  *
  * - Non-streaming / terminal: always returns `target` immediately (no lag).
  * - Streaming: rAF pump only while backlog remains; stops when caught up and
@@ -29,10 +47,10 @@ export function useSmoothStreamText(
   streaming: boolean,
   resetKey: string,
   config: SmoothStreamConfig = DEFAULT_SMOOTH_STREAM_CONFIG,
-  requestFrame: SmoothStreamFrameScheduler = (cb) => window.requestAnimationFrame(cb),
-  cancelFrame: SmoothStreamFrameCanceller = (id) => window.cancelAnimationFrame(id),
-  now: SmoothStreamClock = () => performance.now()
-): string {
+  requestFrame: SmoothStreamFrameScheduler = defaultRequestFrame,
+  cancelFrame: SmoothStreamFrameCanceller = defaultCancelFrame,
+  now: SmoothStreamClock = defaultNow
+): SmoothStreamSnapshot {
   const controllerRef = useRef<SmoothStreamController | null>(null)
   if (controllerRef.current === null) {
     controllerRef.current = new SmoothStreamController(config)
@@ -43,7 +61,9 @@ export function useSmoothStreamText(
   const animationRef = useRef(streaming)
   targetRef.current = target
 
-  const [displayed, setDisplayed] = useState('')
+  const [displayed, setDisplayed] = useState<SmoothStreamSnapshot>(
+    EMPTY_STREAM_SNAPSHOT
+  )
   const resetKeyRef = useRef(resetKey)
 
   useLayoutEffect(() => {
@@ -55,12 +75,16 @@ export function useSmoothStreamText(
     animationRef.current = streaming
     if (!streaming) {
       const snapped = controller.setTarget(target, false, now())
-      setDisplayed((current) => (current === snapped ? current : snapped))
+      setDisplayed((current) =>
+        current.text === snapped ? current : { text: snapped, scalarCount: controller.getDisplayedScalarCount() }
+      )
       return
     }
 
     const seeded = controller.setTarget(target, true, now())
-    setDisplayed((current) => (current === seeded ? current : seeded))
+    setDisplayed((current) =>
+      current.text === seeded ? current : { text: seeded, scalarCount: controller.getDisplayedScalarCount() }
+    )
 
     if (!controller.needsTick()) return
 
@@ -79,7 +103,9 @@ export function useSmoothStreamText(
       }
 
       const advanced = controller.tick(frameTime)
-      setDisplayed((current) => (current === advanced ? current : advanced))
+      setDisplayed((current) =>
+        current.text === advanced ? current : { text: advanced, scalarCount: controller.getDisplayedScalarCount() }
+      )
       if (controller.needsTick()) {
         handle = requestFrame(pump)
       }
@@ -92,5 +118,7 @@ export function useSmoothStreamText(
     }
   }, [cancelFrame, controller, now, requestFrame, resetKey, streaming, target])
 
-  return streaming ? displayed : target
+  return streaming
+    ? displayed
+    : { text: target, scalarCount: displayed.scalarCount }
 }

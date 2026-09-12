@@ -7,6 +7,7 @@ export const AI_PROMPT_LIMIT = 50_000
 export const AI_OUTPUT_LIMIT = 1_000_000
 export const MAX_ENABLED_ACTIONS = 8
 export const MAX_ACTIONS = 50
+export const MAX_CUSTOM_ACTIONS = 10
 export const MAX_PROVIDERS = 20
 export const MAX_PROVIDER_MODELS = 200
 export const RESULT_FONT_SIZE_MIN = 12

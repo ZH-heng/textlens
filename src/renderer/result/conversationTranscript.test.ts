@@ -16,8 +16,15 @@ describe('conversationTranscript', () => {
     turns = patchStreamingAssistant(turns, '你好', false)
     expect(turns).toEqual([
       { id: expect.any(String), role: 'user', content: '你好', streaming: false },
-      { id: 'a1', role: 'assistant', content: '你好', streaming: false }
+      { id: 'a1', role: 'assistant', content: '你好', streaming: false, scalarCount: 2 }
     ])
+  })
+
+  it('keeps controller-provided scalar counts on streaming patches', () => {
+    let turns: TranscriptTurn[] = []
+    turns = beginAssistantTurn(turns, 'a1')
+    turns = patchStreamingAssistant(turns, 'a👩‍💻b', true, 4)
+    expect(turns[0]).toMatchObject({ content: 'a👩‍💻b', streaming: true, scalarCount: 4 })
   })
 
   it('ignores blank user questions', () => {

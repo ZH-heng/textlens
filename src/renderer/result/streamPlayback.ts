@@ -1,3 +1,5 @@
+import { countUnicodeScalars } from '../../shared'
+
 export const MAX_GRAPHEME_CARRY_SCALARS = 256
 
 export interface GraphemeTailUpdate {
@@ -174,6 +176,9 @@ function countBacklogScalars(value: string, from: number, cap: number): number {
 export class SmoothStreamController {
   private target = ''
   private displayed = ''
+  /** Scalar count of `displayed`, maintained incrementally so per-frame
+      consumers never rescan the full revealed text. */
+  private displayedScalarCount = 0
   private streaming = false
   private residual = 0
   private lastTickAt: number | null = null
@@ -187,6 +192,10 @@ export class SmoothStreamController {
     return this.displayed
   }
 
+  getDisplayedScalarCount(): number {
+    return this.displayedScalarCount
+  }
+
   getTarget(): string {
     return this.target
   }
@@ -198,6 +207,7 @@ export class SmoothStreamController {
   reset(): void {
     this.target = ''
     this.displayed = ''
+    this.displayedScalarCount = 0
     this.streaming = false
     this.residual = 0
     this.lastTickAt = null
@@ -214,6 +224,7 @@ export class SmoothStreamController {
 
     if (!streaming) {
       this.displayed = target
+      this.displayedScalarCount = countUnicodeScalars(target)
       this.residual = 0
       this.lastTickAt = null
       return this.displayed
@@ -226,6 +237,7 @@ export class SmoothStreamController {
       !this.displayed.startsWith(target)
     ) {
       this.displayed = target
+      this.displayedScalarCount = countUnicodeScalars(target)
       this.residual = 0
       this.lastTickAt = now || null
       return this.displayed
@@ -233,6 +245,7 @@ export class SmoothStreamController {
 
     if (this.displayed.length > target.length) {
       this.displayed = target
+      this.displayedScalarCount = countUnicodeScalars(target)
       this.residual = 0
       this.lastTickAt = now || null
       return this.displayed
@@ -245,6 +258,7 @@ export class SmoothStreamController {
           ? target.length
           : advanceByUnicodeScalars(target, 0, this.config.firstBurstMax)
       this.displayed = target.slice(0, burst)
+      this.displayedScalarCount = countUnicodeScalars(this.displayed)
       this.residual = 0
       // Anchor the clock so the next tick uses a real frame delta, not a huge gap.
       this.lastTickAt = now || null
@@ -265,6 +279,7 @@ export class SmoothStreamController {
     }
     if (!this.target.startsWith(this.displayed)) {
       this.displayed = this.target
+      this.displayedScalarCount = countUnicodeScalars(this.displayed)
       this.residual = 0
       this.lastTickAt = now
       return this.displayed
@@ -294,6 +309,9 @@ export class SmoothStreamController {
     if (step <= 0) return this.displayed
 
     const end = advanceByUnicodeScalars(this.target, this.displayed.length, step)
+    this.displayedScalarCount += countUnicodeScalars(
+      this.target.slice(this.displayed.length, end)
+    )
     this.displayed = this.target.slice(0, end)
     return this.displayed
   }

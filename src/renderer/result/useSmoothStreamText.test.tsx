@@ -19,7 +19,7 @@ function Harness({
   cancelFrame: (id: number) => void
   now: () => number
 }): ReactElement {
-  const displayed = useSmoothStreamText(
+  const stream = useSmoothStreamText(
     target,
     streaming,
     resetKey,
@@ -28,7 +28,11 @@ function Harness({
     cancelFrame,
     now
   )
-  return <div data-testid="out">{displayed}</div>
+  return (
+    <div data-testid="out" data-scalar-count={stream.scalarCount}>
+      {stream.text}
+    </div>
+  )
 }
 
 describe('useSmoothStreamText', () => {
@@ -105,6 +109,9 @@ describe('useSmoothStreamText', () => {
       guard += 1
     }
     expect(screen.getByTestId('out')).toHaveTextContent(long)
+    // The incremental counter must land on the full scalar count of `long`
+    // (42 code points) without any full-text rescan at the call site.
+    expect(screen.getByTestId('out').dataset.scalarCount).toBe('42')
   })
 
   it('returns the complete result immediately when streaming ends mid-drain', () => {

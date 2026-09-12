@@ -1,4 +1,5 @@
 import {
+  MAX_CUSTOM_ACTIONS,
   MAX_ENABLED_ACTIONS,
   TEXT_PLACEHOLDER,
   isAiActionDefinition,
@@ -110,6 +111,10 @@ export function buildSettingsUpdate(settings: PublicSettings):
   if (enabledCount < 1) return { valid: false, message: '至少需要启用一个工具栏动作' }
   if (enabledCount > MAX_ENABLED_ACTIONS) {
     return { valid: false, message: `最多只能启用 ${MAX_ENABLED_ACTIONS} 个动作` }
+  }
+  const customCount = actions.filter((action) => action.kind === 'custom').length
+  if (customCount > MAX_CUSTOM_ACTIONS) {
+    return { valid: false, message: `最多只能创建 ${MAX_CUSTOM_ACTIONS} 个自定义动作` }
   }
 
   const providersById = new Map(settings.providers.map((provider) => [provider.id, provider]))

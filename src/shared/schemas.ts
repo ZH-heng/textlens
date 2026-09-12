@@ -6,6 +6,7 @@ import {
   BUILTIN_SEARCH_ENGINE_IDS,
   DEFAULT_RESULT_FONT_SIZE,
   MAX_ACTIONS,
+  MAX_CUSTOM_ACTIONS,
   MAX_ENABLED_ACTIONS,
   MAX_PROVIDERS,
   MAX_PROVIDER_MODELS,
@@ -375,6 +376,14 @@ export const actionsSchema = z
       context.addIssue({
         code: z.ZodIssueCode.custom,
         message: `最多只能启用 ${MAX_ENABLED_ACTIONS} 个动作`
+      })
+    }
+
+    const customCount = actions.filter((action) => action.kind === 'custom').length
+    if (customCount > MAX_CUSTOM_ACTIONS) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `最多只能创建 ${MAX_CUSTOM_ACTIONS} 个自定义动作`
       })
     }
   })

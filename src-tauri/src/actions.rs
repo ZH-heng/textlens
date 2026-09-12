@@ -1681,7 +1681,7 @@ impl ActionService {
                     continue;
                 };
                 let id = id.trim();
-                if id.is_empty() || id.len() > 256 || !ids.insert(id.to_owned()) {
+                if id.is_empty() || id.chars().count() > 256 || !ids.insert(id.to_owned()) {
                     continue;
                 }
                 let name = item

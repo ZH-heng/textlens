@@ -249,6 +249,7 @@ impl SettingsRepository {
                         id: provider.id,
                         name: provider.name,
                         enabled: provider.enabled,
+                        protocol: provider.protocol,
                         base_url: provider.base_url,
                         models: provider.models,
                     })
@@ -270,6 +271,7 @@ impl SettingsRepository {
                 id: provider_id,
                 name: input.name,
                 enabled: true,
+                protocol: input.protocol,
                 base_url: input.base_url,
                 models: Vec::new(),
             });
@@ -296,6 +298,9 @@ impl SettingsRepository {
                 }
                 if let Some(base_url) = update.base_url {
                     provider.base_url = base_url;
+                }
+                if let Some(protocol) = update.protocol {
+                    provider.protocol = protocol;
                 }
                 update.models.map(|models| {
                     provider.models = models;
@@ -689,7 +694,7 @@ fn load_settings(path: &Path) -> Result<LoadedSettings, SettingsError> {
             must_persist,
         });
     }
-    if version == Some(11) {
+    if matches!(version, Some(11 | 12)) {
         migrate_v10_search_actions_value(&mut value);
         migrate_quote_to_ask_value(&mut value);
         let mut settings: AppSettings = serde_json::from_value(value)?;
@@ -950,6 +955,7 @@ fn migrate_v1(value: serde_json::Value) -> Result<LoadedSettings, SettingsError>
         id: DEFAULT_PROVIDER_ID.to_owned(),
         name: "OpenAI Compatible".to_owned(),
         enabled: true,
+        protocol: crate::models::ProviderProtocol::OpenAiChat,
         base_url: legacy.ai.base_url,
         models: if model.is_empty() {
             Vec::new()
@@ -959,6 +965,8 @@ fn migrate_v1(value: serde_json::Value) -> Result<LoadedSettings, SettingsError>
                 name: model.clone(),
                 thinking_levels: Vec::new(),
                 thinking_capability: None,
+                thinking_enabled: true,
+                thinking_default: None,
             }]
         },
     };
@@ -1339,6 +1347,8 @@ mod tests {
             name: model_id.to_owned(),
             thinking_levels: Vec::new(),
             thinking_capability: None,
+            thinking_enabled: true,
+            thinking_default: None,
         }];
         for action in settings
             .actions
@@ -1579,6 +1589,14 @@ mod tests {
         let repository = SettingsRepository::with_secret_store(&path, secrets).unwrap();
         let settings = repository.get_settings();
         assert_eq!(settings.version, SETTINGS_VERSION);
+        assert_eq!(
+            settings.translate.default_language,
+            crate::models::TranslationLanguage::EnUs
+        );
+        assert_eq!(
+            settings.translate.target_language,
+            crate::models::TranslationLanguage::ZhCn
+        );
         assert_eq!(settings.providers[0].models[0].id, "gpt-test");
         assert_eq!(settings.actions[1].model_id.as_deref(), Some("gpt-test"));
         assert!(repository.get_public_settings().unwrap().providers[0].key_configured);
@@ -1866,6 +1884,8 @@ mod tests {
             name: "Selected Model".to_owned(),
             thinking_levels: Vec::new(),
             thinking_capability: None,
+            thinking_enabled: true,
+            thinking_default: None,
         }];
         for action in v2.actions.iter_mut().filter(|action| action.kind.is_ai()) {
             action.model_id = Some("model-selected".to_owned());
@@ -2268,6 +2288,37 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v12_provider_and_model_thinking_defaults() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value["version"] = serde_json::json!(12);
+        value["providers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol");
+        value["providers"][0]["models"] = serde_json::json!([{
+            "id": "gpt-5",
+            "name": "GPT-5",
+            "thinkingLevels": ["low", "medium", "high"]
+        }]);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let settings = SettingsRepository::new(&path).unwrap().get_settings();
+        assert_eq!(settings.version, SETTINGS_VERSION);
+        assert_eq!(
+            settings.providers[0].protocol,
+            crate::models::ProviderProtocol::OpenAiChat
+        );
+        assert!(settings.providers[0].models[0].thinking_enabled);
+        assert_eq!(settings.providers[0].models[0].thinking_capability, None);
+        assert_eq!(
+            settings.providers[0].models[0].thinking_default,
+            Some(ThinkingLevel::Medium)
+        );
+    }
+
+    #[test]
     fn migrates_tight_explain_default_that_mentioned_necessary_context() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("settings.json");
@@ -2454,6 +2505,8 @@ mod tests {
                 dialect: Some(ThinkingDialect::ReasoningEffort),
                 supports_off: false,
             }),
+            thinking_enabled: true,
+            thinking_default: None,
         }];
         repository
             .update(SettingsUpdate {

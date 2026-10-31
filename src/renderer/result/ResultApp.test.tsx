@@ -154,6 +154,11 @@ async function renderResult(
       <ResultApp bootstrap={bootstrap} />
   )
   await screen.findByRole('heading', { name: settings.actions.find((action) => action.id === snapshot.actionId)?.name })
+  if (snapshot.actionId === 'translate' && !renderOptions.bootstrap?.start) {
+    // The heading renders from default settings, so it can appear before the
+    // bootstrap snapshot lands; the route needs the session selection.
+    await screen.findByLabelText('翻译方向')
+  }
   return {
     ...view,
     api,
@@ -855,6 +860,30 @@ describe('ResultApp window interactions', () => {
     expect(showResultSelection).not.toHaveBeenCalled()
     // The deferred Markdown chunk may replace its initial plain-text node, so
     // assert against the live result container instead of the stale span.
+    expect(container.querySelector('.result-content')).toHaveTextContent(completedSession.content)
+  })
+
+  it('ignores single-character selections inside result content', async () => {
+    const { container, hideResultSelection, showResultSelection } = await renderResult()
+
+    const selected = screen.getByText('可选择的结果')
+    const range = document.createRange()
+    range.setStart(selected.firstChild!, 0)
+    range.setEnd(selected.firstChild!, 1)
+    const selection = window.getSelection()!
+    selection.removeAllRanges()
+    selection.addRange(range)
+
+    fireEvent.pointerUp(selected, {
+      button: 0,
+      isPrimary: true,
+      screenX: 320,
+      screenY: 240
+    })
+    await waitForAnimationFrame()
+
+    expect(showResultSelection).not.toHaveBeenCalled()
+    expect(hideResultSelection).toHaveBeenCalledWith('session-1')
     expect(container.querySelector('.result-content')).toHaveTextContent(completedSession.content)
   })
 

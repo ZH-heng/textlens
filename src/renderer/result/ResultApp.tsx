@@ -407,11 +407,16 @@ function ResultSessionApp({
   const hasContent = useResultField((state) => state.content.length > 0)
   const hasThinking = useResultField((state) => state.thinkingContent.length > 0)
   const [settings, setSettings] = useState<PublicSettings>(DEFAULT_PUBLIC_SETTINGS)
+  // The initial value above is only a warm-theme placeholder. Applying it
+  // before the real snapshot arrives would overwrite the theme seeded from
+  // localStorage in main.tsx and reintroduce a first-frame flash.
+  const [settingsLoaded, setSettingsLoaded] = useState(false)
   const settingsRevisionRef = useRef(0)
 
   useEffect(() => {
+    if (!settingsLoaded) return
     applyTheme(settings.appearance.theme)
-  }, [settings.appearance.theme])
+  }, [settings.appearance.theme, settingsLoaded])
 
   const [session, setSession] = useState<ResultSessionSnapshot | null>(null)
   const [pinned, setPinned] = useState(false)
@@ -684,10 +689,12 @@ function ResultSessionApp({
     const unsubscribe = window.textLens.onSettingsChanged((next) => {
       settingsRevisionRef.current += 1
       setSettings(next)
+      setSettingsLoaded(true)
     })
     void window.textLens.getSettings().then((initial) => {
       if (!disposed && settingsRevisionRef.current === startedAtRevision) {
         setSettings(initial)
+        setSettingsLoaded(true)
       }
     }).catch((error: unknown) => {
       if (!disposed) {
@@ -968,7 +975,7 @@ function ResultSessionApp({
     selectionFrame.current = window.requestAnimationFrame(() => {
       selectionFrame.current = null
       const text = selectedTextWithin(contentRef.current, window.getSelection())
-      if (!text || !window.textLens.showResultSelection) {
+      if (!text || countUnicodeScalars(text.trim()) < 2 || !window.textLens.showResultSelection) {
         // Click cleared the selection or landed outside selectable text —
         // ensure any result-sourced toolbar is gone (pointer-down may have
         // already done this; this covers edge cases / older backends).

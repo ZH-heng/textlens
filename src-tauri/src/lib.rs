@@ -4,6 +4,7 @@ mod local_secrets;
 pub mod models;
 mod openai_protocol;
 mod openai_transport;
+mod protocols;
 pub mod runtime;
 pub mod selection;
 pub mod settings;

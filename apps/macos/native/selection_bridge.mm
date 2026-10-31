@@ -329,6 +329,52 @@ static bool IsBlank(const std::string &value) {
     return [[string stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] length] == 0;
 }
 
+// Window under a screen point, resolved through the window server. AX hit
+// chains cannot separate WeChat's image viewer from a chat bubble (both report
+// AXButton>AXGroup>AXWindow), and the viewer's window may not answer
+// position/size queries, so compare window numbers instead: a drag that starts
+// in the chat window and ends inside the image viewer must not synthesize
+// Cmd+C, or WeChat copies the image with visible feedback.
+static CGWindowID TopmostWindowNumberAtPoint(pid_t processIdentifier, CGPoint point) {
+    CFArrayRef windows = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (windows == nullptr) {
+        return kCGNullWindowID;
+    }
+    CGWindowID result = kCGNullWindowID;
+    const CFIndex count = CFArrayGetCount(windows);
+    for (CFIndex index = 0; index < count; ++index) {
+        NSDictionary *info = (__bridge NSDictionary *)CFArrayGetValueAtIndex(windows, index);
+        NSNumber *owner = info[(__bridge NSString *)kCGWindowOwnerPID];
+        NSNumber *number = info[(__bridge NSString *)kCGWindowNumber];
+        NSNumber *alpha = info[(__bridge NSString *)kCGWindowAlpha];
+        NSDictionary *bounds = info[(__bridge NSString *)kCGWindowBounds];
+        if (owner == nil || number == nil || bounds == nil ||
+            owner.intValue != processIdentifier) {
+            continue;
+        }
+        if (alpha != nil && alpha.doubleValue < 0.01) {
+            continue;
+        }
+        CGRect frame = CGRectZero;
+        if (!CGRectMakeWithDictionaryRepresentation(
+                (__bridge CFDictionaryRef)bounds, &frame)) {
+            continue;
+        }
+        // Skip tooltips, status icons and other auxiliary windows.
+        if (frame.size.width < 24.0 || frame.size.height < 24.0) {
+            continue;
+        }
+        if (CGRectContainsPoint(CGRectInset(frame, -1.0, -1.0), point)) {
+            result = number.unsignedIntValue;
+            break;
+        }
+    }
+    CFRelease(windows);
+    return result;
+}
+
 static CGPoint CurrentMousePosition() {
     CGEventRef event = CGEventCreate(nullptr);
     if (event == nullptr) {
@@ -1253,6 +1299,11 @@ struct LastClipboardCapture {
 static std::mutex gPasteboardFallbackMutex;
 static std::mutex gLastClipboardCaptureMutex;
 
+// Last WeChat window that produced a real text capture. The image viewer is a
+// separate window; a shallow AX hit inside a window that already yielded text
+// is a chat surface, not the viewer.
+static std::atomic<CGWindowID> gLastWeChatTextWindow{kCGNullWindowID};
+
 static PasteboardSnapshot SnapshotPasteboard(NSPasteboard *pasteboard) {
     PasteboardSnapshot snapshot;
     if (pasteboard == nil) {
@@ -1527,13 +1578,132 @@ struct PointerHitTestOutcome {
     // The hit element IS the bare window/application — the app exposes no
     // content under the cursor at all (opaque canvas surface).
     bool bareWindowSurface = false;
+    // The hit element is the menu bar; a text selection never ends there.
+    bool isMenuBar = false;
+    // The hit element or one of its two closest ancestors accepts text.
+    bool hasTextRole = false;
+    // An ancestor also hosts selectable content (chat split view / web area)
+    // even when the exact hit point is not text. A start point in blank space
+    // of a real content window still belongs to the same text selection.
+    bool hasContentRole = false;
+    // The chain reached the top-level window within the scan depth. WeChat's
+    // image viewer reports hit -> groups -> AXWindow with no text or content
+    // ancestor; a synthetic Cmd+C on that surface copies the viewed image.
+    bool reachedWindow = false;
+    // The window itself contains a real content surface even though the hit
+    // chain did not pass through it (a shallow button inside the chat window).
+    // Scanning the window separates that case from an opaque viewer window.
+    bool windowHasContentSurface = false;
+    // Frame of the top-level window containing the hit element. Comparing the
+    // start and end frames separates a text selection (same window) from a
+    // window drag (the press point now exposes the window behind).
+    bool hasWindowFrame = false;
+    CGRect windowFrame = CGRectZero;
     int axError = 0;
     std::string roleChain;
 };
 
+static bool IsTextLayerRole(const std::string &role) {
+    return role == "AXStaticText" || role == "AXTextArea" ||
+        role == "AXTextField" || role == "AXTextView";
+}
+
+static bool IsContentSurfaceRole(const std::string &role) {
+    return role == "AXSplitGroup" || role == "AXWebArea";
+}
+
+static bool CopyAXWindowFrame(AXUIElementRef element, CGRect &frame) {
+    if (element == nullptr) {
+        return false;
+    }
+    AXUIElementRef window = nullptr;
+    if (AXUIElementCopyAttributeValue(
+            element,
+            kAXWindowAttribute,
+            reinterpret_cast<CFTypeRef *>(&window)) != kAXErrorSuccess ||
+        window == nullptr) {
+        return false;
+    }
+    AXUIElementSetMessagingTimeout(window, kAXGeometryMessagingTimeoutSeconds);
+    AXValueRef positionValue = nullptr;
+    AXValueRef sizeValue = nullptr;
+    const bool copied =
+        AXUIElementCopyAttributeValue(
+            window,
+            kAXPositionAttribute,
+            reinterpret_cast<CFTypeRef *>(&positionValue)) == kAXErrorSuccess &&
+        AXUIElementCopyAttributeValue(
+            window,
+            kAXSizeAttribute,
+            reinterpret_cast<CFTypeRef *>(&sizeValue)) == kAXErrorSuccess;
+    bool ok = false;
+    if (copied && positionValue != nullptr && sizeValue != nullptr) {
+        CGPoint position = CGPointZero;
+        CGSize size = CGSizeZero;
+        if (AXValueGetValue(positionValue, kAXValueTypeCGPoint, &position) &&
+            AXValueGetValue(sizeValue, kAXValueTypeCGSize, &size)) {
+            frame = CGRectMake(position.x, position.y, size.width, size.height);
+            ok = true;
+        }
+    }
+    if (positionValue != nullptr) {
+        CFRelease(positionValue);
+    }
+    if (sizeValue != nullptr) {
+        CFRelease(sizeValue);
+    }
+    CFRelease(window);
+    return ok;
+}
+
+static bool SubtreeContainsContentSurface(
+    AXUIElementRef element,
+    int depth,
+    size_t &remaining) {
+    if (element == nullptr || depth < 0 || remaining == 0) {
+        return false;
+    }
+    --remaining;
+    AXUIElementSetMessagingTimeout(element, kAXGeometryMessagingTimeoutSeconds);
+    CFArrayRef children = nullptr;
+    if (AXUIElementCopyAttributeValue(
+            element,
+            kAXChildrenAttribute,
+            reinterpret_cast<CFTypeRef *>(&children)) != kAXErrorSuccess ||
+        children == nullptr) {
+        return false;
+    }
+    bool found = false;
+    const CFIndex count = std::min<CFIndex>(CFArrayGetCount(children), 32);
+    for (CFIndex index = 0; index < count && !found && remaining > 0; ++index) {
+        AXUIElementRef child = static_cast<AXUIElementRef>(
+            const_cast<void *>(CFArrayGetValueAtIndex(children, index)));
+        std::string role;
+        CFTypeRef roleValue = nullptr;
+        AXUIElementSetMessagingTimeout(child, kAXGeometryMessagingTimeoutSeconds);
+        if (AXUIElementCopyAttributeValue(child, kAXRoleAttribute, &roleValue) ==
+                kAXErrorSuccess &&
+            roleValue != nullptr) {
+            if (CFGetTypeID(roleValue) == CFStringGetTypeID()) {
+                StringFromCFString(static_cast<CFStringRef>(roleValue), role);
+            }
+            CFRelease(roleValue);
+        }
+        if (IsContentSurfaceRole(role)) {
+            found = true;
+        } else if (depth > 0) {
+            found = SubtreeContainsContentSurface(child, depth - 1, remaining);
+        }
+    }
+    CFRelease(children);
+    return found;
+}
+
 static PointerHitTestOutcome PointerHitTestAtPosition(
     NSRunningApplication *application,
-    CGPoint point) {
+    CGPoint point,
+    bool includeWindowFrame = false,
+    bool inspectWindowContent = false) {
     PointerHitTestOutcome outcome;
     if (application == nil) {
         return outcome;
@@ -1553,11 +1723,18 @@ static PointerHitTestOutcome PointerHitTestAtPosition(
         return outcome;
     }
     outcome.resolved = true;
+    if (includeWindowFrame && CopyAXWindowFrame(hit, outcome.windowFrame)) {
+        outcome.hasWindowFrame = true;
+    }
 
     static const char *const kRoleSeparator = ">";
     AXUIElementRef current = hit;
     CFRetain(current);
-    for (int level = 0; level < 3 && !outcome.isImage && current != nullptr; ++level) {
+    // WeChat's image viewer hides the image below several wrapper groups; a
+    // three-level scan stops before the window and cannot tell it apart from
+    // a chat bubble. Deep-scan only the WeChat call sites (includeWindowFrame).
+    const int scanDepth = includeWindowFrame ? 5 : 3;
+    for (int level = 0; level < scanDepth && !outcome.isImage && current != nullptr; ++level) {
         std::string role;
         CFTypeRef roleValue = nullptr;
         if (AXUIElementCopyAttributeValue(current, kAXRoleAttribute, &roleValue) ==
@@ -1572,13 +1749,36 @@ static PointerHitTestOutcome PointerHitTestAtPosition(
             outcome.roleChain += kRoleSeparator;
         }
         outcome.roleChain += role.empty() ? "?" : role;
+        if (IsTextLayerRole(role)) {
+            outcome.hasTextRole = true;
+        }
+        if (IsContentSurfaceRole(role)) {
+            outcome.hasContentRole = true;
+        }
         if (level == 0) {
             // Bare window surface: no content element under the cursor.
             outcome.bareWindowSurface =
                 role == "AXWindow" || role == "AXApplication";
+            outcome.isMenuBar = role == "AXMenuBar";
         }
         if (role == "AXImage") {
             outcome.isImage = true;
+            break;
+        }
+        if (role == "AXWindow" || role == "AXApplication") {
+            outcome.reachedWindow = true;
+            // A shallow button also exists inside the chat window. Only call
+            // the hit chain opaque when the containing window has no content
+            // surface of its own; the image viewer window has none.
+            if (inspectWindowContent && role == "AXWindow" &&
+                !outcome.hasTextRole && !outcome.hasContentRole) {
+                size_t remaining = 48;
+                outcome.windowHasContentSurface =
+                    SubtreeContainsContentSurface(current, 2, remaining);
+            }
+            break;
+        }
+        if (outcome.hasTextRole || outcome.hasContentRole) {
             break;
         }
         AXUIElementRef parent = nullptr;
@@ -1600,6 +1800,34 @@ static PointerHitTestOutcome PointerHitTestAtPosition(
     }
     CFRelease(hit);
     return outcome;
+}
+
+// True when a WeChat gesture's anchor sits on an opaque, text-less window
+// surface: the hit chain reaches the top-level window through wrapper groups
+// with no text or content ancestor, and the window itself has no content
+// surface. The image viewer reports exactly this chain
+// (AXButton > AXGroup > AXWindow); synthesizing Cmd+C there copies the viewed
+// image with visible feedback. A shallow button inside the chat window still
+// has the chat split view below the window and is not treated as opaque.
+static bool PointerHitTestIsOpaqueWindowSurface(const PointerHitTestOutcome &outcome) {
+    return outcome.resolved && outcome.reachedWindow &&
+        !outcome.hasTextRole && !outcome.hasContentRole &&
+        !outcome.windowHasContentSurface;
+}
+
+// Even an opaque chain is a text surface when the anchor window already
+// produced a real text capture. WeChat's image viewer is a new, different
+// window, so it never inherits that trust.
+static bool WeChatAnchorIsOpaqueWindow(
+    const PointerHitTestOutcome &outcome,
+    CGWindowID anchorWindow) {
+    if (!PointerHitTestIsOpaqueWindowSurface(outcome)) {
+        return false;
+    }
+    if (anchorWindow == kCGNullWindowID) {
+        return true;
+    }
+    return anchorWindow != gLastWeChatTextWindow.load(std::memory_order_relaxed);
 }
 
 // True when a TEXT-role focused element explicitly reports an empty selected
@@ -1794,15 +2022,23 @@ static bool CaptureViaClipboard(
         // Mouse gestures carry a meaningful cursor position; keyboard
         // gestures keep the fallback because the cursor may be parked
         // anywhere while the user selects by keyboard.
-        const PointerHitTestOutcome hitTest =
-            PointerHitTestAtPosition(application, info.mouseCurrent);
-        char hitLine[160];
+        const bool isWeChat = info.bundleId == "com.tencent.xinWeChat";
+        const bool inspectWindowContent = isWeChat &&
+            (info.trigger == Trigger::DoubleClick ||
+             info.trigger == Trigger::ShiftClick);
+        const PointerHitTestOutcome hitTest = PointerHitTestAtPosition(
+            application, info.mouseCurrent, isWeChat, inspectWindowContent);
+        char hitLine[192];
         if (hitTest.resolved) {
             std::snprintf(
                 hitLine,
                 sizeof(hitLine),
-                "pointer-hit-test: roles=%s",
-                hitTest.roleChain.c_str());
+                "pointer-hit-test: roles=%s text=%d content=%d window=%d surface=%d",
+                hitTest.roleChain.c_str(),
+                hitTest.hasTextRole ? 1 : 0,
+                hitTest.hasContentRole ? 1 : 0,
+                hitTest.reachedWindow ? 1 : 0,
+                hitTest.windowHasContentSurface ? 1 : 0);
         } else {
             std::snprintf(
                 hitLine,
@@ -1821,9 +2057,140 @@ static bool CaptureViaClipboard(
         // bare surface can only be the image viewer (or empty canvas
         // background), where the chord copies the image with visible
         // feedback and never yields text.
-        if (info.bundleId == "com.tencent.xinWeChat" && hitTest.bareWindowSurface) {
+        if (isWeChat && hitTest.bareWindowSurface) {
             TraceClipboardGateFor(info, "skip: wechat-bare-window-drag");
             return false;
+        }
+        // A text selection never ends on the menu bar; in WeChat this is a
+        // window/title-bar drag (seen in traces) that copies chrome. Keep the
+        // rule app-scoped so canvas hosts keep their existing fallback.
+        if (isWeChat && hitTest.isMenuBar) {
+            TraceClipboardGateFor(info, "skip: pointer-element-is-menu-bar");
+            return false;
+        }
+        // A double-click or shift-click inside WeChat's image viewer lands on
+        // the same opaque window surface as a drag. There is no text to copy;
+        // the chord would copy the image with visible feedback.
+        if (isWeChat &&
+            (info.trigger == Trigger::DoubleClick || info.trigger == Trigger::ShiftClick)) {
+            const CGWindowID anchorWindow = TopmostWindowNumberAtPoint(
+                application.processIdentifier, info.mouseCurrent);
+            char windowNumberLine[96];
+            std::snprintf(
+                windowNumberLine,
+                sizeof(windowNumberLine),
+                "pointer-window-number: point=%u trusted=%u",
+                anchorWindow,
+                gLastWeChatTextWindow.load(std::memory_order_relaxed));
+            TraceClipboardGate(windowNumberLine);
+            if (WeChatAnchorIsOpaqueWindow(hitTest, anchorWindow)) {
+                TraceClipboardGateFor(info, "skip: wechat-opaque-window-click");
+                return false;
+            }
+        }
+        // WeChat's image viewer exposes no text under the cursor. The 0.4.1
+        // gate only covered a bare AXWindow hit, but real traces also show
+        // image-viewer and window drags landing on AXButton/AXGroup. The hit
+        // test runs at the release point, which can legitimately land on the
+        // chat input button for a text drag, so the end chain cannot separate
+        // the two. Compare the drag start instead: a text selection starts on
+        // text inside the same window, while a window drag leaves the press
+        // point over the window behind.
+        if (isWeChat && info.trigger == Trigger::Drag && info.hasMouseStart) {
+            const PointerHitTestOutcome startHit =
+                PointerHitTestAtPosition(application, info.mouseStart, true, true);
+            char startLine[192];
+            if (startHit.resolved) {
+                std::snprintf(
+                    startLine,
+                    sizeof(startLine),
+                    "pointer-hit-test-start: roles=%s text=%d content=%d window=%d surface=%d",
+                    startHit.roleChain.c_str(),
+                    startHit.hasTextRole ? 1 : 0,
+                    startHit.hasContentRole ? 1 : 0,
+                    startHit.reachedWindow ? 1 : 0,
+                    startHit.windowHasContentSurface ? 1 : 0);
+            } else {
+                std::snprintf(
+                    startLine,
+                    sizeof(startLine),
+                    "pointer-hit-test-start: unavailable (axError=%d)",
+                    startHit.axError);
+            }
+            TraceClipboardGate(startLine);
+            const CGWindowID startWindow = TopmostWindowNumberAtPoint(
+                application.processIdentifier, info.mouseStart);
+            const CGWindowID endWindow = TopmostWindowNumberAtPoint(
+                application.processIdentifier, info.mouseCurrent);
+            char windowNumberLine[128];
+            std::snprintf(
+                windowNumberLine,
+                sizeof(windowNumberLine),
+                "pointer-window-numbers: start=%u end=%u trusted=%u",
+                startWindow,
+                endWindow,
+                gLastWeChatTextWindow.load(std::memory_order_relaxed));
+            TraceClipboardGate(windowNumberLine);
+            if (startHit.hasWindowFrame && hitTest.hasWindowFrame) {
+                char windowLine[144];
+                std::snprintf(
+                    windowLine,
+                    sizeof(windowLine),
+                    "pointer-hit-test-window: start=%.0f,%.0f,%.0fx%.0f end=%.0f,%.0f,%.0fx%.0f",
+                    startHit.windowFrame.origin.x,
+                    startHit.windowFrame.origin.y,
+                    startHit.windowFrame.size.width,
+                    startHit.windowFrame.size.height,
+                    hitTest.windowFrame.origin.x,
+                    hitTest.windowFrame.origin.y,
+                    hitTest.windowFrame.size.width,
+                    hitTest.windowFrame.size.height);
+                TraceClipboardGate(windowLine);
+            }
+            if (startHit.isImage) {
+                TraceClipboardGateFor(info, "skip: wechat-image-drag-start");
+                return false;
+            }
+            if (startHit.bareWindowSurface) {
+                TraceClipboardGateFor(info, "skip: wechat-bare-window-drag-start");
+                return false;
+            }
+            // The image viewer's press point reports AXButton > AXGroup >
+            // AXWindow with no text or content ancestor, while a real text
+            // selection starts on text or inside the chat split view. Window
+            // numbers alone cannot see this: the drag starts and ends inside
+            // the same viewer window. A window that already produced text is
+            // trusted so shallow chat hits keep working.
+            if (WeChatAnchorIsOpaqueWindow(startHit, startWindow)) {
+                TraceClipboardGateFor(info, "skip: wechat-opaque-window-drag-start");
+                return false;
+            }
+            // AX window frames are unavailable for these WeChat drags (the
+            // viewer does not answer position/size queries), so compare the
+            // window server's topmost window instead. A drag that leaves the
+            // chat window and lands on the image viewer is not a text
+            // selection; synthesizing Cmd+C there copies the image.
+            if (startWindow != kCGNullWindowID && endWindow != kCGNullWindowID &&
+                startWindow != endWindow) {
+                TraceClipboardGateFor(info, "skip: wechat-cross-window-drag");
+                return false;
+            }
+            if (startHit.hasWindowFrame && hitTest.hasWindowFrame) {
+                constexpr CGFloat kWindowFrameTolerance = 1.0;
+                const bool sameWindow =
+                    std::fabs(startHit.windowFrame.origin.x - hitTest.windowFrame.origin.x) <=
+                        kWindowFrameTolerance &&
+                    std::fabs(startHit.windowFrame.origin.y - hitTest.windowFrame.origin.y) <=
+                        kWindowFrameTolerance &&
+                    std::fabs(startHit.windowFrame.size.width - hitTest.windowFrame.size.width) <=
+                        kWindowFrameTolerance &&
+                    std::fabs(startHit.windowFrame.size.height - hitTest.windowFrame.size.height) <=
+                        kWindowFrameTolerance;
+                if (!sameWindow) {
+                    TraceClipboardGateFor(info, "skip: wechat-cross-window-drag");
+                    return false;
+                }
+            }
         }
     }
 
@@ -2303,6 +2670,18 @@ static bool CaptureSelection(
         }
         if (!captured) {
             TraceClipboardGateFor(info, "abort: no-selection-found");
+        } else if (info.bundleId == "com.tencent.xinWeChat" && hasMouseEnd &&
+                   (trigger == Trigger::Drag || trigger == Trigger::DoubleClick ||
+                    trigger == Trigger::ShiftClick)) {
+            // Remember the window that actually yielded text. A later shallow
+            // hit in this window is a chat surface, not the image viewer.
+            const CGPoint anchor =
+                trigger == Trigger::Drag && hasMouseStart ? mouseStart : mouseEnd;
+            const CGWindowID window =
+                TopmostWindowNumberAtPoint(application.processIdentifier, anchor);
+            if (window != kCGNullWindowID) {
+                gLastWeChatTextWindow.store(window, std::memory_order_relaxed);
+            }
         }
         return captured;
     }

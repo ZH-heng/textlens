@@ -19,6 +19,12 @@ const CAP_PROMPT: ThinkingCapability = {
   supportsOff: true
 }
 
+const CAP_MANUAL: ThinkingCapability = {
+  source: 'manual',
+  dialect: null,
+  supportsOff: true
+}
+
 function model(
   id: string,
   name: string,
@@ -30,6 +36,12 @@ function model(
     thinkingLevels: extras?.thinkingLevels ?? [],
     ...(extras?.thinkingCapability !== undefined
       ? { thinkingCapability: extras.thinkingCapability }
+      : {}),
+    ...(extras?.thinkingEnabled !== undefined
+      ? { thinkingEnabled: extras.thinkingEnabled }
+      : {}),
+    ...(extras?.thinkingDefault !== undefined
+      ? { thinkingDefault: extras.thinkingDefault }
       : {})
   }
 }
@@ -99,6 +111,61 @@ describe('mergeProviderModelsOnPick', () => {
       }),
       model('remote-1', 'Remote New')
     ])
+  })
+
+  it('keeps manual thinking levels and the enable toggle across a refresh', () => {
+    const previous = [
+      model('claude', 'Claude', {
+        thinkingLevels: ['low', 'high'],
+        thinkingCapability: CAP_MANUAL,
+        thinkingEnabled: false,
+        thinkingDefault: 'high'
+      })
+    ]
+    const remote = [
+      model('claude', 'Claude Remote', {
+        thinkingLevels: ['low', 'medium', 'high'],
+        thinkingCapability: CAP_NONE
+      })
+    ]
+
+    const result = mergeProviderModelsOnPick({
+      previous,
+      remote,
+      checkedIds: ['claude']
+    })
+
+    expect(result[0]).toMatchObject({
+      name: 'Claude Remote',
+      thinkingLevels: ['low', 'high'],
+      thinkingCapability: CAP_MANUAL,
+      thinkingEnabled: false,
+      thinkingDefault: 'high'
+    })
+  })
+
+  it('keeps a valid default level but adopts refreshed remote levels', () => {
+    const previous = [
+      model('gemini', 'Gemini', {
+        thinkingLevels: ['low', 'medium'],
+        thinkingDefault: 'medium'
+      })
+    ]
+    const remote = [
+      model('gemini', 'Gemini Remote', {
+        thinkingLevels: ['low', 'medium', 'high'],
+        thinkingDefault: 'high'
+      })
+    ]
+
+    const result = mergeProviderModelsOnPick({
+      previous,
+      remote,
+      checkedIds: ['gemini']
+    })
+
+    expect(result[0]?.thinkingLevels).toEqual(['low', 'medium', 'high'])
+    expect(result[0]?.thinkingDefault).toBe('medium')
   })
 
   it('drops unchecked previous models', () => {

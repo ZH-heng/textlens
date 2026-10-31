@@ -152,14 +152,45 @@ describe('SettingsApp provider deletion', () => {
     expect(screen.queryByRole('heading', { name: 'AI 服务商与模型' })).not.toBeInTheDocument()
   })
 
-  it('shows AI default reply language under the language section', async () => {
+  it('shows AI reply and translation languages under the language section', async () => {
     installDefaultBridge()
     render(<SettingsApp />)
 
     await goToSettingsSection('语言')
     expect(await screen.findByRole('combobox', { name: 'AI 默认回复语言' })).toBeInTheDocument()
+    expect(screen.getByRole('combobox', { name: '翻译默认语言' })).toHaveValue('en-US')
+    expect(screen.getByRole('combobox', { name: '翻译目标语言' })).toHaveValue('zh-CN')
     expect(screen.getByText(/检测到 简体中文 时译为 English/)).toBeInTheDocument()
     expect(screen.queryByText('默认回答语言')).not.toBeInTheDocument()
+  })
+
+  it('persists the default and target translation languages', async () => {
+    const updateSettings = vi.fn(async (update: SettingsUpdate): Promise<PublicSettings> => ({
+      ...DEFAULT_PUBLIC_SETTINGS,
+      translate: update.translate ?? DEFAULT_PUBLIC_SETTINGS.translate,
+      providers: (update.providers ?? DEFAULT_PUBLIC_SETTINGS.providers).map((provider) => ({
+        ...provider,
+        keyConfigured: false
+      })),
+      actions: update.actions ?? DEFAULT_PUBLIC_SETTINGS.actions
+    }))
+    installDefaultBridge({ updateSettings })
+    render(<SettingsApp />)
+
+    await goToSettingsSection('语言')
+    fireEvent.change(await screen.findByRole('combobox', { name: '翻译默认语言' }), {
+      target: { value: 'ja-JP' }
+    })
+    fireEvent.change(screen.getByRole('combobox', { name: '翻译目标语言' }), {
+      target: { value: 'en-US' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1))
+    expect(updateSettings.mock.calls[0]?.[0].translate).toEqual({
+      defaultLanguage: 'ja-JP',
+      targetLanguage: 'en-US'
+    })
   })
 
   it('switches to the actions section when guidance focuses actions', async () => {
@@ -1307,5 +1338,147 @@ describe('SettingsApp provider deletion', () => {
     expect(
       (updateSettings.mock.calls[0]?.[0].providers?.[0]?.models ?? []).map((model) => model.id)
     ).toEqual(['o3-mini', 'gpt-4o-mini'])
+  })
+})
+
+describe('SettingsApp provider protocols', () => {
+  it('switches protocol, reseeds model thinking and saves the new fields', async () => {
+    const provider = DEFAULT_PUBLIC_SETTINGS.providers[0]!
+    const settings: PublicSettings = {
+      ...DEFAULT_PUBLIC_SETTINGS,
+      providers: [{
+        ...provider,
+        enabled: true,
+        protocol: 'openAiChat',
+        baseUrl: 'https://api.openai.com/v1',
+        keyConfigured: true,
+        models: [{ id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5', thinkingLevels: [] }]
+      }]
+    }
+    const updateSettings = vi.fn(async (_update: SettingsUpdate) => settings)
+    installDefaultBridge({
+      getSettings: vi.fn(async () => settings),
+      updateSettings
+    } as Partial<WindowTextLensApi>)
+
+    render(<SettingsApp />)
+    await goToSettingsSection('服务商')
+
+    const protocol = await screen.findByLabelText('OpenAI Compatible：接口协议')
+    fireEvent.change(protocol, { target: { value: 'anthropicMessages' } })
+    expect(protocol).toHaveValue('anthropicMessages')
+    expect(screen.getByDisplayValue('https://api.anthropic.com/v1')).toBeInTheDocument()
+    expect(screen.getByText(/默认 中 · 低\/中\/高/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1))
+    const update = updateSettings.mock.calls[0]?.[0]
+    const saved = update?.providers?.[0]
+    expect(saved?.protocol).toBe('anthropicMessages')
+    expect(saved?.baseUrl).toBe('https://api.anthropic.com/v1')
+    expect(saved?.models[0]).toMatchObject({
+      thinkingLevels: ['low', 'medium', 'high'],
+      thinkingCapability: {
+        source: 'heuristic',
+        dialect: null,
+        supportsOff: true
+      },
+      thinkingEnabled: true,
+      thinkingDefault: 'medium'
+    })
+  })
+})
+
+describe('SettingsApp model thinking', () => {
+  it('shows disabled thinking without levels and re-detects DeepSeek V4', async () => {
+    const provider = DEFAULT_PUBLIC_SETTINGS.providers[0]!
+    const settings: PublicSettings = {
+      ...DEFAULT_PUBLIC_SETTINGS,
+      providers: [{
+        ...provider,
+        enabled: true,
+        protocol: 'openAiChat',
+        keyConfigured: true,
+        models: [{
+          id: 'deepseek-ai/deepseek-v4.1-flash-1017',
+          name: 'DeepSeek-V4.1-Flash-1017',
+          thinkingLevels: [],
+          thinkingEnabled: false
+        }]
+      }]
+    }
+    const updateSettings = vi.fn(async (_update: SettingsUpdate) => settings)
+    installDefaultBridge({
+      getSettings: vi.fn(async () => settings),
+      updateSettings
+    } as Partial<WindowTextLensApi>)
+
+    render(<SettingsApp />)
+    await goToSettingsSection('服务商')
+
+    expect(
+      await screen.findByText('不启用思考', { selector: '.model-row__thinking-summary' })
+    ).toBeInTheDocument()
+    expect(screen.queryByText('未识别思考档位')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'DeepSeek-V4.1-Flash-1017：思考设置' }))
+    fireEvent.click(screen.getByRole('button', { name: '重新自动识别' }))
+    expect(await screen.findByText('默认 高 · 低/高/最高')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1))
+    expect(updateSettings.mock.calls[0]?.[0].providers?.[0]?.models[0]).toMatchObject({
+      thinkingLevels: ['low', 'high', 'xhigh'],
+      thinkingCapability: {
+        source: 'heuristic',
+        dialect: 'reasoningEffortMax',
+        supportsOff: true
+      },
+      thinkingEnabled: true,
+      thinkingDefault: 'high'
+    })
+  })
+
+  it('auto-detects versioned GPT thinking levels on manual add', async () => {
+    const provider = DEFAULT_PUBLIC_SETTINGS.providers[0]!
+    const settings: PublicSettings = {
+      ...DEFAULT_PUBLIC_SETTINGS,
+      providers: [{
+        ...provider,
+        enabled: true,
+        protocol: 'openAiChat',
+        keyConfigured: true,
+        models: []
+      }]
+    }
+    const updateSettings = vi.fn(async (_update: SettingsUpdate) => settings)
+    installDefaultBridge({
+      getSettings: vi.fn(async () => settings),
+      updateSettings
+    } as Partial<WindowTextLensApi>)
+
+    render(<SettingsApp />)
+    await goToSettingsSection('服务商')
+
+    fireEvent.change(screen.getByPlaceholderText('手动添加模型 ID'), {
+      target: { value: 'gpt6-luna' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '添加' }))
+
+    expect(await screen.findByText('默认 中 · 最低/低/中/高/最高')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1))
+    expect(updateSettings.mock.calls[0]?.[0].providers?.[0]?.models[0]).toMatchObject({
+      id: 'gpt6-luna',
+      thinkingLevels: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+      thinkingCapability: {
+        source: 'heuristic',
+        dialect: 'reasoningEffort',
+        supportsOff: true
+      },
+      thinkingEnabled: true,
+      thinkingDefault: 'medium'
+    })
   })
 })

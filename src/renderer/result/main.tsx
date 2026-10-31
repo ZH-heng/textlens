@@ -6,6 +6,7 @@ import '../themes.css'
 import './result.css'
 import { installTauriBridge } from '../lib/tauriBridge'
 import { runDetached } from '../lib/asyncEffects'
+import { applyTheme, storedTheme } from '../lib/theme'
 import { startActionEventStore } from './actionEventStore'
 import { ResultApp } from './ResultApp'
 import {
@@ -14,6 +15,7 @@ import {
 } from './resultSessionBootstrap'
 
 installTauriBridge()
+applyTheme(storedTheme())
 
 const root = document.getElementById('root')
 

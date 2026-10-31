@@ -34,12 +34,24 @@ describe('translation languages', () => {
     expect(detectTranslationLanguage('Hello world')).toBe('en-US')
   })
 
-  it('defaults Chinese↔English and other languages to Chinese outside the pair', () => {
-    const pair = { primaryLanguage: 'zh-CN' as const, alternateLanguage: 'en-US' as const }
-    expect(defaultTranslationTarget('zh-CN', pair)).toBe('en-US')
-    expect(defaultTranslationTarget('en-US', pair)).toBe('zh-CN')
-    expect(defaultTranslationTarget('ja-JP', pair)).toBe('zh-CN')
-    expect(defaultTranslationTarget('fr-FR', pair)).toBe('zh-CN')
+  it('uses script share so one foreign character cannot hijack a paragraph', () => {
+    expect(
+      detectTranslationLanguage('The quick brown fox jumps over the lazy dog near 重 5G.')
+    ).toBe('en-US')
+    expect(detectTranslationLanguage('Hello の world')).toBe('en-US')
+    expect(detectTranslationLanguage('Hello 한 world')).toBe('en-US')
+    expect(detectTranslationLanguage('Hello Ж world')).toBe('en-US')
+    expect(detectTranslationLanguage('Mixed English 中文中文中文')).toBe('zh-CN')
+    expect(detectTranslationLanguage('日本語能力試験に合格した')).toBe('ja-JP')
+    expect(detectTranslationLanguage('12345 — !')).toBe('en-US')
+  })
+
+  it('translates into the target unless the text already uses it', () => {
+    const settings = { defaultLanguage: 'en-US' as const, targetLanguage: 'zh-CN' as const }
+    expect(defaultTranslationTarget('en-US', settings)).toBe('zh-CN')
+    expect(defaultTranslationTarget('zh-CN', settings)).toBe('en-US')
+    expect(defaultTranslationTarget('ja-JP', settings)).toBe('zh-CN')
+    expect(defaultTranslationTarget('fr-FR', settings)).toBe('zh-CN')
   })
 
   it('maps prompt slot names in English', () => {

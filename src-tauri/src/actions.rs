@@ -28,10 +28,11 @@ use crate::{
     },
     openai_protocol::provider_error_from_value,
     openai_transport::{
-        await_headers, consume_json_response, consume_sse_response, read_http_error,
+        await_headers, consume_json_response_for, consume_sse_response_for, read_http_error,
         GenerationBudget, ResponseTermination, ResponseTransport, TransportConfig,
         TransportFailure, TransportMarker, TransportSuccess,
     },
+    protocols,
     settings::{SettingsError, SettingsRepository},
     thinking::{self, AppliedThinkingControl, ThinkingRequestPlan},
 };
@@ -93,16 +94,16 @@ struct ActionServiceState {
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum ChatRole {
+pub(crate) enum ChatRole {
     System,
     User,
     Assistant,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct ChatMessage {
-    role: ChatRole,
-    content: String,
+pub(crate) struct ChatMessage {
+    pub(crate) role: ChatRole,
+    pub(crate) content: String,
 }
 
 impl ChatMessage {
@@ -1166,17 +1167,24 @@ impl ActionService {
     pub async fn sync_provider_models(&self, provider_id: &str) -> SyncModelsResult {
         match self.fetch_models(provider_id).await {
             Ok(models) => {
+                let existing = self
+                    .inner
+                    .settings
+                    .get_provider(provider_id)
+                    .map(|provider| provider.models)
+                    .unwrap_or_default();
+                let merged = protocols::merge_remote_models(&existing, models);
                 let update = self.inner.settings.update_provider(
                     provider_id,
                     UpdateProviderInput {
-                        models: Some(models.clone()),
+                        models: Some(merged.clone()),
                         ..Default::default()
                     },
                 );
                 match update {
                     Ok(settings) => SyncModelsResult {
                         ok: true,
-                        models,
+                        models: merged,
                         settings: Some(settings),
                         message: None,
                         status: None,
@@ -1240,8 +1248,11 @@ impl ActionService {
             return Ok(RequestOutcome::Cancelled);
         }
         let base = build_base_body(prepared);
-        let (controlled, applied) =
-            build_controlled_body(&base, &prepared.session_data.route.thinking);
+        let (controlled, applied) = build_controlled_body(
+            &base,
+            prepared.session_data.route.provider.protocol,
+            &prepared.session_data.route.thinking,
+        );
         match self.perform_attempt(app, prepared, &controlled).await {
             Ok(success) => self.complete_generated(
                 prepared,
@@ -1384,29 +1395,34 @@ impl ActionService {
         if cancellation.is_cancelled() {
             return Err(cancelled_transport_failure());
         }
-        let endpoint = format!(
-            "{}/chat/completions",
-            prepared
-                .session_data
-                .route
-                .provider
-                .base_url
-                .trim_end_matches('/')
-        );
+        let provider = &prepared.session_data.route.provider;
+        let endpoint = protocols::endpoint(provider, &prepared.session_data.route.model).map_err(
+            |message| TransportFailure {
+                code: "INVALID_URL",
+                message,
+                retryable: false,
+                status: None,
+                provider_error: None,
+                content_seen: false,
+            },
+        )?;
+        let codec = protocols::sse_codec(provider.protocol);
         prepared
             .trace
             .lock()
             .mark(TransportMarker::RequestSend, tokio::time::Instant::now());
-        let send = self
-            .inner
-            .client
-            .post(endpoint)
-            .header(header::ACCEPT, "text/event-stream")
-            .header(header::ACCEPT_ENCODING, "identity")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .bearer_auth(&prepared.api_key)
-            .json(body)
-            .send();
+        let send = protocols::apply_auth(
+            self.inner
+                .client
+                .post(endpoint)
+                .header(header::ACCEPT, "text/event-stream")
+                .header(header::ACCEPT_ENCODING, "identity")
+                .header(header::CACHE_CONTROL, "no-cache"),
+            provider.protocol,
+            &prepared.api_key,
+        )
+        .json(body)
+        .send();
         let config = TransportConfig::production();
         let response = await_headers(send, &cancellation, &prepared.budget, config).await?;
         let headers_at = tokio::time::Instant::now();
@@ -1429,7 +1445,8 @@ impl ActionService {
         let marker_trace = Arc::clone(&prepared.trace);
         let ticket = prepared.ticket.clone();
         let result = if content_type.contains("application/json") {
-            consume_json_response(
+            consume_json_response_for(
+                codec,
                 response,
                 &cancellation,
                 &prepared.budget,
@@ -1451,7 +1468,8 @@ impl ActionService {
             )
             .await
         } else {
-            consume_sse_response(
+            consume_sse_response_for(
+                codec,
                 response,
                 &cancellation,
                 &prepared.budget,
@@ -1643,17 +1661,21 @@ impl ActionService {
             .ok_or_else(|| {
                 RuntimeFailure::new("API_KEY_MISSING", "请先为服务商保存 API Key", false)
             })?;
-        let endpoint = format!("{}/models", provider.base_url.trim_end_matches('/'));
+        let protocol = provider.protocol;
+        let endpoint = protocols::models_endpoint(&provider)
+            .map_err(|message| RuntimeFailure::new("INVALID_URL", message, false))?;
         let operation = async {
-            let response = self
-                .inner
-                .client
-                .get(endpoint)
-                .header(header::ACCEPT, "application/json")
-                .bearer_auth(&api_key)
-                .send()
-                .await
-                .map_err(classify_reqwest_error)?;
+            let response = protocols::apply_auth(
+                self.inner
+                    .client
+                    .get(endpoint)
+                    .header(header::ACCEPT, "application/json"),
+                protocol,
+                &api_key,
+            )
+            .send()
+            .await
+            .map_err(classify_reqwest_error)?;
             if !response.status().is_success() {
                 return Err(
                     model_http_failure(response, &api_key, &CancellationToken::new()).await,
@@ -1668,41 +1690,8 @@ impl ActionService {
             let payload: Value = serde_json::from_slice(&bytes).map_err(|_| {
                 RuntimeFailure::new("INVALID_RESPONSE", "模型列表响应格式无效", true)
             })?;
-            let items = payload
-                .get("data")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    RuntimeFailure::new("INVALID_RESPONSE", "模型列表响应缺少 data 数组", true)
-                })?;
-            let mut models = Vec::new();
-            let mut ids = std::collections::HashSet::new();
-            for item in items.iter().take(200) {
-                let Some(id) = item.get("id").and_then(Value::as_str) else {
-                    continue;
-                };
-                let id = id.trim();
-                if id.is_empty() || id.chars().count() > 256 || !ids.insert(id.to_owned()) {
-                    continue;
-                }
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty() && name.len() <= 256)
-                    .unwrap_or(id);
-                let detected = thinking::extract_thinking_capability_from_api_item(item)
-                    .or_else(|| thinking::infer_thinking_capability(id));
-                let (thinking_levels, thinking_capability) = detected
-                    .map(|value| (value.levels, Some(value.capability)))
-                    .unwrap_or_default();
-                models.push(ProviderModel {
-                    id: id.to_owned(),
-                    name: name.to_owned(),
-                    thinking_levels,
-                    thinking_capability,
-                });
-            }
-            Ok(models)
+            protocols::parse_models(protocol, &payload)
+                .map_err(|message| RuntimeFailure::new("INVALID_RESPONSE", message, true))
         };
         match tokio::time::timeout(CONNECTION_TIMEOUT, operation).await {
             Ok(result) => result,
@@ -1809,7 +1798,10 @@ fn resolve_route(
         .find(|model| model.id == model_id)
         .expect("prepared_provider validated the selected model");
     let thinking = thinking::resolve_thinking_for_request(
+        provider.protocol,
         model_id,
+        model.thinking_enabled,
+        model.thinking_default,
         &model.thinking_levels,
         model.thinking_capability.as_ref(),
         action.thinking_mode,
@@ -2113,20 +2105,44 @@ fn locale_code(locale: Locale) -> &'static str {
     }
 }
 
-/// Detect the likely source language of selected text (mirrors TS `detectTranslationLanguage`).
+/// Detect the likely source language by script share (mirrors TS
+/// `detectTranslationLanguage`). A single foreign character must not hijack a
+/// whole paragraph, so each script needs a meaningful share of the letters.
 fn detect_translation_language(text: &str) -> TranslationLanguage {
-    let has_han = text.chars().any(is_han_character);
-    let has_kana = text.chars().any(is_kana_character);
-    if has_kana {
+    let mut han = 0usize;
+    let mut kana = 0usize;
+    let mut hangul = 0usize;
+    let mut cyrillic = 0usize;
+    let mut other = 0usize;
+    for character in text.chars() {
+        if is_han_character(character) {
+            han += 1;
+        } else if is_kana_character(character) {
+            kana += 1;
+        } else if is_hangul_character(character) {
+            hangul += 1;
+        } else if is_cyrillic_character(character) {
+            cyrillic += 1;
+        } else if character.is_alphabetic() {
+            other += 1;
+        }
+    }
+    let total = han + kana + hangul + cyrillic + other;
+    if total == 0 {
+        return TranslationLanguage::EnUs;
+    }
+    // Kana uses a lower share because Japanese prose splits itself between
+    // kana and a large Han share.
+    if kana * 10 >= total {
         return TranslationLanguage::JaJp;
     }
-    if text.chars().any(is_hangul_character) {
+    if hangul * 10 >= total * 3 {
         return TranslationLanguage::KoKr;
     }
-    if has_han {
+    if han * 10 >= total * 3 {
         return TranslationLanguage::ZhCn;
     }
-    if text.chars().any(is_cyrillic_character) {
+    if cyrillic * 10 >= total * 3 {
         return TranslationLanguage::RuRu;
     }
     TranslationLanguage::EnUs
@@ -2135,16 +2151,12 @@ fn detect_translation_language(text: &str) -> TranslationLanguage {
 /// Default translation target (mirrors TS `defaultTranslationTarget`).
 fn default_translation_target(
     source: TranslationLanguage,
-    pair: &TranslationSettings,
+    settings: &TranslationSettings,
 ) -> TranslationLanguage {
-    if source == pair.primary_language {
-        pair.alternate_language
-    } else if source == pair.alternate_language {
-        pair.primary_language
-    } else if source == TranslationLanguage::ZhCn {
-        TranslationLanguage::EnUs
+    if source == settings.target_language {
+        settings.default_language
     } else {
-        TranslationLanguage::ZhCn
+        settings.target_language
     }
 }
 
@@ -2168,19 +2180,20 @@ fn is_cyrillic_character(character: char) -> bool {
 }
 
 fn build_base_body(prepared: &PreparedRequest) -> Value {
-    serde_json::json!({
-        "model": prepared.session_data.route.model,
-        "stream": true,
-        "messages": prepared.session_data.last_messages,
-    })
+    protocols::build_base_body(
+        prepared.session_data.route.provider.protocol,
+        &prepared.session_data.route.model,
+        &prepared.session_data.last_messages,
+    )
 }
 
 fn build_controlled_body(
     base: &Value,
+    protocol: crate::models::ProviderProtocol,
     plan: &ThinkingRequestPlan,
 ) -> (Value, Option<AppliedThinkingControl>) {
     let mut body = base.clone();
-    let applied = thinking::apply_thinking_to_body(&mut body, plan);
+    let applied = protocols::apply_thinking(protocol, &mut body, plan);
     (body, applied)
 }
 
@@ -2422,6 +2435,8 @@ mod tests {
                 crate::models::ThinkingLevel::High,
             ],
             thinking_capability: None,
+            thinking_enabled: true,
+            thinking_default: None,
         }];
         let action = settings
             .actions
@@ -2498,6 +2513,7 @@ mod tests {
                         id: "provider-fixture".to_owned(),
                         name: "Provider Fixture".to_owned(),
                         enabled: true,
+                        protocol: crate::models::ProviderProtocol::OpenAiChat,
                         base_url: "http://127.0.0.1:1/v1".to_owned(),
                         models: Vec::new(),
                     },
@@ -2540,16 +2556,27 @@ mod tests {
                 id: "provider-fixture".to_owned(),
                 name: "Provider Fixture".to_owned(),
                 enabled: true,
+                protocol: crate::models::ProviderProtocol::OpenAiChat,
                 base_url: "http://localhost:11434/v1".to_owned(),
                 models: vec![ProviderModel {
                     id: model.to_owned(),
                     name: model.to_owned(),
                     thinking_levels: Vec::new(),
                     thinking_capability: None,
+                    thinking_enabled: true,
+                    thinking_default: None,
                 }],
             },
             model: model.to_owned(),
-            thinking: thinking::resolve_thinking_for_request(model, &[], None, ThinkingMode::Off),
+            thinking: thinking::resolve_thinking_for_request(
+                crate::models::ProviderProtocol::OpenAiChat,
+                model,
+                true,
+                None,
+                &[],
+                None,
+                ThinkingMode::Off,
+            ),
         }
     }
 
@@ -2810,13 +2837,17 @@ mod tests {
     fn transport_controlled_body_applies_at_most_one_field_path() {
         for dialect in [
             ThinkingDialect::ReasoningEffort,
+            ThinkingDialect::ReasoningEffortMax,
             ThinkingDialect::EnableThinking,
             ThinkingDialect::ChatTemplateKwargs,
         ] {
             let prepared = prepared_fixture(ThinkingMode::Off, Some(dialect));
             let base = build_base_body(&prepared);
-            let (body, applied) =
-                build_controlled_body(&base, &prepared.session_data.route.thinking);
+            let (body, applied) = build_controlled_body(
+                &base,
+                prepared.session_data.route.provider.protocol,
+                &prepared.session_data.route.thinking,
+            );
             let applied = applied.unwrap();
             let present = [
                 body.get("reasoning_effort").is_some(),
@@ -2835,8 +2866,11 @@ mod tests {
     fn fallback_body_is_the_original_base_and_cannot_retain_control_fields() {
         let prepared = prepared_fixture(ThinkingMode::Off, Some(ThinkingDialect::ReasoningEffort));
         let base = build_base_body(&prepared);
-        let (controlled, applied) =
-            build_controlled_body(&base, &prepared.session_data.route.thinking);
+        let (controlled, applied) = build_controlled_body(
+            &base,
+            prepared.session_data.route.provider.protocol,
+            &prepared.session_data.route.thinking,
+        );
         assert!(applied.is_some());
         assert!(controlled.get("reasoning_effort").is_some());
         let fallback = build_fallback_body(&base);
@@ -2985,15 +3019,21 @@ mod tests {
         .unwrap();
         assert!(explicitly_french.user.contains("French"));
 
-        settings.translate.primary_language = TranslationLanguage::EnUs;
-        settings.translate.alternate_language = TranslationLanguage::ZhCn;
+        settings.translate.default_language = TranslationLanguage::ZhCn;
+        settings.translate.target_language = TranslationLanguage::EnUs;
         let translate = settings
             .actions
             .iter()
             .find(|action| action.id == "translate")
             .unwrap();
-        let swapped_pair =
-            build_prompt(translate, "这是测试。", &settings, None, "request-swapped").unwrap();
+        let swapped_pair = build_prompt(
+            translate,
+            "これはテストです。",
+            &settings,
+            None,
+            "request-swapped",
+        )
+        .unwrap();
         assert!(swapped_pair.user.contains("English"));
 
         settings.locale = Locale::EnUs;
@@ -3029,6 +3069,37 @@ mod tests {
             refined.user,
             "请对用XML标签<INPUT>包裹的用户输入内容进行优化或润色，并保持原内容的含义和完整性。要求：你的输出应当与用户输入内容的语言相同；请不要包含对本提示词的任何解释，直接给出回复；请不要输出XML标签，直接输出优化后的内容: \n\n<INPUT>Original **Markdown**</INPUT>"
         );
+    }
+
+    #[test]
+    fn translation_language_detection_uses_script_share() {
+        use TranslationLanguage::{EnUs, JaJp, KoKr, RuRu, ZhCn};
+
+        assert_eq!(detect_translation_language("这是中文"), ZhCn);
+        assert_eq!(detect_translation_language("これは日本語です"), JaJp);
+        assert_eq!(detect_translation_language("안녕하세요"), KoKr);
+        assert_eq!(detect_translation_language("Привет"), RuRu);
+        assert_eq!(
+            detect_translation_language("日本語能力試験に合格した"),
+            JaJp
+        );
+        assert_eq!(detect_translation_language("Hello の world"), EnUs);
+        assert_eq!(detect_translation_language("Hello 한 world"), EnUs);
+        assert_eq!(detect_translation_language("Hello Ж world"), EnUs);
+        assert_eq!(
+            detect_translation_language("Mixed English 中文中文中文"),
+            ZhCn
+        );
+        assert_eq!(
+            detect_translation_language("The quick brown fox jumps over the lazy dog near 重 5G."),
+            EnUs
+        );
+        assert_eq!(detect_translation_language("12345 — !"), EnUs);
+
+        let settings = TranslationSettings::default();
+        assert_eq!(default_translation_target(EnUs, &settings), ZhCn);
+        assert_eq!(default_translation_target(ZhCn, &settings), EnUs);
+        assert_eq!(default_translation_target(JaJp, &settings), ZhCn);
     }
 
     #[test]
@@ -3202,6 +3273,8 @@ mod tests {
             name: model_id.clone(),
             thinking_levels: Vec::new(),
             thinking_capability: None,
+            thinking_enabled: true,
+            thinking_default: None,
         }];
         let ask = settings
             .actions
@@ -3521,12 +3594,15 @@ mod tests {
             id: "provider-two".to_owned(),
             name: "Provider Two".to_owned(),
             enabled: true,
+            protocol: crate::models::ProviderProtocol::OpenAiChat,
             base_url: "http://localhost:11434/v1".to_owned(),
             models: vec![ProviderModel {
                 id: "model-two".to_owned(),
                 name: "Model Two".to_owned(),
                 thinking_levels: Vec::new(),
                 thinking_capability: None,
+                thinking_enabled: true,
+                thinking_default: None,
             }],
         });
         repository

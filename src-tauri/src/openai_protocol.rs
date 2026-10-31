@@ -21,6 +21,15 @@ impl ProtocolLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SseCodec {
+    #[default]
+    OpenAiChat,
+    OpenAiResponses,
+    AnthropicMessages,
+    Gemini,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SseState {
     Open,
@@ -75,6 +84,7 @@ pub(crate) enum ProtocolError {
 
 pub(crate) struct SseDecoder {
     limits: ProtocolLimits,
+    codec: SseCodec,
     buffer: Vec<u8>,
     consumed: usize,
     scan_from: usize,
@@ -83,9 +93,15 @@ pub(crate) struct SseDecoder {
 }
 
 impl SseDecoder {
+    #[cfg(test)]
     pub(crate) fn new(limits: ProtocolLimits) -> Self {
+        Self::with_codec(limits, SseCodec::OpenAiChat)
+    }
+
+    pub(crate) fn with_codec(limits: ProtocolLimits, codec: SseCodec) -> Self {
         Self {
             limits,
+            codec,
             buffer: Vec::new(),
             consumed: 0,
             scan_from: 0,
@@ -117,10 +133,6 @@ impl SseDecoder {
         self.consumed = event_end + separator_len;
         self.scan_from = self.consumed;
 
-        if matches!(self.state, SseState::Done) && event_end > event_start {
-            return self.fail(ProtocolError::DataAfterDone);
-        }
-
         let event = match std::str::from_utf8(&self.buffer[event_start..event_end]) {
             Ok(event) => event,
             Err(_) => return self.fail(ProtocolError::InvalidUtf8),
@@ -135,6 +147,13 @@ impl SseDecoder {
             if let Some(value) = line.strip_prefix("data:") {
                 data_lines.push(value.strip_prefix(' ').unwrap_or(value));
             }
+        }
+
+        // `response.completed` already ends some Responses streams, while other
+        // gateways still append the conventional [DONE] marker.
+        let trailing_done = data_lines.len() == 1 && data_lines[0] == "[DONE]";
+        if matches!(self.state, SseState::Done) && event_end > event_start && !trailing_done {
+            return self.fail(ProtocolError::DataAfterDone);
         }
 
         let result = if data_lines.is_empty() {
@@ -181,42 +200,7 @@ impl SseDecoder {
         if let Some(error) = provider_error_from_value(&value) {
             return Err(ProtocolError::Provider(error));
         }
-
-        let content = value
-            .pointer("/choices/0/delta/content")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        // Prefer dedicated reasoning_content; some gateways use delta.reasoning.
-        let reasoning = value
-            .pointer("/choices/0/delta/reasoning_content")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                value
-                    .pointer("/choices/0/delta/reasoning")
-                    .and_then(Value::as_str)
-            })
-            .map(ToOwned::to_owned);
-        let finish_reason = value
-            .pointer("/choices/0/finish_reason")
-            .and_then(Value::as_str)
-            .filter(|reason| !reason.is_empty())
-            .map(ToOwned::to_owned);
-
-        if matches!(self.state, SseState::FinishSeen)
-            && content.as_deref().is_some_and(|value| !value.is_empty())
-        {
-            return Err(ProtocolError::ContentAfterFinish);
-        }
-        if finish_reason.is_some() && matches!(self.state, SseState::Open) {
-            self.state = SseState::FinishSeen;
-        }
-
-        Ok(DecodedSseEvent::Data(DecodedSseData {
-            metadata_only: content.is_none() && reasoning.is_none() && finish_reason.is_none(),
-            content,
-            reasoning,
-            finish_reason,
-        }))
+        decode_protocol_event(self.codec, &value, &mut self.state)
     }
 
     fn next_boundary(&mut self) -> Option<(usize, usize)> {
@@ -310,6 +294,294 @@ impl SseDecoder {
         self.state = SseState::Error;
         Err(error)
     }
+}
+
+fn decode_protocol_event(
+    codec: SseCodec,
+    value: &Value,
+    state: &mut SseState,
+) -> Result<DecodedSseEvent, ProtocolError> {
+    match codec {
+        SseCodec::OpenAiChat => decode_openai_chat_event(value, state),
+        SseCodec::OpenAiResponses => decode_openai_responses_event(value, state),
+        SseCodec::AnthropicMessages => decode_anthropic_event(value, state),
+        SseCodec::Gemini => decode_gemini_event(value, state),
+    }
+}
+
+fn decode_openai_chat_event(
+    value: &Value,
+    state: &mut SseState,
+) -> Result<DecodedSseEvent, ProtocolError> {
+    let content = value
+        .pointer("/choices/0/delta/content")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    // Prefer dedicated reasoning_content; some gateways use delta.reasoning.
+    let reasoning = value
+        .pointer("/choices/0/delta/reasoning_content")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .pointer("/choices/0/delta/reasoning")
+                .and_then(Value::as_str)
+        })
+        .map(ToOwned::to_owned);
+    let finish_reason = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+        .map(ToOwned::to_owned);
+    data_event(state, content, reasoning, finish_reason)
+}
+
+fn decode_openai_responses_event(
+    value: &Value,
+    state: &mut SseState,
+) -> Result<DecodedSseEvent, ProtocolError> {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "response.completed" => {
+            *state = SseState::Done;
+            Ok(DecodedSseEvent::Done)
+        }
+        "response.incomplete" => data_event(state, None, None, Some("incomplete".to_owned())),
+        "response.failed" => {
+            let error = value.pointer("/response/error");
+            Err(ProtocolError::Provider(ProviderErrorEnvelope {
+                code: error
+                    .and_then(|error| error.get("code"))
+                    .and_then(string_or_number),
+                kind: Some("response_failed".to_owned()),
+                param: error
+                    .and_then(|error| error.get("param"))
+                    .and_then(Value::as_str)
+                    .map(bounded),
+                message: error
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .map(bounded)
+                    .unwrap_or_else(|| "provider response failed".to_owned()),
+            }))
+        }
+        "response.output_text.delta" => data_event(
+            state,
+            value
+                .get("delta")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            None,
+            None,
+        ),
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => data_event(
+            state,
+            None,
+            value
+                .get("delta")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            None,
+        ),
+        _ => data_event(state, None, None, None),
+    }
+}
+
+fn decode_anthropic_event(
+    value: &Value,
+    state: &mut SseState,
+) -> Result<DecodedSseEvent, ProtocolError> {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "message_stop" => {
+            *state = SseState::Done;
+            Ok(DecodedSseEvent::Done)
+        }
+        "message_delta" => {
+            let finish_reason = value
+                .pointer("/delta/stop_reason")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.is_empty())
+                .map(ToOwned::to_owned);
+            data_event(state, None, None, finish_reason)
+        }
+        "content_block_delta" => {
+            let delta = value.get("delta").unwrap_or(&Value::Null);
+            let delta_type = delta
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let content = (delta_type == "text_delta")
+                .then(|| delta.get("text").and_then(Value::as_str))
+                .flatten()
+                .map(ToOwned::to_owned);
+            let reasoning = (delta_type == "thinking_delta")
+                .then(|| delta.get("thinking").and_then(Value::as_str))
+                .flatten()
+                .map(ToOwned::to_owned);
+            data_event(state, content, reasoning, None)
+        }
+        _ => data_event(state, None, None, None),
+    }
+}
+
+fn decode_gemini_event(
+    value: &Value,
+    state: &mut SseState,
+) -> Result<DecodedSseEvent, ProtocolError> {
+    if let Some(reason) = value
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+    {
+        return Err(ProtocolError::Provider(ProviderErrorEnvelope {
+            code: Some("prompt_blocked".to_owned()),
+            kind: None,
+            param: None,
+            message: format!("请求被 Gemini 安全策略阻止：{reason}"),
+        }));
+    }
+
+    let candidate = value.pointer("/candidates/0");
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    if let Some(parts) = candidate
+        .and_then(|candidate| candidate.pointer("/content/parts"))
+        .and_then(Value::as_array)
+    {
+        for part in parts {
+            let Some(text) = part.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                reasoning.push_str(text);
+            } else {
+                content.push_str(text);
+            }
+        }
+    }
+    let finish_reason = candidate
+        .and_then(|candidate| {
+            candidate
+                .get("finishReason")
+                .or_else(|| candidate.get("finish_reason"))
+        })
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+        .map(ToOwned::to_owned);
+    data_event(
+        state,
+        (!content.is_empty()).then_some(content),
+        (!reasoning.is_empty()).then_some(reasoning),
+        finish_reason,
+    )
+}
+
+fn data_event(
+    state: &mut SseState,
+    content: Option<String>,
+    reasoning: Option<String>,
+    finish_reason: Option<String>,
+) -> Result<DecodedSseEvent, ProtocolError> {
+    if matches!(*state, SseState::FinishSeen)
+        && content.as_deref().is_some_and(|value| !value.is_empty())
+    {
+        return Err(ProtocolError::ContentAfterFinish);
+    }
+    if finish_reason.is_some() && matches!(*state, SseState::Open) {
+        *state = SseState::FinishSeen;
+    }
+    Ok(DecodedSseEvent::Data(DecodedSseData {
+        metadata_only: content.is_none() && reasoning.is_none() && finish_reason.is_none(),
+        content,
+        reasoning,
+        finish_reason,
+    }))
+}
+
+fn string_or_number(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| value.as_i64().map(|number| number.to_string()))
+}
+
+/// Extract answer text from a non-streaming response body for one protocol.
+pub(crate) fn decode_json_content(codec: SseCodec, value: &Value) -> Option<String> {
+    let content = match codec {
+        SseCodec::OpenAiChat => value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        SseCodec::OpenAiResponses => value
+            .get("output_text")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                let mut text = String::new();
+                for item in value
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    for part in item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                            if let Some(value) = part.get("text").and_then(Value::as_str) {
+                                text.push_str(value);
+                            }
+                        }
+                    }
+                }
+                (!text.is_empty()).then_some(text)
+            })
+            .unwrap_or_default(),
+        SseCodec::AnthropicMessages => {
+            let mut text = String::new();
+            for block in value
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(part) = block.get("text").and_then(Value::as_str) {
+                        text.push_str(part);
+                    }
+                }
+            }
+            text
+        }
+        SseCodec::Gemini => {
+            let mut text = String::new();
+            for part in value
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                if let Some(part) = part.get("text").and_then(Value::as_str) {
+                    text.push_str(part);
+                }
+            }
+            text
+        }
+    };
+    (!content.is_empty()).then_some(content)
 }
 
 pub(crate) fn provider_error_from_value(value: &Value) -> Option<ProviderErrorEnvelope> {
@@ -527,6 +799,152 @@ mod tests {
             oversized_stream.push(tiny_event),
             Err(ProtocolError::StreamTooLarge),
         );
+    }
+
+    #[test]
+    fn protocol_decodes_anthropic_deltas_and_stop() {
+        let events = decode_all_with_codec(
+            b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n\
+              data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
+              data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+              data: {\"type\":\"message_stop\"}\n\n",
+            SseCodec::AnthropicMessages,
+        )
+        .unwrap();
+        assert_eq!(
+            events.events,
+            vec![
+                DecodedSseEvent::Data(DecodedSseData {
+                    content: None,
+                    reasoning: Some("plan".to_owned()),
+                    finish_reason: None,
+                    metadata_only: false,
+                }),
+                DecodedSseEvent::Data(DecodedSseData {
+                    content: Some("answer".to_owned()),
+                    reasoning: None,
+                    finish_reason: None,
+                    metadata_only: false,
+                }),
+                DecodedSseEvent::Data(DecodedSseData {
+                    content: None,
+                    reasoning: None,
+                    finish_reason: Some("end_turn".to_owned()),
+                    metadata_only: false,
+                }),
+                DecodedSseEvent::Done,
+            ]
+        );
+        assert_eq!(events.termination, SseTermination::Done);
+    }
+
+    #[test]
+    fn protocol_decodes_gemini_thought_parts_and_finish_reason() {
+        let events = decode_all_with_codec(
+            b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"plan\",\"thought\":true},{\"text\":\"hello\"}]}}]}\n\n\
+              data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n",
+            SseCodec::Gemini,
+        )
+        .unwrap();
+        assert_eq!(
+            events.events,
+            vec![
+                DecodedSseEvent::Data(DecodedSseData {
+                    content: Some("hello".to_owned()),
+                    reasoning: Some("plan".to_owned()),
+                    finish_reason: None,
+                    metadata_only: false,
+                }),
+                DecodedSseEvent::Data(DecodedSseData {
+                    content: None,
+                    reasoning: None,
+                    finish_reason: Some("STOP".to_owned()),
+                    metadata_only: false,
+                }),
+            ]
+        );
+        assert_eq!(events.termination, SseTermination::FinishReason);
+    }
+
+    #[test]
+    fn protocol_decodes_responses_deltas_and_completion() {
+        let events = decode_all_with_codec(
+            b"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"plan\"}\n\n\
+              data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n\
+              data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n\
+              data: [DONE]\n\n",
+            SseCodec::OpenAiResponses,
+        )
+        .unwrap();
+        assert_eq!(
+            events.events,
+            vec![
+                DecodedSseEvent::Data(DecodedSseData {
+                    content: None,
+                    reasoning: Some("plan".to_owned()),
+                    finish_reason: None,
+                    metadata_only: false,
+                }),
+                DecodedSseEvent::Data(DecodedSseData {
+                    content: Some("hello".to_owned()),
+                    reasoning: None,
+                    finish_reason: None,
+                    metadata_only: false,
+                }),
+                DecodedSseEvent::Done,
+                DecodedSseEvent::Done,
+            ]
+        );
+    }
+
+    #[test]
+    fn protocol_extracts_non_stream_answer_text() {
+        assert_eq!(
+            decode_json_content(
+                SseCodec::AnthropicMessages,
+                &serde_json::json!({"content": [
+                    {"type": "thinking", "thinking": "plan"},
+                    {"type": "text", "text": "answer"}
+                ]})
+            )
+            .as_deref(),
+            Some("answer")
+        );
+        assert_eq!(
+            decode_json_content(
+                SseCodec::Gemini,
+                &serde_json::json!({"candidates": [{"content": {"parts": [
+                    {"text": "plan", "thought": true},
+                    {"text": "answer"}
+                ]}}]})
+            )
+            .as_deref(),
+            Some("answer")
+        );
+        assert_eq!(
+            decode_json_content(
+                SseCodec::OpenAiResponses,
+                &serde_json::json!({"output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "answer"}]}
+                ]})
+            )
+            .as_deref(),
+            Some("answer")
+        );
+    }
+
+    fn decode_all_with_codec(
+        bytes: &[u8],
+        codec: SseCodec,
+    ) -> Result<DecodedFixture, ProtocolError> {
+        let mut decoder = SseDecoder::with_codec(ProtocolLimits::test(), codec);
+        decoder.push(bytes)?;
+        let events = drain(&mut decoder)?;
+        let termination = decoder.finish()?;
+        Ok(DecodedFixture {
+            events,
+            termination,
+        })
     }
 
     fn drain(decoder: &mut SseDecoder) -> Result<Vec<DecodedSseEvent>, ProtocolError> {

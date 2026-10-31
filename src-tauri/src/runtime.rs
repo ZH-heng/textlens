@@ -35,12 +35,12 @@ use crate::{
         SettingsUpdate, SyncModelsResult, TriggerMode, UpdateProviderInput,
         WindowSize as SettingsWindowSize,
     },
-    settings::SettingsError,
     selection::{
         SelectionDirection, SelectionEvent, SelectionEventReceiver, SelectionMethod,
         SelectionMonitor, SelectionMouse, SelectionPayload, SelectionPoint, SelectionTrigger,
         SourceApplication,
     },
+    settings::SettingsError,
     settings::SettingsRepository,
     windows::{
         restore_source_app_activation, result_label, DismissMode, Point as WindowPoint,
@@ -60,6 +60,9 @@ const SELECTION_MONITOR_START_ERROR: &str =
 const SELECTION_MONITOR_DISCONNECTED_ERROR: &str = "系统划词监听意外停止。请重新启动 TextLens。";
 const GLOBAL_SHORTCUT_ERROR: &str =
     "全局快捷键注册失败，可能已被其他应用占用。请更换快捷键后重试。";
+/// Safety net for a main-thread hop. The queued closure may still run after a
+/// timeout, but a stuck UI loop must not leave a settings save pending forever.
+const MAIN_THREAD_HOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 const TOOLBAR_LABEL: &str = "selection-toolbar";
 const SETTINGS_LABEL: &str = "settings";
@@ -307,6 +310,12 @@ struct HostSelectionClear {
     bundle_id: Option<String>,
 }
 
+/// Stray one-character selections are almost always drag artifacts; require
+/// more than one visible character before presenting a toolbar.
+fn selection_text_is_too_short(text: &str) -> bool {
+    text.trim().chars().count() < 2
+}
+
 fn host_selection_clear_args(text: &str, bundle_id: Option<&str>) -> Option<HostSelectionClear> {
     let text = text.to_owned();
     if text.is_empty() {
@@ -502,6 +511,10 @@ pub struct RuntimeState {
     pub settings: Arc<SettingsRepository>,
     pub actions: ActionService,
     pub windows: WindowCoordinator,
+    /// Serializes update_settings end-to-end (shortcut switch, disk write and
+    /// rollback). Async commands can run concurrently, unlike the old
+    /// main-thread sync commands, so the read-modify-write needs its own lock.
+    settings_mutation: tokio::sync::Mutex<()>,
     selection_monitor: Mutex<SelectionMonitor>,
     current_selection: Mutex<Option<CurrentSelection>>,
     consuming_selection_ids: Mutex<HashSet<String>>,
@@ -543,6 +556,7 @@ impl RuntimeState {
             settings,
             actions,
             windows: WindowCoordinator::default(),
+            settings_mutation: tokio::sync::Mutex::new(()),
             selection_monitor: Mutex::new(monitor),
             current_selection: Mutex::new(None),
             consuming_selection_ids: Mutex::new(HashSet::new()),
@@ -812,7 +826,7 @@ impl RuntimeState {
             return;
         }
         if !application_is_allowed(&settings.filter, &selection)
-            || selection.text.trim().is_empty()
+            || selection_text_is_too_short(&selection.text)
             || selection.text.chars().count() > 1_000_000
         {
             self.windows.hide_toolbar(app);
@@ -2116,6 +2130,7 @@ fn trace_selection_timing(stage: &str, started: Instant) {
     }
 }
 
+#[cfg(test)]
 fn selection_monitor_disconnect_diagnostic(shutting_down: bool) -> Option<String> {
     (!shutting_down).then(|| SELECTION_MONITOR_DISCONNECTED_ERROR.to_owned())
 }
@@ -2198,23 +2213,26 @@ pub fn settings_ready(window: WebviewWindow, state: State<'_, RuntimeState>) -> 
     Ok(())
 }
 
-/// Runs an operation on the main thread and waits for its result. Settings
+/// Runs an operation on the main thread and awaits its result. Settings
 /// commands are async so disk IO runs on the blocking pool, but global
 /// shortcut registration and window-facing broadcasts keep their original
-/// main-thread execution context through this hop.
-fn run_on_main_thread<T, F>(app: &AppHandle, operation: F) -> Result<T, String>
+/// main-thread execution context through this hop. Awaiting a oneshot instead
+/// of blocking a shared async worker keeps unrelated commands responsive.
+async fn run_on_main_thread<T, F>(app: &AppHandle, operation: F) -> Result<T, String>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let (sender, receiver) = oneshot::channel();
     app.run_on_main_thread(move || {
         let _ignored = sender.send(operation());
     })
     .map_err(|error| error.to_string())?;
-    receiver
-        .recv()
-        .map_err(|_| "主线程调度器已退出".to_owned())
+    match tokio::time::timeout(MAIN_THREAD_HOP_TIMEOUT, receiver).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err("主线程调度器已退出".to_owned()),
+        Err(_) => Err("主线程调度超时".to_owned()),
+    }
 }
 
 /// Runs repository work on the blocking pool. Transactions hold the settings
@@ -2231,6 +2249,37 @@ where
         .map_err(|error| error.to_string())
 }
 
+async fn broadcast_settings_changed(
+    app: &AppHandle,
+    public: &PublicSettings,
+) -> Result<(), String> {
+    let app_for_hop = app.clone();
+    let app_for_main = app.clone();
+    let public = public.clone();
+    run_on_main_thread(&app_for_hop, move || {
+        app_for_main
+            .state::<RuntimeState>()
+            .after_settings_changed(&app_for_main, &public);
+    })
+    .await
+}
+
+/// Commits a repository transaction and broadcasts the resulting snapshot on
+/// the main thread. Every settings mutation goes through here so a new command
+/// cannot forget the broadcast.
+async fn persist_settings_change<F>(
+    app: &AppHandle,
+    repository: Arc<SettingsRepository>,
+    operation: F,
+) -> Result<PublicSettings, String>
+where
+    F: FnOnce(&SettingsRepository) -> Result<PublicSettings, SettingsError> + Send + 'static,
+{
+    let public = run_repository(move || operation(&repository)).await?;
+    broadcast_settings_changed(app, &public).await?;
+    Ok(public)
+}
+
 #[tauri::command]
 pub async fn update_settings(
     app: AppHandle,
@@ -2239,6 +2288,10 @@ pub async fn update_settings(
     update: SettingsUpdate,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
+    // Async commands can overlap: serialize the shortcut switch, durable write
+    // and rollback so two saves cannot leave the registered hotkey and the
+    // persisted setting disagreeing.
+    let _settings_guard = state.settings_mutation.lock().await;
     let shortcut_change_requested =
         update.enabled.is_some() || update.capture_shortcut.is_some() || update.trigger.is_some();
     let previous_shortcut = if shortcut_change_requested {
@@ -2259,7 +2312,8 @@ pub async fn update_settings(
                 app_for_shortcut
                     .state::<RuntimeState>()
                     .switch_shortcut(&app_for_shortcut, &requested)
-            })??,
+            })
+            .await??,
         )
     } else {
         None
@@ -2274,7 +2328,9 @@ pub async fn update_settings(
                     app_for_rollback
                         .state::<RuntimeState>()
                         .switch_shortcut(&app_for_rollback, &previous)
-                }) {
+                })
+                .await
+                {
                     // The registration is now neither the requested nor the
                     // previous shortcut while the settings file still holds
                     // the previous value. Surface the loss instead of letting
@@ -2288,13 +2344,7 @@ pub async fn update_settings(
             return Err(error);
         }
     };
-    let public_for_broadcast = public.clone();
-    let app_for_broadcast = app.clone();
-    run_on_main_thread(&app, move || {
-        app_for_broadcast
-            .state::<RuntimeState>()
-            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
-    })?;
+    broadcast_settings_changed(&app, &public).await?;
     Ok(public)
 }
 
@@ -2309,16 +2359,10 @@ pub async fn reset_result_size(
     // this removes the ambiguity between an explicit reset and a stale draft.
     state.pending_result_sizes.lock().clear();
     *state.latest_result_size.lock() = None;
-    let settings = state.settings.clone();
-    let public = run_repository(move || settings.clear_result_last_size()).await?;
-    let public_for_broadcast = public.clone();
-    let app_for_broadcast = app.clone();
-    run_on_main_thread(&app, move || {
-        app_for_broadcast
-            .state::<RuntimeState>()
-            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
-    })?;
-    Ok(public)
+    persist_settings_change(&app, state.settings.clone(), |repository| {
+        repository.clear_result_last_size()
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2329,16 +2373,10 @@ pub async fn create_provider(
     input: CreateProviderInput,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
-    let settings = state.settings.clone();
-    let public = run_repository(move || settings.create_provider(input)).await?;
-    let public_for_broadcast = public.clone();
-    let app_for_broadcast = app.clone();
-    run_on_main_thread(&app, move || {
-        app_for_broadcast
-            .state::<RuntimeState>()
-            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
-    })?;
-    Ok(public)
+    persist_settings_change(&app, state.settings.clone(), move |repository| {
+        repository.create_provider(input)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2350,16 +2388,10 @@ pub async fn update_provider(
     update: UpdateProviderInput,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
-    let settings = state.settings.clone();
-    let public = run_repository(move || settings.update_provider(&provider_id, update)).await?;
-    let public_for_broadcast = public.clone();
-    let app_for_broadcast = app.clone();
-    run_on_main_thread(&app, move || {
-        app_for_broadcast
-            .state::<RuntimeState>()
-            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
-    })?;
-    Ok(public)
+    persist_settings_change(&app, state.settings.clone(), move |repository| {
+        repository.update_provider(&provider_id, update)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2370,16 +2402,10 @@ pub async fn delete_provider(
     provider_id: String,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
-    let settings = state.settings.clone();
-    let public = run_repository(move || settings.delete_provider(&provider_id)).await?;
-    let public_for_broadcast = public.clone();
-    let app_for_broadcast = app.clone();
-    run_on_main_thread(&app, move || {
-        app_for_broadcast
-            .state::<RuntimeState>()
-            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
-    })?;
-    Ok(public)
+    persist_settings_change(&app, state.settings.clone(), move |repository| {
+        repository.delete_provider(&provider_id)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2391,16 +2417,10 @@ pub async fn set_provider_api_key(
     api_key: String,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
-    let settings = state.settings.clone();
-    let public = run_repository(move || settings.set_provider_api_key(&provider_id, &api_key)).await?;
-    let public_for_broadcast = public.clone();
-    let app_for_broadcast = app.clone();
-    run_on_main_thread(&app, move || {
-        app_for_broadcast
-            .state::<RuntimeState>()
-            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
-    })?;
-    Ok(public)
+    persist_settings_change(&app, state.settings.clone(), move |repository| {
+        repository.set_provider_api_key(&provider_id, &api_key)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2411,16 +2431,10 @@ pub async fn clear_provider_api_key(
     provider_id: String,
 ) -> Result<PublicSettings, String> {
     ensure_settings_caller(&window)?;
-    let settings = state.settings.clone();
-    let public = run_repository(move || settings.clear_provider_api_key(&provider_id)).await?;
-    let public_for_broadcast = public.clone();
-    let app_for_broadcast = app.clone();
-    run_on_main_thread(&app, move || {
-        app_for_broadcast
-            .state::<RuntimeState>()
-            .after_settings_changed(&app_for_broadcast, &public_for_broadcast);
-    })?;
-    Ok(public)
+    persist_settings_change(&app, state.settings.clone(), move |repository| {
+        repository.clear_provider_api_key(&provider_id)
+    })
+    .await
 }
 
 /// Settings-window only: reveal a saved provider API key for display/editing.
@@ -2466,7 +2480,11 @@ pub async fn sync_provider_models(
     ensure_settings_caller(&window)?;
     let result = state.actions.sync_provider_models(&provider_id).await;
     if let Some(settings) = &result.settings {
-        state.after_settings_changed(&app, settings);
+        // Keep the tray/window-facing side effects on the main thread; this
+        // command runs on the async runtime now.
+        if let Err(error) = broadcast_settings_changed(&app, settings).await {
+            eprintln!("[TextLens] 模型同步后的设置广播失败：{error}");
+        }
     }
     Ok(result)
 }
@@ -3023,6 +3041,9 @@ pub fn show_result_selection(
     }
     if text.trim().is_empty() {
         return Err("所选文字为空".to_owned());
+    }
+    if selection_text_is_too_short(&text) {
+        return Err("所选文字过短".to_owned());
     }
     if text.chars().count() > 1_000_000 {
         return Err("所选文字过长".to_owned());
@@ -3991,6 +4012,18 @@ mod tests {
             true,
             TriggerMode::Selected
         ));
+    }
+
+    #[test]
+    fn toolbar_requires_more_than_one_visible_character() {
+        assert!(selection_text_is_too_short(""));
+        assert!(selection_text_is_too_short(" \n\t "));
+        assert!(selection_text_is_too_short("字"));
+        assert!(selection_text_is_too_short(" 字 "));
+        assert!(selection_text_is_too_short("a"));
+        assert!(selection_text_is_too_short(" a "));
+        assert!(!selection_text_is_too_short("中文"));
+        assert!(!selection_text_is_too_short(" ab "));
     }
 
     #[cfg(target_os = "windows")]

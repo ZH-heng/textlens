@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-pub const SETTINGS_VERSION: u8 = 12;
+pub const SETTINGS_VERSION: u8 = 13;
 pub const TEXT_PLACEHOLDER: &str = "{{text}}";
 pub const OUTPUT_LANGUAGE_PLACEHOLDER: &str = "{{language}}";
 pub const TARGET_LANGUAGE_PLACEHOLDER: &str = "{{target_language}}";
@@ -14,6 +14,7 @@ pub const MAX_ENABLED_ACTIONS: usize = 8;
 pub const MAX_CUSTOM_ACTIONS: usize = 10;
 pub const MAX_ACTIONS: usize = 50;
 pub const MAX_PROVIDERS: usize = 20;
+pub const MAX_PROVIDER_MODELS: usize = 200;
 pub const MAX_SEARCH_ENGINES: usize = 20;
 pub const DEFAULT_PROVIDER_ID: &str = "openai-compatible";
 pub const DEFAULT_SEARCH_TEMPLATE: &str = "https://www.google.com/search?q={{text}}";
@@ -265,9 +266,7 @@ pub struct AppearanceSettings {
 
 impl Default for AppearanceSettings {
     fn default() -> Self {
-        Self {
-            theme: Theme::Warm,
-        }
+        Self { theme: Theme::Warm }
     }
 }
 
@@ -415,20 +414,24 @@ impl Default for SelectionCaptureSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TranslationSettings {
-    pub primary_language: TranslationLanguage,
-    pub alternate_language: TranslationLanguage,
+    // Persisted pairs used to be primary/alternate; the old primary was the
+    // reverse-direction language, which is now `target_language`.
+    #[serde(alias = "alternateLanguage")]
+    pub default_language: TranslationLanguage,
+    #[serde(alias = "primaryLanguage")]
+    pub target_language: TranslationLanguage,
 }
 
 impl Default for TranslationSettings {
     fn default() -> Self {
         Self {
-            primary_language: TranslationLanguage::ZhCn,
-            alternate_language: TranslationLanguage::EnUs,
+            default_language: TranslationLanguage::EnUs,
+            target_language: TranslationLanguage::ZhCn,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub enum ThinkingLevel {
     Minimal,
@@ -443,6 +446,8 @@ pub enum ThinkingLevel {
 pub enum ThinkingMode {
     #[default]
     Off,
+    /// Follow the model's configured default level; resolves to Off when none is set.
+    Auto,
     Minimal,
     Low,
     Medium,
@@ -455,12 +460,16 @@ pub enum ThinkingMode {
 pub enum ThinkingCapabilitySource {
     Explicit,
     Heuristic,
+    /// User-edited levels; provider metadata must not overwrite them.
+    Manual,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ThinkingDialect {
     ReasoningEffort,
+    // DeepSeek V4 accepts low/high/max rather than OpenAI's middle gears.
+    ReasoningEffortMax,
     EnableThinking,
     ChatTemplateKwargs,
 }
@@ -476,7 +485,7 @@ pub struct ThinkingCapability {
 impl ThinkingMode {
     pub fn as_level(self) -> Option<ThinkingLevel> {
         match self {
-            Self::Off => None,
+            Self::Off | Self::Auto => None,
             Self::Minimal => Some(ThinkingLevel::Minimal),
             Self::Low => Some(ThinkingLevel::Low),
             Self::Medium => Some(ThinkingLevel::Medium),
@@ -484,19 +493,43 @@ impl ThinkingMode {
             Self::Xhigh => Some(ThinkingLevel::Xhigh),
         }
     }
+
+    pub fn from_level(level: ThinkingLevel) -> Self {
+        match level {
+            ThinkingLevel::Minimal => Self::Minimal,
+            ThinkingLevel::Low => Self::Low,
+            ThinkingLevel::Medium => Self::Medium,
+            ThinkingLevel::High => Self::High,
+            ThinkingLevel::Xhigh => Self::Xhigh,
+        }
+    }
 }
 
 /// Clamp action thinking mode to the model capability list (or Off).
 pub fn clamp_thinking_mode(mode: ThinkingMode, levels: &[ThinkingLevel]) -> ThinkingMode {
-    match mode.as_level() {
-        None => ThinkingMode::Off,
-        Some(level) if levels.contains(&level) => mode,
-        Some(_) => ThinkingMode::Off,
+    match mode {
+        ThinkingMode::Off => ThinkingMode::Off,
+        ThinkingMode::Auto if levels.is_empty() => ThinkingMode::Off,
+        ThinkingMode::Auto => ThinkingMode::Auto,
+        level => match level.as_level() {
+            Some(level) if levels.contains(&level) => mode,
+            _ => ThinkingMode::Off,
+        },
     }
 }
 
 fn is_thinking_mode_off(mode: &ThinkingMode) -> bool {
     matches!(mode, ThinkingMode::Off)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderProtocol {
+    #[default]
+    OpenAiChat,
+    OpenAiResponses,
+    AnthropicMessages,
+    Gemini,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -508,6 +541,14 @@ pub struct ProviderModel {
     pub thinking_levels: Vec<ThinkingLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_capability: Option<ThinkingCapability>,
+    #[serde(default = "default_thinking_enabled")]
+    pub thinking_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_default: Option<ThinkingLevel>,
+}
+
+fn default_thinking_enabled() -> bool {
+    true
 }
 
 fn default_provider_enabled() -> bool {
@@ -521,6 +562,8 @@ pub struct ProviderConfig {
     pub name: String,
     #[serde(default = "default_provider_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub protocol: ProviderProtocol,
     pub base_url: String,
     #[serde(default)]
     pub models: Vec<ProviderModel>,
@@ -533,6 +576,8 @@ pub struct PublicProviderConfig {
     pub name: String,
     #[serde(default = "default_provider_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub protocol: ProviderProtocol,
     pub base_url: String,
     pub models: Vec<ProviderModel>,
     pub key_configured: bool,
@@ -544,6 +589,7 @@ impl PublicProviderConfig {
             id: provider.id.clone(),
             name: provider.name.clone(),
             enabled: provider.enabled,
+            protocol: provider.protocol,
             base_url: provider.base_url.clone(),
             models: provider.models.clone(),
             key_configured,
@@ -766,6 +812,8 @@ pub struct SettingsUpdate {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateProviderInput {
     pub name: String,
+    #[serde(default)]
+    pub protocol: ProviderProtocol,
     pub base_url: String,
 }
 
@@ -773,6 +821,7 @@ pub struct CreateProviderInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateProviderInput {
     pub name: Option<String>,
+    pub protocol: Option<ProviderProtocol>,
     pub base_url: Option<String>,
     pub models: Option<Vec<ProviderModel>>,
 }
@@ -990,6 +1039,7 @@ impl Default for AppSettings {
             id: DEFAULT_PROVIDER_ID.to_owned(),
             name: "OpenAI Compatible".to_owned(),
             enabled: true,
+            protocol: ProviderProtocol::OpenAiChat,
             base_url: "https://api.openai.com/v1".to_owned(),
             models: Vec::new(),
         };
@@ -1114,8 +1164,8 @@ impl AppSettings {
         if self.trigger.mode == TriggerMode::Shortcut && self.capture_shortcut.is_empty() {
             return Err("快捷键触发模式需要设置捕获快捷键".to_owned());
         }
-        if self.translate.primary_language == self.translate.alternate_language {
-            return Err("翻译语言必须不同".to_owned());
+        if self.translate.default_language == self.translate.target_language {
+            return Err("默认语言和翻译语言不能相同".to_owned());
         }
         validate_result_settings(&self.result)?;
 
@@ -1166,8 +1216,8 @@ impl AppSettings {
             if provider.name.is_empty() || provider.name.chars().count() > 80 {
                 return Err("服务商名称应为 1–80 个字符".to_owned());
             }
-            if provider.models.len() > 200 {
-                return Err("每个服务商最多保存 200 个模型".to_owned());
+            if provider.models.len() > MAX_PROVIDER_MODELS {
+                return Err(format!("每个服务商最多保存 {MAX_PROVIDER_MODELS} 个模型"));
             }
             let mut model_ids = HashSet::new();
             for model in &mut provider.models {
@@ -1178,6 +1228,33 @@ impl AppSettings {
                 }
                 if model.name.is_empty() || model.name.chars().count() > 256 {
                     return Err("模型名称应为 1–256 个字符".to_owned());
+                }
+                let mut levels = Vec::with_capacity(model.thinking_levels.len());
+                for level in model.thinking_levels.drain(..) {
+                    if !levels.contains(&level) {
+                        levels.push(level);
+                    }
+                }
+                levels.sort_unstable();
+                model.thinking_levels = levels;
+                if model
+                    .thinking_default
+                    .is_some_and(|level| !model.thinking_levels.contains(&level))
+                {
+                    model.thinking_default = None;
+                }
+                if model.thinking_default.is_none() {
+                    model.thinking_default = model
+                        .thinking_levels
+                        .contains(&ThinkingLevel::Medium)
+                        .then_some(ThinkingLevel::Medium)
+                        .or_else(|| {
+                            model
+                                .thinking_levels
+                                .contains(&ThinkingLevel::High)
+                                .then_some(ThinkingLevel::High)
+                        })
+                        .or_else(|| model.thinking_levels.first().copied());
                 }
                 if !model_ids.insert(model.id.clone()) {
                     return Err(format!("模型 ID 重复：{}", model.id));
@@ -1776,6 +1853,8 @@ mod tests {
                 ThinkingLevel::High,
             ],
             thinking_capability: None,
+            thinking_enabled: true,
+            thinking_default: None,
         }];
         settings.actions[0].model_id = Some("o3-mini".to_owned());
         settings.actions[0].thinking_mode = ThinkingMode::Xhigh;
@@ -1792,11 +1871,30 @@ mod tests {
                 ThinkingLevel::High,
             ],
             thinking_capability: None,
+            thinking_enabled: true,
+            thinking_default: None,
         }];
         settings.actions[0].model_id = Some("o3-mini".to_owned());
         settings.actions[0].thinking_mode = ThinkingMode::Medium;
         let normalized = settings.normalize_and_validate().unwrap();
         assert_eq!(normalized.actions[0].thinking_mode, ThinkingMode::Medium);
+    }
+
+    #[test]
+    fn provider_protocol_wire_names_match_the_renderer_schema() {
+        for (protocol, wire) in [
+            (ProviderProtocol::OpenAiChat, "openAiChat"),
+            (ProviderProtocol::OpenAiResponses, "openAiResponses"),
+            (ProviderProtocol::AnthropicMessages, "anthropicMessages"),
+            (ProviderProtocol::Gemini, "gemini"),
+        ] {
+            assert_eq!(serde_json::to_value(protocol).unwrap(), wire);
+        }
+        assert_eq!(
+            serde_json::from_value::<ProviderProtocol>(serde_json::json!("anthropicMessages"))
+                .unwrap(),
+            ProviderProtocol::AnthropicMessages
+        );
     }
 
     #[test]
@@ -1816,6 +1914,8 @@ mod tests {
                 dialect: Some(ThinkingDialect::ReasoningEffort),
                 supports_off: false,
             }),
+            thinking_enabled: true,
+            thinking_default: None,
         };
         let value = serde_json::to_value(&model).unwrap();
         assert_eq!(value["thinkingCapability"]["source"], "explicit");

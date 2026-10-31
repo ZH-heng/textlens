@@ -19,6 +19,8 @@
   --accent: #3568d0;
   --accent-hover: #2a56b4;
   --accent-soft: rgba(53, 104, 208, 0.11);
+  /* Text on --accent fills. Dark mode accents are light, so this flips there. */
+  --on-accent: #ffffff;
   --danger: #b8443c;
   --danger-soft: rgba(184, 68, 60, 0.11);
   --success: #37794f;
@@ -50,6 +52,7 @@
     --accent: #78a0ff;
     --accent-hover: #91b2ff;
     --accent-soft: rgba(120, 160, 255, 0.15);
+    --on-accent: #10141d;
     --danger: #ff8585;
     --danger-soft: rgba(255, 133, 133, 0.13);
     --success: #76d5a2;
@@ -167,19 +170,13 @@ textarea:disabled {
 }
 
 .button--primary {
-  color: white;
+  color: var(--on-accent);
   background: var(--accent);
   border-color: transparent;
 }
 
 .button--primary:hover:not(:disabled) {
   background: var(--accent-hover);
-}
-
-@media (prefers-color-scheme: dark) {
-  .button--primary {
-    color: #10141d;
-  }
 }
 
 .button--danger {

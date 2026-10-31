@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     models::AI_OUTPUT_LIMIT,
     openai_protocol::{
-        provider_error_from_value, DecodedSseEvent, ProtocolError, ProtocolLimits,
-        ProviderErrorEnvelope, SseDecoder, SseTermination,
+        decode_json_content, provider_error_from_value, DecodedSseEvent, ProtocolError,
+        ProtocolLimits, ProviderErrorEnvelope, SseCodec, SseDecoder, SseTermination,
     },
 };
 
@@ -168,7 +168,9 @@ where
     }
 }
 
-pub(crate) async fn consume_sse_response<D, T, M>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn consume_sse_response_for<D, T, M>(
+    codec: SseCodec,
     response: Response,
     cancellation: &CancellationToken,
     budget: &GenerationBudget,
@@ -183,7 +185,8 @@ where
     T: FnMut(String) -> ControlFlow<()>,
     M: FnMut(TransportMarker, Instant),
 {
-    consume_sse_chunks(
+    consume_sse_chunks_for(
+        codec,
         response
             .bytes_stream()
             .map(|chunk| chunk.map_err(reqwest_failure)),
@@ -198,7 +201,9 @@ where
     .await
 }
 
-pub(crate) async fn consume_json_response<D, T, M>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn consume_json_response_for<D, T, M>(
+    codec: SseCodec,
     response: Response,
     cancellation: &CancellationToken,
     budget: &GenerationBudget,
@@ -214,7 +219,8 @@ where
     M: FnMut(TransportMarker, Instant),
 {
     let _ = on_thinking;
-    consume_json_chunks(
+    consume_json_chunks_for(
+        codec,
         response
             .bytes_stream()
             .map(|chunk| chunk.map_err(reqwest_failure)),
@@ -245,7 +251,39 @@ pub(crate) async fn read_http_error(
     .await
 }
 
+#[cfg(test)]
 async fn consume_sse_chunks<S, D, T, M>(
+    chunks: S,
+    cancellation: &CancellationToken,
+    budget: &GenerationBudget,
+    headers_at: Instant,
+    config: TransportConfig,
+    on_delta: D,
+    on_thinking: T,
+    on_marker: M,
+) -> Result<TransportSuccess, TransportFailure>
+where
+    S: Stream<Item = Result<Bytes, TransportFailure>>,
+    D: FnMut(String) -> ControlFlow<()>,
+    T: FnMut(String) -> ControlFlow<()>,
+    M: FnMut(TransportMarker, Instant),
+{
+    consume_sse_chunks_for(
+        SseCodec::OpenAiChat,
+        chunks,
+        cancellation,
+        budget,
+        headers_at,
+        config,
+        on_delta,
+        on_thinking,
+        on_marker,
+    )
+    .await
+}
+
+async fn consume_sse_chunks_for<S, D, T, M>(
+    codec: SseCodec,
     chunks: S,
     cancellation: &CancellationToken,
     budget: &GenerationBudget,
@@ -262,7 +300,7 @@ where
     M: FnMut(TransportMarker, Instant),
 {
     futures_util::pin_mut!(chunks);
-    let mut decoder = SseDecoder::new(config.protocol);
+    let mut decoder = SseDecoder::with_codec(config.protocol, codec);
     let mut content = String::new();
     let mut output_scalars = 0usize;
     let mut thinking_scalars = 0usize;
@@ -404,7 +442,36 @@ where
     }
 }
 
+#[cfg(test)]
 async fn consume_json_chunks<S, D, M>(
+    chunks: S,
+    cancellation: &CancellationToken,
+    budget: &GenerationBudget,
+    headers_at: Instant,
+    config: TransportConfig,
+    on_delta: D,
+    on_marker: M,
+) -> Result<TransportSuccess, TransportFailure>
+where
+    S: Stream<Item = Result<Bytes, TransportFailure>>,
+    D: FnMut(String) -> ControlFlow<()>,
+    M: FnMut(TransportMarker, Instant),
+{
+    consume_json_chunks_for(
+        SseCodec::OpenAiChat,
+        chunks,
+        cancellation,
+        budget,
+        headers_at,
+        config,
+        on_delta,
+        on_marker,
+    )
+    .await
+}
+
+async fn consume_json_chunks_for<S, D, M>(
+    codec: SseCodec,
     chunks: S,
     cancellation: &CancellationToken,
     budget: &GenerationBudget,
@@ -450,11 +517,7 @@ where
         return Err(provider_failure(envelope, false));
     }
     on_marker(TransportMarker::FirstValidEvent, Instant::now());
-    let content = value
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    let content = decode_json_content(codec, &value).unwrap_or_default();
     let scalar_count = content.chars().count();
     if scalar_count > config.output_scalars {
         return Err(output_limit_failure(false));

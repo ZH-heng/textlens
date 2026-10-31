@@ -98,8 +98,14 @@ use windows::{
     },
 };
 
-const WORKER_PUMP_INTERVAL: Duration = Duration::from_millis(12);
-const HOOK_HEALTH_INTERVAL: Duration = Duration::from_millis(50);
+// The helper only pumps STA messages between captures; a blocking recv wakes
+// immediately for new work, so a slower idle cadence avoids 80+ wakeups/s
+// without adding capture latency.
+const WORKER_PUMP_INTERVAL: Duration = Duration::from_millis(250);
+// Hook callbacks are delivered by the OS; this timeout only re-checks the
+// reinstall deadline and the stop flag, so 20 wakeups/s bought no extra
+// responsiveness.
+const HOOK_HEALTH_INTERVAL: Duration = Duration::from_millis(250);
 // Windows can silently remove a low-level hook after a callback timeout while
 // leaving its owner thread and message loop alive. Periodically replacing the
 // two input hooks gives the worker a bounded self-recovery window; an install

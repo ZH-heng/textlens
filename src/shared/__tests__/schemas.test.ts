@@ -8,6 +8,7 @@ import {
   DEFAULT_PROVIDER_ID,
   DEFAULT_PUBLIC_SETTINGS,
   MAX_ENABLED_ACTIONS,
+  SETTINGS_VERSION,
   TEXT_PLACEHOLDER,
   actionDefinitionSchema,
   actionStreamEventSchema,
@@ -25,9 +26,9 @@ import {
 } from '..'
 
 describe('settings schemas and defaults', () => {
-  it('provides v12 defaults with search engine bound to the search action', () => {
+  it('provides current defaults with search engine bound to the search action', () => {
     expect(appSettingsSchema.parse(DEFAULT_APP_SETTINGS)).toEqual(DEFAULT_APP_SETTINGS)
-    expect(DEFAULT_APP_SETTINGS.version).toBe(12)
+    expect(DEFAULT_APP_SETTINGS.version).toBe(SETTINGS_VERSION)
     expect(DEFAULT_APP_SETTINGS.enabled).toBe(true)
     expect(DEFAULT_APP_SETTINGS.actions.find((action) => action.kind === 'search')).toMatchObject({
       searchEngineId: 'google'
@@ -46,8 +47,8 @@ describe('settings schemas and defaults', () => {
       models: []
     })
     expect(DEFAULT_APP_SETTINGS.translate).toEqual({
-      primaryLanguage: 'zh-CN',
-      alternateLanguage: 'en-US'
+      defaultLanguage: 'en-US',
+      targetLanguage: 'zh-CN'
     })
     expect(DEFAULT_APP_SETTINGS.providers).toHaveLength(1)
     expect(DEFAULT_APP_SETTINGS.result).toMatchObject({
@@ -110,7 +111,7 @@ describe('settings schemas and defaults', () => {
   it('migrates v11 settings to visible capture compatibility rules', () => {
     const { selectionCapture: _selectionCapture, ...v11 } = DEFAULT_APP_SETTINGS
     const migrated = migrateAppSettings({ ...v11, version: 11 })
-    expect(migrated.version).toBe(12)
+    expect(migrated.version).toBe(SETTINGS_VERSION)
     expect(migrated.selectionCapture.applications).toContainEqual({
       application: 'emeditor.exe',
       strategy: 'clipboard'
@@ -152,7 +153,7 @@ describe('settings schemas and defaults', () => {
     const ask = migrated.actions.find((action) => action.id === 'ask-ai' || action.kind === 'ask')
     expect(ask?.kind).toBe('ask')
     expect(ask?.name).toBe('问AI')
-    expect(migrated.version).toBe(12)
+    expect(migrated.version).toBe(SETTINGS_VERSION)
     expect(migrated.actions.filter((action) => action.kind === 'ask')).toHaveLength(1)
   })
 
@@ -348,7 +349,11 @@ describe('settings schemas and defaults', () => {
       ]
     }
     const migrated = migrateAppSettings(legacy)
-    expect(migrated.version).toBe(12)
+    expect(migrated.version).toBe(SETTINGS_VERSION)
+    expect(migrated.translate).toEqual({
+      defaultLanguage: 'en-US',
+      targetLanguage: 'zh-CN'
+    })
     expect(migrated.providers[0]).toMatchObject({
       baseUrl: 'https://example.com/v1',
       apiKey: 'secret',
@@ -465,7 +470,7 @@ describe('settings schemas and defaults', () => {
       actions: [...DEFAULT_APP_SETTINGS.actions, secondTranslate]
     })
 
-    expect(migrated.version).toBe(12)
+    expect(migrated.version).toBe(SETTINGS_VERSION)
     expect(migrated.providers[1]).toEqual({
       ...secondProvider,
       enabled: true,
@@ -510,7 +515,7 @@ describe('settings schemas and defaults', () => {
       ]
     })
 
-    expect(migrated.version).toBe(12)
+    expect(migrated.version).toBe(SETTINGS_VERSION)
     expect(migrated.actions.find((action) => action.id === 'translate')).toMatchObject({
       prompt: DEFAULT_ACTION_PROMPTS.translate
     })
@@ -568,7 +573,7 @@ describe('settings schemas and defaults', () => {
     const migratedPublic = migratePublicSettings(withV4Prompts(DEFAULT_PUBLIC_SETTINGS))
 
     for (const settings of [migrated, migratedPublic]) {
-      expect(settings.version).toBe(12)
+      expect(settings.version).toBe(SETTINGS_VERSION)
       expect(settings.actions.find((action) => action.id === 'summary')).toMatchObject({
         prompt: DEFAULT_ACTION_PROMPTS.summary
       })
@@ -645,7 +650,7 @@ Return only the translated content. Do not include explanations, labels, tags, o
     const migratedPublic = migratePublicSettings(withLegacyV11(DEFAULT_PUBLIC_SETTINGS))
 
     for (const settings of [migrated, migratedPublic]) {
-      expect(settings.version).toBe(12)
+      expect(settings.version).toBe(SETTINGS_VERSION)
       expect(settings.actions.find((action) => action.id === 'translate')).toMatchObject({
         prompt: DEFAULT_ACTION_PROMPTS.translate
       })
@@ -733,7 +738,7 @@ Return only the translated content. Do not include explanations, labels, tags, o
         return rest
       })
     })
-    expect(fromV8.version).toBe(12)
+    expect(fromV8.version).toBe(SETTINGS_VERSION)
     expect(fromV8.actions.find((action) => action.kind === 'search')).toMatchObject({
       searchEngineId: 'baidu'
     })
@@ -753,7 +758,7 @@ Return only the translated content. Do not include explanations, labels, tags, o
       ]
     })
 
-    expect(migrated.version).toBe(12)
+    expect(migrated.version).toBe(SETTINGS_VERSION)
     expect(migrated.actions.filter((action) => action.kind === 'search')).toMatchObject([
       { id: 'search', icon: 'search', searchEngineId: 'google' }
     ])

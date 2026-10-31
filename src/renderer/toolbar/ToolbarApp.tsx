@@ -295,9 +295,11 @@ export function ToolbarApp(): JSX.Element {
     [settings]
   )
 
+  const theme = settings?.appearance.theme
   useEffect(() => {
-    applyTheme(settings?.appearance.theme)
-  }, [settings?.appearance.theme])
+    // Keep the localStorage-seeded theme until the real snapshot arrives.
+    if (theme) applyTheme(theme)
+  }, [theme])
 
   useLayoutEffect(() => {
     const element = toolbarRef.current

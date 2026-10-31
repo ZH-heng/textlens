@@ -64,6 +64,16 @@ describe('settings form helpers', () => {
     })
   })
 
+  it('rejects identical default and target translation languages', () => {
+    expect(buildSettingsUpdate({
+      ...DEFAULT_PUBLIC_SETTINGS,
+      translate: { defaultLanguage: 'zh-CN', targetLanguage: 'zh-CN' }
+    })).toEqual({
+      valid: false,
+      message: '默认语言和翻译语言不能相同'
+    })
+  })
+
   it('rejects shortcut names that Tauri cannot register', () => {
     expect(buildSettingsUpdate({
       ...DEFAULT_PUBLIC_SETTINGS,

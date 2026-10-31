@@ -12,7 +12,7 @@ import {
   DEFAULT_RESULT_SETTINGS,
   DEFAULT_SEARCH_ENGINE_ID,
   DEFAULT_TOOLBAR_SETTINGS,
-  DEFAULT_TRANSLATION_PAIR,
+  DEFAULT_TRANSLATION_SETTINGS,
   DEFAULT_TRIGGER_SETTINGS,
   RESULT_FONT_SIZE_MAX,
   RESULT_FONT_SIZE_MIN,
@@ -218,7 +218,7 @@ export const DEFAULT_APP_SETTINGS: Readonly<AppSettings> = Object.freeze(
     enabled: true,
     captureShortcut: DEFAULT_CAPTURE_SHORTCUT,
     locale: DEFAULT_LOCALE,
-    translate: DEFAULT_TRANSLATION_PAIR,
+    translate: DEFAULT_TRANSLATION_SETTINGS,
     toolbar: DEFAULT_TOOLBAR_SETTINGS,
     appearance: DEFAULT_APPEARANCE_SETTINGS,
     result: DEFAULT_RESULT_SETTINGS,
@@ -231,6 +231,7 @@ export const DEFAULT_APP_SETTINGS: Readonly<AppSettings> = Object.freeze(
         id: DEFAULT_PROVIDER_ID,
         name: DEFAULT_PROVIDER_NAME,
         enabled: true,
+        protocol: 'openAiChat',
         baseUrl: DEFAULT_OPENAI_BASE_URL,
         apiKey: '',
         models: []
@@ -276,6 +277,25 @@ function asRecord(value: unknown): UnknownRecord {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? (value as UnknownRecord)
     : {}
+}
+
+/**
+ * Old settings paired "primary"/"alternate" languages. The new model keeps
+ * `targetLanguage` as the default output and `defaultLanguage` as the reverse
+ * direction, so the historical primary maps to target and alternate to default.
+ */
+function migrateTranslationSettingsCandidate(candidate: UnknownRecord): UnknownRecord {
+  const translate = asRecord(candidate.translate)
+  if (translate.primaryLanguage === undefined && translate.alternateLanguage === undefined) {
+    return candidate
+  }
+  return {
+    ...candidate,
+    translate: {
+      defaultLanguage: translate.defaultLanguage ?? translate.alternateLanguage,
+      targetLanguage: translate.targetLanguage ?? translate.primaryLanguage
+    }
+  }
 }
 
 function migrateV2Candidate(candidate: UnknownRecord): UnknownRecord {
@@ -615,9 +635,10 @@ function migrateLegacyCommon(input: UnknownRecord) {
 
 /** Converts persisted internal settings into the current version. */
 export function migrateAppSettings(input: unknown): AppSettings {
-  const candidate = asRecord(input)
+  const candidate = migrateTranslationSettingsCandidate(asRecord(input))
   if (
     candidate.version === SETTINGS_VERSION ||
+    candidate.version === 12 ||
     candidate.version === 11 ||
     candidate.version === 10 ||
     candidate.version === 9 ||
@@ -644,6 +665,7 @@ export function migrateAppSettings(input: unknown): AppSettings {
       {
         id: DEFAULT_PROVIDER_ID,
         name: DEFAULT_PROVIDER_NAME,
+        protocol: 'openAiChat',
         baseUrl,
         apiKey,
         models: legacyModel(common.ai)
@@ -654,9 +676,10 @@ export function migrateAppSettings(input: unknown): AppSettings {
 
 /** Converts a persisted public payload; API key material is never accepted or returned. */
 export function migratePublicSettings(input: unknown): PublicSettings {
-  const candidate = asRecord(input)
+  const candidate = migrateTranslationSettingsCandidate(asRecord(input))
   if (
     candidate.version === SETTINGS_VERSION ||
+    candidate.version === 12 ||
     candidate.version === 11 ||
     candidate.version === 10 ||
     candidate.version === 9 ||
@@ -682,6 +705,7 @@ export function migratePublicSettings(input: unknown): PublicSettings {
       {
         id: DEFAULT_PROVIDER_ID,
         name: DEFAULT_PROVIDER_NAME,
+        protocol: 'openAiChat',
         baseUrl,
         keyConfigured: candidate.keyConfigured === true,
         models: legacyModel(common.ai)

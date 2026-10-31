@@ -2,7 +2,7 @@ import {
   AI_TEXT_LIMIT,
   AI_PROMPT_LIMIT,
   DEFAULT_LOCALE,
-  DEFAULT_TRANSLATION_PAIR,
+  DEFAULT_TRANSLATION_SETTINGS,
   OUTPUT_LANGUAGE_PLACEHOLDER,
   TARGET_LANGUAGE_PLACEHOLDER,
   TEXT_PLACEHOLDER
@@ -130,7 +130,7 @@ export function buildActionPrompt(
   let targetLanguage: TranslationLanguage | undefined
   let sourceBoundary: SourceBoundary | undefined
   if (action.kind === 'translate') {
-    const pair = options.translate ?? DEFAULT_TRANSLATION_PAIR
+    const pair = options.translate ?? DEFAULT_TRANSLATION_SETTINGS
     sourceLanguage = detectTranslationLanguage(text)
     targetLanguage = options.targetLanguage ?? defaultTranslationTarget(sourceLanguage, pair)
     template = template.replaceAll(

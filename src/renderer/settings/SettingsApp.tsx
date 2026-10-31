@@ -38,6 +38,7 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
   X
@@ -48,21 +49,31 @@ import {
   DEFAULT_OPENAI_BASE_URL,
   DEFAULT_SEARCH_ENGINE_ID,
   MAX_ENABLED_ACTIONS,
+  PROVIDER_PROTOCOLS,
   RESULT_FONT_SIZE_MAX,
   RESULT_FONT_SIZE_MIN,
   THEME_OPTIONS,
+  THINKING_LEVELS,
+  THINKING_LEVEL_LABELS,
   TRANSLATION_LANGUAGES,
   TRANSLATION_LANGUAGE_NAMES,
   actionDefinitionSchema,
+  defaultThinkingLevel,
+  inferThinkingLevels,
+  inferredThinkingCapability,
   isAiActionDefinition,
+  providerProtocolOption,
+  protocolSupportsThinkingOff,
   searchEngineDisplayName,
   type AccessibilityStatus,
   type ActionDefinition,
   type PublicProviderSettings,
   type PublicSettings,
   type ProviderModel,
+  type ProviderProtocol,
   type SettingsGuidance,
   type SupportedLocale,
+  type ThinkingLevel,
   type TranslationLanguage
 } from '../../shared'
 import { ActionIcon } from '../components/ActionIcon'
@@ -200,9 +211,38 @@ function normalizedModels(models: readonly ProviderModel[]): ProviderModel[] {
       id,
       name: model.name.trim() || id,
       thinkingLevels: model.thinkingLevels ?? [],
-      thinkingCapability: model.thinkingCapability
+      thinkingCapability: model.thinkingCapability,
+      thinkingEnabled: model.thinkingEnabled,
+      thinkingDefault: model.thinkingDefault
     }]
   })
+}
+
+function providerProtocol(provider: Pick<PublicProviderSettings, 'protocol'>): ProviderProtocol {
+  return provider.protocol ?? 'openAiChat'
+}
+
+function reseedModelThinking(
+  model: ProviderModel,
+  protocol: ProviderProtocol
+): ProviderModel {
+  if (model.thinkingCapability?.source === 'manual') {
+    return {
+      ...model,
+      thinkingCapability: {
+        ...model.thinkingCapability,
+        supportsOff: protocolSupportsThinkingOff(model.id, protocol)
+      }
+    }
+  }
+  const levels = inferThinkingLevels(model.id, protocol)
+  return {
+    ...model,
+    thinkingEnabled: model.thinkingEnabled ?? true,
+    thinkingLevels: levels,
+    thinkingCapability: inferredThinkingCapability(model.id, protocol) ?? undefined,
+    thinkingDefault: defaultThinkingLevel(levels)
+  }
 }
 
 function usesPlainHttp(value: string): boolean {
@@ -490,6 +530,7 @@ export function SettingsApp(): JSX.Element {
         if (disposed) return
         const normalized = normalizePublicSettings(settings)
         setDraft(normalized)
+        applyTheme(normalized.appearance.theme)
         // Do not preload API keys — fetch only when the user clicks show.
         resetProviderKeyFields()
       })
@@ -510,6 +551,7 @@ export function SettingsApp(): JSX.Element {
       if (!dirtyRef.current && !unsavedChangesRef.current) {
         const normalized = normalizePublicSettings(settings)
         setDraft(normalized)
+        applyTheme(normalized.appearance.theme)
         resetProviderKeyFields()
       }
       runDetached(refreshRuntimeStatus(), {
@@ -542,7 +584,7 @@ export function SettingsApp(): JSX.Element {
   // resetting the draft reverts the attribute through the same effect.
   const draftTheme = draft?.appearance.theme
   useEffect(() => {
-    if (draftTheme) applyTheme(draftTheme)
+    if (draftTheme) applyTheme(draftTheme, false)
   }, [draftTheme])
 
   const enabledActions = useMemo(
@@ -575,6 +617,7 @@ export function SettingsApp(): JSX.Element {
 
     await refreshRuntimeStatus().catch(() => undefined)
 
+    applyTheme(saved.appearance.theme)
     setDraft(normalizePublicSettings(saved))
     setDirty(false)
     dirtyRef.current = false
@@ -718,6 +761,7 @@ export function SettingsApp(): JSX.Element {
       id,
       name: `服务商 ${(draft?.providers.length ?? 0) + 1}`,
       enabled: true,
+      protocol: 'openAiChat',
       baseUrl: DEFAULT_OPENAI_BASE_URL,
       keyConfigured: false,
       models: []
@@ -734,6 +778,22 @@ export function SettingsApp(): JSX.Element {
       providers: current.providers.map((provider) =>
         provider.id === providerId ? updater(provider) : provider
       )
+    }))
+  }
+
+  const changeProviderProtocol = (
+    provider: PublicProviderSettings,
+    next: ProviderProtocol
+  ): void => {
+    const previous = providerProtocol(provider)
+    const currentBase = provider.baseUrl.trim().replace(/\/+$/u, '')
+    const replaceBase =
+      currentBase === '' || currentBase === providerProtocolOption(previous).defaultBaseUrl
+    changeProvider(provider.id, (current) => ({
+      ...current,
+      protocol: next,
+      baseUrl: replaceBase ? providerProtocolOption(next).defaultBaseUrl : current.baseUrl,
+      models: current.models.map((model) => reseedModelThinking(model, next))
     }))
   }
 
@@ -913,10 +973,24 @@ export function SettingsApp(): JSX.Element {
       setBanner({ kind: 'error', text: `模型“${id}”已存在` })
       return
     }
-    changeProvider(provider.id, (current) => ({
-      ...current,
-      models: [...current.models, { id, name: id, thinkingLevels: [] }]
-    }))
+    changeProvider(provider.id, (current) => {
+      const protocol = providerProtocol(current)
+      const levels = inferThinkingLevels(id, protocol)
+      return {
+        ...current,
+        models: [
+          ...current.models,
+          {
+            id,
+            name: id,
+            thinkingLevels: levels,
+            thinkingCapability: inferredThinkingCapability(id, protocol) ?? undefined,
+            thinkingEnabled: true,
+            thinkingDefault: defaultThinkingLevel(levels)
+          }
+        ]
+      }
+    })
     setNewModelInputs((current) => ({ ...current, [provider.id]: '' }))
   }
 
@@ -1287,12 +1361,31 @@ export function SettingsApp(): JSX.Element {
                 </div>
               </header>
               <div className="provider-grid">
+                <label className="field field--wide"><span className="field__label">接口协议</span>
+                  <select
+                    className="control"
+                    aria-label={`${provider.name}：接口协议`}
+                    value={providerProtocol(provider)}
+                    onChange={(event) => changeProviderProtocol(
+                      provider,
+                      event.target.value as ProviderProtocol
+                    )}
+                  >
+                    {PROVIDER_PROTOCOLS.map((option) => (
+                      <option value={option.id} key={option.id}>{option.name}</option>
+                    ))}
+                  </select>
+                  <span className="field__hint">
+                    {providerProtocolOption(providerProtocol(provider)).hint}
+                  </span>
+                </label>
                 <label className="field field--wide"><span className="field__label">API 地址（HTTP / HTTPS）</span>
                   <input className="control" type="url" value={provider.baseUrl} spellCheck={false}
-                    placeholder="https://api.example.com/v1 或 http://localhost:11434/v1"
+                    placeholder={providerProtocolOption(providerProtocol(provider)).defaultBaseUrl}
                     onChange={(event) => changeProvider(provider.id, (current) => ({ ...current, baseUrl: event.target.value }))} />
                   <span className="field__hint">
-                    填写到版本前缀即可，例如 <code>…/v1</code>；不要带 <code>/chat/completions</code>。本地 Ollama 可用 HTTP。
+                    填写到版本前缀即可，例如 <code>…/v1</code>；不要带{' '}
+                    <code>{providerProtocolOption(providerProtocol(provider)).basePath}</code>。本地 Ollama 可用 HTTP。
                   </span>
                   {usesPlainHttp(provider.baseUrl) && <span className="provider-http-warning" role="alert">
                     <CircleAlert size={15} aria-hidden="true" />当前服务使用 HTTP，API Key 将通过网络明文传输。仅在你信任的网络和服务中使用。
@@ -1364,7 +1457,14 @@ export function SettingsApp(): JSX.Element {
                           <SortableModelRow
                             key={model.id}
                             model={model}
+                            protocol={providerProtocol(provider)}
                             dragging={draggingModelId === model.id}
+                            onChange={(next) => changeProvider(provider.id, (current) => ({
+                              ...current,
+                              models: current.models.map((candidate) =>
+                                candidate.id === model.id ? next : candidate
+                              )
+                            }))}
                             onRemove={() => changeDraft((current) =>
                               removeProviderModelFromSettings(current, provider.id, model.id)
                             )}
@@ -1460,21 +1560,21 @@ export function SettingsApp(): JSX.Element {
         </div>
         <div className="settings-card form-grid settings-card--follow">
           <label className="field">
-            <span className="field__label">翻译主要语言</span>
+            <span className="field__label">默认语言</span>
             <select
               className="control"
-              aria-label="翻译主要语言"
-              value={draft.translate.primaryLanguage}
+              aria-label="翻译默认语言"
+              value={draft.translate.defaultLanguage}
               onChange={(event) => {
-                const primaryLanguage = event.target.value as TranslationLanguage
+                const defaultLanguage = event.target.value as TranslationLanguage
                 changeDraft((current) => {
-                  const alternateLanguage =
-                    current.translate.alternateLanguage === primaryLanguage
-                      ? (primaryLanguage === 'zh-CN' ? 'en-US' : 'zh-CN')
-                      : current.translate.alternateLanguage
+                  const targetLanguage =
+                    current.translate.targetLanguage === defaultLanguage
+                      ? (defaultLanguage === 'zh-CN' ? 'en-US' : 'zh-CN')
+                      : current.translate.targetLanguage
                   return {
                     ...current,
-                    translate: { primaryLanguage, alternateLanguage }
+                    translate: { defaultLanguage, targetLanguage }
                   }
                 })
               }}
@@ -1485,21 +1585,21 @@ export function SettingsApp(): JSX.Element {
             </select>
           </label>
           <label className="field">
-            <span className="field__label">翻译另一语言</span>
+            <span className="field__label">翻译成</span>
             <select
               className="control"
-              aria-label="翻译另一语言"
-              value={draft.translate.alternateLanguage}
+              aria-label="翻译目标语言"
+              value={draft.translate.targetLanguage}
               onChange={(event) => {
-                const alternateLanguage = event.target.value as TranslationLanguage
+                const targetLanguage = event.target.value as TranslationLanguage
                 changeDraft((current) => {
-                  const primaryLanguage =
-                    current.translate.primaryLanguage === alternateLanguage
-                      ? (alternateLanguage === 'zh-CN' ? 'en-US' : 'zh-CN')
-                      : current.translate.primaryLanguage
+                  const defaultLanguage =
+                    current.translate.defaultLanguage === targetLanguage
+                      ? (targetLanguage === 'zh-CN' ? 'en-US' : 'zh-CN')
+                      : current.translate.defaultLanguage
                   return {
                     ...current,
-                    translate: { primaryLanguage, alternateLanguage }
+                    translate: { defaultLanguage, targetLanguage }
                   }
                 })
               }}
@@ -1510,9 +1610,9 @@ export function SettingsApp(): JSX.Element {
             </select>
           </label>
           <p className="translation-summary field--wide">
-            默认：检测到 {TRANSLATION_LANGUAGE_NAMES[draft.translate.primaryLanguage]} 时译为{' '}
-            {TRANSLATION_LANGUAGE_NAMES[draft.translate.alternateLanguage]}，反之亦然；
-            其他语种默认译为中文，中文默认译为英语。结果框可切换为日语、韩语、俄语、德语、法语等。
+            默认：检测到 {TRANSLATION_LANGUAGE_NAMES[draft.translate.targetLanguage]} 时译为{' '}
+            {TRANSLATION_LANGUAGE_NAMES[draft.translate.defaultLanguage]}，其他语种译为{' '}
+            {TRANSLATION_LANGUAGE_NAMES[draft.translate.targetLanguage]}。结果框可临时切换目标语言。
           </p>
         </div>
       </section>
@@ -1966,9 +2066,11 @@ function ActionZone({ title, count, actions, enabled, draggingId, onEdit, onDele
 }
 
 
-function SortableModelRow({ model, dragging, onRemove }: {
+function SortableModelRow({ model, protocol, dragging, onChange, onRemove }: {
   model: ProviderModel
+  protocol: ProviderProtocol
   dragging: boolean
+  onChange: (model: ProviderModel) => void
   onRemove: () => void
 }): JSX.Element {
   const {
@@ -1980,11 +2082,53 @@ function SortableModelRow({ model, dragging, onRemove }: {
     transform,
     transition
   } = useSortable({ id: model.id })
+  const [expanded, setExpanded] = useState(false)
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition
   }
   const showId = model.name !== model.id
+  const levels = model.thinkingLevels ?? []
+  const thinkingEnabled = model.thinkingEnabled !== false
+  const supportsOff =
+    model.thinkingCapability?.supportsOff ?? protocolSupportsThinkingOff(model.id, protocol)
+  const defaultLevel = model.thinkingDefault ?? defaultThinkingLevel(levels)
+  const openAiDialect = protocol === 'openAiChat' || protocol === 'openAiResponses'
+
+  const setLevels = (nextLevels: ThinkingLevel[]): void => {
+    const capability = {
+      source: 'manual' as const,
+      dialect: model.thinkingCapability?.dialect
+        ?? (openAiDialect ? ('reasoningEffort' as const) : null),
+      supportsOff
+    }
+    onChange({
+      ...model,
+      thinkingLevels: nextLevels,
+      thinkingCapability: nextLevels.length > 0 ? capability : undefined,
+      thinkingDefault:
+        model.thinkingDefault && nextLevels.includes(model.thinkingDefault)
+          ? model.thinkingDefault
+          : defaultThinkingLevel(nextLevels)
+    })
+  }
+
+  const autoDetect = (): void => {
+    const nextLevels = inferThinkingLevels(model.id, protocol)
+    onChange({
+      ...model,
+      thinkingEnabled: true,
+      thinkingLevels: nextLevels,
+      thinkingCapability: inferredThinkingCapability(model.id, protocol) ?? undefined,
+      thinkingDefault: defaultThinkingLevel(nextLevels)
+    })
+  }
+
+  const summary = !thinkingEnabled
+    ? supportsOff ? '不启用思考' : '最低档思考'
+    : levels.length === 0
+      ? '未识别思考档位'
+      : `默认 ${THINKING_LEVEL_LABELS[defaultLevel ?? levels[0] ?? 'medium']} · ${levels.map((level) => THINKING_LEVEL_LABELS[level]).join('/')}`
 
   return (
     <div
@@ -2008,7 +2152,18 @@ function SortableModelRow({ model, dragging, onRemove }: {
       <div className="model-row__body">
         <span className="model-row__name">{model.name}</span>
         {showId && <span className="model-row__id">{model.id}</span>}
+        <span className="model-row__thinking-summary">{summary}</span>
       </div>
+      <button
+        type="button"
+        className="model-row__settings"
+        aria-label={`${model.name}：思考设置`}
+        aria-expanded={expanded}
+        title="思考设置"
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <SlidersHorizontal size={13} />
+      </button>
       <button
         type="button"
         className="model-row__remove"
@@ -2017,6 +2172,61 @@ function SortableModelRow({ model, dragging, onRemove }: {
       >
         <X size={12} />
       </button>
+      {expanded && (
+        <div className="model-row__thinking-panel">
+          <label className="model-thinking-toggle">
+            <input
+              type="checkbox"
+              role="switch"
+              checked={thinkingEnabled}
+              onChange={(event) => onChange({ ...model, thinkingEnabled: event.target.checked })}
+            />
+            启用思考
+          </label>
+          <label className="model-thinking-default">
+            默认强度
+            <select
+              className="control compact-control"
+              value={defaultLevel ?? ''}
+              disabled={!thinkingEnabled || levels.length === 0}
+              onChange={(event) => onChange({
+                ...model,
+                thinkingDefault: event.target.value as ThinkingLevel
+              })}
+            >
+              {levels.map((level) => (
+                <option value={level} key={level}>{THINKING_LEVEL_LABELS[level]}</option>
+              ))}
+            </select>
+          </label>
+          <div className="thinking-level-chips" role="group" aria-label="可用思考档位">
+            {THINKING_LEVELS.map((level) => (
+              <label className="thinking-chip" key={level}>
+                <input
+                  type="checkbox"
+                  checked={levels.includes(level)}
+                  onChange={() => setLevels(
+                    THINKING_LEVELS.filter((candidate) =>
+                      candidate === level
+                        ? !levels.includes(level)
+                        : levels.includes(candidate)
+                    )
+                  )}
+                />
+                {THINKING_LEVEL_LABELS[level]}
+              </label>
+            ))}
+          </div>
+          <div className="model-thinking-actions">
+            <button className="button button--quiet" type="button" onClick={autoDetect}>
+              <RefreshCw size={12} />重新自动识别
+            </button>
+            {!supportsOff && (
+              <span className="model-thinking-hint">该模型无法完全关闭思考，关闭时使用最低预算。</span>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

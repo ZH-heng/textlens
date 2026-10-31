@@ -89,9 +89,9 @@ Rules:
     expect(prompt.userPrompt).not.toContain(TARGET_LANGUAGE_PLACEHOLDER)
   })
 
-  it('keeps bidirectional translation correct when the configured pair is reversed', () => {
+  it('keeps bidirectional translation correct when the configured languages are reversed', () => {
     const prompt = buildActionPrompt(action('translate'), '这是测试。', {
-      translate: { primaryLanguage: 'en-US', alternateLanguage: 'zh-CN' }
+      translate: { defaultLanguage: 'zh-CN', targetLanguage: 'en-US' }
     })
     expect(prompt.sourceLanguage).toBe('zh-CN')
     expect(prompt.targetLanguage).toBe('en-US')

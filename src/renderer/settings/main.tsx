@@ -5,9 +5,11 @@ import '../styles.css'
 import '../themes.css'
 import './settings.css'
 import { installTauriBridge } from '../lib/tauriBridge'
+import { applyTheme, storedTheme } from '../lib/theme'
 import { SettingsApp } from './SettingsApp'
 
 installTauriBridge()
+applyTheme(storedTheme())
 
 const root = document.getElementById('root')
 

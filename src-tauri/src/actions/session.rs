@@ -82,15 +82,13 @@ pub(super) struct RequestStreamState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct DeadlineGeneration(u64);
 
-impl DeadlineGeneration {
-    fn checked_next(self) -> Option<Self> {
-        (self.0 < MAX_WIRE_COUNTER).then(|| Self(self.0 + 1))
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TimerDirective {
     None,
+    // Reserved for the coalesced-delta protocol. Streaming currently emits
+    // every delta immediately (see the module header), so nothing constructs
+    // this yet; the flush machinery stays for a future batching mode.
+    #[allow(dead_code)]
     Schedule {
         deadline: tokio::time::Instant,
         generation: DeadlineGeneration,
@@ -102,6 +100,9 @@ pub(super) enum TimerDirective {
 pub(super) enum DeltaTransition {
     Ignored,
     Stale,
+    // Reserved alongside TimerDirective::Schedule; matched defensively by the
+    // submit paths but not produced while deltas are emitted immediately.
+    #[allow(dead_code)]
     Buffered {
         deadline: tokio::time::Instant,
         generation: DeadlineGeneration,
@@ -1891,7 +1892,7 @@ mod tests {
             table.begin_ready("missing", "result/missing"),
             Err(SessionError::Ended)
         );
-        assert!(table.entries.get("missing").is_none());
+        assert!(!table.entries.contains_key("missing"));
         let (mut table, ticket) = running_table("s");
         table
             .accept_delta(&ticket, "A".into(), tokio::time::Instant::now())

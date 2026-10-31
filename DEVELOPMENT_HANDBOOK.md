@@ -506,7 +506,7 @@ Windows 适配没有另起一套设置文件。现有 macOS 服务商、模型�
 | 搜索地址 | 自定义包含 `{{text}}` 的 URL 模板 | Windows 搜索后来改为异步 Shell 打开，URL/域名/IP 可直接访问 |
 | 应用过滤 | 全部、白名单、黑名单 | Windows 按可执行文件名匹配，macOS 按应用名或 Bundle ID 匹配 |
 | 服务商与模型 | 多个 OpenAI-compatible 服务、同步或手动添加模型 | API Key 继续单独加密，不通过公开 settings IPC 返回 |
-| 翻译语言 | 主要语言与另一语言自动互译 | 结果标题栏可以临时切换目标语言并重新生成 |
+| 翻译语言 | 默认语言与翻译目标可配置，其余语种译为翻译目标 | 结果标题栏可以临时切换目标语言并重新生成 |
 | 结果窗口 | 跟随鼠标、记住尺寸、默认置顶、字体、透明度和关闭方式 | Windows 原生窗口在 prepare/commit 后应用这些设置 |
 | 工具栏动作 | 启用、停用、拖拽排序、自定义提示词和模型 | 动作与 renderer 在两平台共享，不为 Windows 分叉 |
 
@@ -871,7 +871,7 @@ Windows 安装包使用 current-user 模式，不要求管理员权限；禁止�
 - **服务商启停：** `ProviderConfig.enabled`（默认 true）；设置页可禁用服务商；禁用后不出现在动作模型绑定与结果窗换模列表，已绑定该服务商的动作仍可运行。
 - **动作模型选择：** 编辑动作时由「服务商 + 模型」双列表改为按服务商分组的统一 optgroup 列表（与结果窗一致）；过滤未启用服务商。
 - **思考档位：** 按模型名自动推断可用思考强度（`inferThinkingLevels` / `effectiveThinkingLevels`），支持「关闭思考」；无思考能力的模型不展示档位。
-- **多语言翻译：** 目标语言扩展为简体中文 / English / 日本語 / 한국어 / Русский / Deutsch / Français；结果标题栏以 CN/EN/JA/KO/RU/DE/FR 短码切换；`detectTranslationLanguage` 与 `defaultTranslationTarget` 双端对齐——匹配设置语言对则翻转，中文默认译英，其他语种默认译中。
+- **多语言翻译：** 目标语言扩展为简体中文 / English / 日本語 / 한국어 / Русский / Deutsch / Français；结果标题栏以 CN/EN/JA/KO/RU/DE/FR 短码切换；设置提供「默认语言 / 翻译成」，检测到翻译目标时反向译为默认语言，其余语种译为翻译目标。`detectTranslationLanguage` 与 `defaultTranslationTarget` 双端对齐，源语言按字符占比判定（假名 10%，汉字/谚文/西里尔 30%），避免单个外文字符劫持整段。
 - **提示词：** 翻译提示词强化多语言专业翻译；解释提示词改为整体解释、仅展开重要术语；未改动的内置默认文案在加载时迁移，自定义提示词保留。
 - **版本与源码包：** `package.json`、`Cargo.toml`、`tauri.conf.json`、Windows conf、README 与开发记录统一为 0.3.55；`pnpm export:dev-source` 导出可迁移源码包。
 - 产品版本升至 0.3.55。

@@ -83,8 +83,8 @@ export function removeProviderModelFromSettings(
 export function buildSettingsUpdate(settings: PublicSettings):
   | { valid: true; value: SettingsUpdate }
   | { valid: false; message: string } {
-  if (settings.translate.primaryLanguage === settings.translate.alternateLanguage) {
-    return { valid: false, message: '主要语言和另一语言不能相同' }
+  if (settings.translate.defaultLanguage === settings.translate.targetLanguage) {
+    return { valid: false, message: '默认语言和翻译语言不能相同' }
   }
 
   const captureShortcut = settings.captureShortcut.trim()
@@ -164,7 +164,9 @@ export function buildSettingsUpdate(settings: PublicSettings):
         id: model.id.trim(),
         name: model.name.trim(),
         thinkingLevels: model.thinkingLevels ?? [],
-        thinkingCapability: model.thinkingCapability
+        thinkingCapability: model.thinkingCapability,
+        thinkingEnabled: model.thinkingEnabled,
+        thinkingDefault: model.thinkingDefault
       }))
     })),
     actions
@@ -182,7 +184,9 @@ export function buildSettingsUpdate(settings: PublicSettings):
         id: model.id.trim(),
         name: model.name.trim(),
         thinkingLevels: model.thinkingLevels ?? [],
-        thinkingCapability: model.thinkingCapability
+        thinkingCapability: model.thinkingCapability,
+        thinkingEnabled: model.thinkingEnabled,
+        thinkingDefault: model.thinkingDefault
       }))
     }))
   })

@@ -10,6 +10,7 @@ import {
   MAX_ENABLED_ACTIONS,
   MAX_PROVIDERS,
   MAX_PROVIDER_MODELS,
+  PROVIDER_PROTOCOL_IDS,
   RESULT_FONT_SIZE_MAX,
   RESULT_FONT_SIZE_MIN,
   SETTINGS_VERSION,
@@ -390,12 +391,12 @@ export const actionsSchema = z
 
 export const translationSettingsSchema = z
   .object({
-    primaryLanguage: translationLanguageSchema,
-    alternateLanguage: translationLanguageSchema
+    defaultLanguage: translationLanguageSchema,
+    targetLanguage: translationLanguageSchema
   })
   .strict()
-  .refine((value) => value.primaryLanguage !== value.alternateLanguage, {
-    message: '翻译语言必须不同'
+  .refine((value) => value.defaultLanguage !== value.targetLanguage, {
+    message: '默认语言和翻译语言不能相同'
   })
 export type TranslationSettings = z.infer<typeof translationSettingsSchema>
 
@@ -404,10 +405,14 @@ export const providerModelSchema = z
     id: z.string().trim().min(1).max(256),
     name: z.string().trim().min(1).max(256),
     thinkingLevels: z.array(thinkingLevelSchema).max(THINKING_LEVELS.length).default([]),
-    thinkingCapability: thinkingCapabilitySchema.optional()
+    thinkingCapability: thinkingCapabilitySchema.optional(),
+    thinkingEnabled: z.boolean().optional(),
+    thinkingDefault: thinkingLevelSchema.nullable().optional()
   })
   .strict()
 export type ProviderModel = z.infer<typeof providerModelSchema>
+
+export const providerProtocolSchema = z.enum(PROVIDER_PROTOCOL_IDS)
 
 const providerMetadataShape = {
   id: z
@@ -419,6 +424,7 @@ const providerMetadataShape = {
   name: z.string().trim().min(1).max(80),
   /** When false, hidden from action model pickers and the result model switcher. */
   enabled: z.boolean().default(true),
+  protocol: providerProtocolSchema.optional(),
   baseUrl: z
     .string()
     .trim()
@@ -655,13 +661,18 @@ export const settingsUpdateSchema = z
 export type SettingsUpdate = z.infer<typeof settingsUpdateSchema>
 
 export const providerCreateInputSchema = z
-  .object({ name: z.string().trim().min(1).max(80), baseUrl: providerMetadataShape.baseUrl })
+  .object({
+    name: z.string().trim().min(1).max(80),
+    protocol: providerProtocolSchema.optional(),
+    baseUrl: providerMetadataShape.baseUrl
+  })
   .strict()
 export type ProviderCreateInput = z.infer<typeof providerCreateInputSchema>
 
 export const providerUpdateInputSchema = z
   .object({
     name: z.string().trim().min(1).max(80).optional(),
+    protocol: providerProtocolSchema.optional(),
     baseUrl: providerMetadataShape.baseUrl.optional(),
     models: z.array(providerModelSchema).max(MAX_PROVIDER_MODELS).optional()
   })

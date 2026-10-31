@@ -50,38 +50,59 @@ export function isTranslationLanguage(value: string): value is TranslationLangua
   return (TRANSLATION_LANGUAGES as readonly string[]).includes(value)
 }
 
+const HAN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u
+const KANA = /[\u3040-\u309f\u30a0-\u30ff]/u
+const HANGUL = /[\uac00-\ud7af\u1100-\u11ff]/u
+const CYRILLIC = /[\u0400-\u04ff]/u
+const LETTER = /\p{Alphabetic}/u
+
 /**
- * Detect the likely source language of selected text.
- * Chinese (Han) wins over shared CJK punctuation; Japanese needs kana;
- * Korean hangul; Cyrillic → Russian; otherwise Latin/other → English.
+ * Detect the likely source language of selected text by script share.
+ *
+ * A single foreign character must not hijack a whole paragraph, so each
+ * script has to own a meaningful share of the letters. Kana uses a lower
+ * threshold because Japanese prose mixes it with a large Han share.
+ * Mirrors `detect_translation_language` in `src-tauri/src/actions.rs`.
  */
 export function detectTranslationLanguage(text: string): TranslationLanguage {
-  const hasHan = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u.test(text)
-  const hasKana = /[\u3040-\u309f\u30a0-\u30ff]/u.test(text)
-  if (hasKana) return 'ja-JP'
-  if (/[\uac00-\ud7af\u1100-\u11ff]/u.test(text)) return 'ko-KR'
-  if (hasHan) return 'zh-CN'
-  if (/[\u0400-\u04ff]/u.test(text)) return 'ru-RU'
+  let han = 0
+  let kana = 0
+  let hangul = 0
+  let cyrillic = 0
+  let other = 0
+  for (const character of text) {
+    if (HAN.test(character)) han += 1
+    else if (KANA.test(character)) kana += 1
+    else if (HANGUL.test(character)) hangul += 1
+    else if (CYRILLIC.test(character)) cyrillic += 1
+    else if (LETTER.test(character)) other += 1
+  }
+  const total = han + kana + hangul + cyrillic + other
+  if (total === 0) return 'en-US'
+  if (kana * 10 >= total) return 'ja-JP'
+  if (hangul * 10 >= total * 3) return 'ko-KR'
+  if (han * 10 >= total * 3) return 'zh-CN'
+  if (cyrillic * 10 >= total * 3) return 'ru-RU'
   return 'en-US'
 }
 
-export interface TranslationPair {
-  primaryLanguage: TranslationLanguage
-  alternateLanguage: TranslationLanguage
+export interface TranslationLanguageSettings {
+  defaultLanguage: TranslationLanguage
+  targetLanguage: TranslationLanguage
 }
 
 /**
- * Resolve default translation target:
- * - If source matches the configured pair, flip to the other side.
- * - Otherwise: Chinese → English, any other language → Chinese.
+ * Resolve the default target: translate into `targetLanguage`, except when
+ * the text already is in it, in which case `defaultLanguage` is the reverse
+ * direction. Mirrors `default_translation_target` in the Rust executor.
  */
 export function defaultTranslationTarget(
   source: TranslationLanguage,
-  pair: TranslationPair
+  settings: TranslationLanguageSettings
 ): TranslationLanguage {
-  if (source === pair.primaryLanguage) return pair.alternateLanguage
-  if (source === pair.alternateLanguage) return pair.primaryLanguage
-  return source === 'zh-CN' ? 'en-US' : 'zh-CN'
+  return source === settings.targetLanguage
+    ? settings.defaultLanguage
+    : settings.targetLanguage
 }
 
 export function translationTargetEnglishName(locale: TranslationLanguage): string {

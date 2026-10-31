@@ -9,12 +9,16 @@ import {
   THINKING_LEVEL_LABELS,
   aiActionKindSchema,
   clampThinkingMode,
+  defaultThinkingLevel,
   effectiveThinkingLevels,
   modelSupportsThinkingOff,
+  protocolSupportsThinkingOff,
   type ActionDefinition,
   type ActionKind,
+  type ProviderProtocol,
   type PublicProviderSettings,
   type SearchEngineId,
+  type ThinkingLevel,
   type ThinkingMode
 } from '../../shared'
 import { isLucideIconName } from '../components/lucideIconRegistry'
@@ -33,6 +37,15 @@ const ACTION_KIND_NAMES: Readonly<Record<ActionKind, string>> = {
 
 function isAiKind(kind: ActionKind): boolean {
   return aiActionKindSchema.safeParse(kind).success
+}
+
+function resolveThinkingMode(choice: ModelChoice | null, mode: ThinkingMode): ThinkingMode {
+  if (!choice || !choice.thinkingEnabled) return 'off'
+  const clamped = clampThinkingMode(mode, choice.thinkingLevels)
+  if (clamped !== 'off' || choice.supportsOff) return clamped
+  // The model cannot disable thinking; fall back to its default gear instead
+  // of leaving the request on an unavailable option.
+  return choice.thinkingDefault ?? choice.thinkingLevels[0] ?? 'off'
 }
 
 function defaultPrompt(kind: ActionKind): string {
@@ -102,7 +115,11 @@ interface ModelChoice extends ModelRoute {
   value: string
   providerName: string
   modelName: string
+  protocol: ProviderProtocol
   thinkingLevels: ReturnType<typeof effectiveThinkingLevels>
+  thinkingEnabled: boolean
+  thinkingDefault: ThinkingLevel | null
+  supportsOff: boolean
 }
 
 export function CustomActionDialog({
@@ -141,19 +158,35 @@ export function CustomActionDialog({
   const modelGroups = useMemo(() => {
     return enabledProviders
       .filter((provider) => provider.models.length > 0)
-      .map((provider) => ({
-        id: provider.id,
-        name: provider.name,
-        keyConfigured: provider.keyConfigured,
-        choices: provider.models.map<ModelChoice>((model) => ({
-          providerId: provider.id,
-          modelId: model.id,
-          providerName: provider.name,
-          modelName: model.name,
-          thinkingLevels: effectiveThinkingLevels(model.id, model.thinkingLevels),
-          value: modelRouteValue({ providerId: provider.id, modelId: model.id })
-        }))
-      }))
+      .map((provider) => {
+        const protocol = provider.protocol ?? 'openAiChat'
+        return {
+          id: provider.id,
+          name: provider.name,
+          keyConfigured: provider.keyConfigured,
+          choices: provider.models.map<ModelChoice>((model) => {
+            const thinkingLevels = effectiveThinkingLevels(
+              model.id,
+              model.thinkingLevels,
+              protocol
+            )
+            return {
+              providerId: provider.id,
+              modelId: model.id,
+              providerName: provider.name,
+              modelName: model.name,
+              protocol,
+              thinkingLevels,
+              thinkingEnabled: model.thinkingEnabled !== false,
+              thinkingDefault: model.thinkingDefault ?? defaultThinkingLevel(thinkingLevels),
+              supportsOff:
+                model.thinkingCapability?.supportsOff
+                ?? protocolSupportsThinkingOff(model.id, protocol),
+              value: modelRouteValue({ providerId: provider.id, modelId: model.id })
+            }
+          })
+        }
+      })
   }, [enabledProviders])
 
   const modelChoices = useMemo(
@@ -172,8 +205,14 @@ export function CustomActionDialog({
     ? modelRouteValue({ providerId, modelId })
     : ''
 
-  const thinkingLevels = selectedChoice?.thinkingLevels ?? []
-  const showThinkingOff = modelSupportsThinkingOff(thinkingLevels)
+  const thinkingLevels = selectedChoice?.thinkingEnabled ? selectedChoice.thinkingLevels : []
+  const showThinkingOff = modelSupportsThinkingOff(
+    thinkingLevels,
+    selectedChoice?.supportsOff ?? true
+  )
+  const showThinkingAuto = Boolean(
+    selectedChoice?.thinkingEnabled && selectedChoice.thinkingDefault && thinkingLevels.length > 0
+  )
 
   useEffect(() => {
     nameRef.current?.focus()
@@ -220,7 +259,7 @@ export function CustomActionDialog({
         prompt: cleanPrompt,
         providerId,
         modelId,
-        thinkingMode: clampThinkingMode(thinkingMode, thinkingLevels)
+        thinkingMode: resolveThinkingMode(selectedChoice, thinkingMode)
       })
       return
     }
@@ -263,9 +302,7 @@ export function CustomActionDialog({
     )
     setProviderId(route.providerId)
     setModelId(route.modelId)
-    setThinkingMode((current) =>
-      clampThinkingMode(current, choice?.thinkingLevels ?? [])
-    )
+    setThinkingMode((current) => resolveThinkingMode(choice ?? null, current))
   }
 
   return (
@@ -386,9 +423,14 @@ export function CustomActionDialog({
                   <select
                     className="control"
                     aria-label="思考强度"
-                    value={thinkingMode}
+                    value={resolveThinkingMode(selectedChoice, thinkingMode)}
                     onChange={(event) => setThinkingMode(event.target.value as ThinkingMode)}
                   >
+                    {showThinkingAuto && (
+                      <option value="auto">
+                        跟随模型默认（{THINKING_LEVEL_LABELS[selectedChoice?.thinkingDefault ?? 'medium']}）
+                      </option>
+                    )}
                     {showThinkingOff && (
                       <option value="off">关闭思考（更快首字）</option>
                     )}
@@ -399,7 +441,7 @@ export function CustomActionDialog({
                     ))}
                   </select>
                   <span className="field__hint">
-                    已根据模型 ID 自动识别思考能力；关闭思考可缩短首字延迟。
+                    档位来自服务商的模型列表，也可在「服务商」里为单个模型手动调整或关闭思考。
                   </span>
                 </label>
               )}

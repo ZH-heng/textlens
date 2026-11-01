@@ -36,9 +36,9 @@ use crate::{
         WindowSize as SettingsWindowSize,
     },
     selection::{
-        SelectionDirection, SelectionEvent, SelectionEventReceiver, SelectionMethod,
-        SelectionMonitor, SelectionMouse, SelectionPayload, SelectionPoint, SelectionTrigger,
-        SourceApplication,
+        SelectionBounds, SelectionDirection, SelectionEvent, SelectionEventReceiver,
+        SelectionMethod, SelectionMonitor, SelectionMouse, SelectionPayload, SelectionPoint,
+        SelectionTrigger, SourceApplication,
     },
     settings::SettingsError,
     settings::SettingsRepository,
@@ -241,55 +241,97 @@ fn dismiss_hide_plan(cleared_id: Option<String>, scoped_hide_succeeded: bool) ->
     }
 }
 
-/// After copy/dismiss, the host app may still report the same selected text on the
-/// following mouse-up (micro-drag ≥ 4px, or AX lag). Presenting that again makes the
-/// toolbar jump to the click and requires a second outside click. Suppress same-text
-/// auto-presentation for a short window.
-const SAME_TEXT_SELECTION_SUPPRESS_MS: u64 = 2_000;
+/// How far apart a drag's endpoints must be to read as "the user selected this
+/// again" instead of the few pixels of drift a plain click always picks up.
+const RESELECT_MIN_REACH_PX: f64 = 12.0;
+
+/// Two reads of the same range differ by sub-pixel rounding, not by intent.
+const SELECTION_BOUNDS_MATCH_TOLERANCE_PX: f64 = 2.0;
+
+/// The selection whose toolbar we last presented. A host app keeps reporting
+/// the same selected text after an action finishes, so every later click that
+/// drifts a few pixels re-captures it and the toolbar jumps back to the cursor.
+/// That is what this identity exists to reject; a timer cannot tell the two
+/// gestures apart, the range and the drag can.
+#[derive(Debug, Clone, PartialEq)]
+struct PresentedSelection {
+    source: String,
+    text: String,
+    bounds: Option<SelectionBounds>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionBoundsMatch {
+    Same,
+    Different,
+    /// The provider exposes no range geometry, so position carries no evidence.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionPresentation {
+    Present,
+    AlreadyPresented,
+}
+
+fn selection_bounds_match(
+    presented: Option<SelectionBounds>,
+    current: Option<SelectionBounds>,
+) -> SelectionBoundsMatch {
+    let (Some(presented), Some(current)) = (presented, current) else {
+        return SelectionBoundsMatch::Unknown;
+    };
+    let tolerance = SELECTION_BOUNDS_MATCH_TOLERANCE_PX;
+    let matches = (presented.x - current.x).abs() <= tolerance
+        && (presented.y - current.y).abs() <= tolerance
+        && (presented.width - current.width).abs() <= tolerance
+        && (presented.height - current.height).abs() <= tolerance;
+    if matches {
+        SelectionBoundsMatch::Same
+    } else {
+        SelectionBoundsMatch::Different
+    }
+}
+
+/// Distance actually travelled by the drag. A capture that reports no endpoints
+/// is treated as no travel at all, which is the honest reading of a click.
+fn selection_gesture_reach(mouse: &SelectionMouse) -> f64 {
+    let start = mouse.start.unwrap_or(mouse.current);
+    let end = mouse.end.unwrap_or(mouse.current);
+    ((end.x - start.x).powi(2) + (end.y - start.y).powi(2)).sqrt()
+}
+
+fn judge_selection_presentation(
+    presented: Option<&PresentedSelection>,
+    selection: &SelectionPayload,
+) -> SelectionPresentation {
+    let Some(presented) = presented else {
+        return SelectionPresentation::Present;
+    };
+    if presented.source != selection.source_app.bundle_id || presented.text != selection.text {
+        return SelectionPresentation::Present;
+    }
+    if selection.trigger == SelectionTrigger::Manual {
+        // The user invoked the shortcut; they asked for this selection again.
+        return SelectionPresentation::Present;
+    }
+    match selection_bounds_match(presented.bounds, selection.bounds) {
+        SelectionBoundsMatch::Different => SelectionPresentation::Present,
+        SelectionBoundsMatch::Same | SelectionBoundsMatch::Unknown => match selection.trigger {
+            SelectionTrigger::Drag
+                if selection_gesture_reach(&selection.mouse) >= RESELECT_MIN_REACH_PX =>
+            {
+                SelectionPresentation::Present
+            }
+            _ => SelectionPresentation::AlreadyPresented,
+        },
+    }
+}
 
 /// Delay before collapsing the host highlight after a result closes. A synchronous
 /// AX/UIA clear on the same gesture that blurs the result races the next drag and
 /// can drop the capture (no toolbar). Cancel if a new selection is accepted first.
 const HOST_SELECTION_CLEAR_DELAY_MS: u64 = 200;
-
-#[derive(Debug, Clone)]
-struct SameTextSelectionSuppress {
-    text: String,
-    until: Instant,
-}
-
-fn should_suppress_same_text_selection(
-    suppression: Option<&SameTextSelectionSuppress>,
-    selection_text: &str,
-    now: Instant,
-) -> bool {
-    suppression.is_some_and(|guard| now < guard.until && guard.text == selection_text)
-}
-
-fn same_text_selection_suppress(
-    text: impl Into<String>,
-    now: Instant,
-) -> SameTextSelectionSuppress {
-    SameTextSelectionSuppress {
-        text: text.into(),
-        until: now + Duration::from_millis(SAME_TEXT_SELECTION_SUPPRESS_MS),
-    }
-}
-
-/// After the deferred host clear runs, drop a matching same-text suppress so an
-/// intentional re-select of the same phrase can show the toolbar. Keep a non-
-/// matching suppress (e.g. a newer copy-arm for different text) intact.
-fn release_same_text_suppress_after_host_clear(
-    suppression: &mut Option<SameTextSelectionSuppress>,
-    cleared_text: &str,
-) {
-    if suppression
-        .as_ref()
-        .is_some_and(|guard| guard.text == cleared_text)
-    {
-        *suppression = None;
-    }
-}
 
 /// Token match check for deferred host clear. A cancelled / superseded clear
 /// holds a stale scheduled token and must be a no-op.
@@ -531,9 +573,9 @@ pub struct RuntimeState {
     selection_monitor: Mutex<SelectionMonitor>,
     current_selection: Mutex<Option<CurrentSelection>>,
     consuming_selection_ids: Mutex<HashSet<String>>,
-    /// Blocks re-presenting the same text shortly after copy/dismiss (see
-    /// `should_suppress_same_text_selection`).
-    same_text_selection_suppress: Mutex<Option<SameTextSelectionSuppress>>,
+    /// The last selection whose toolbar we presented, for
+    /// `judge_selection_presentation`.
+    presented_selection: Mutex<Option<PresentedSelection>>,
     /// Generation token for deferred host selection clear after result close.
     /// Bumped on cancel or when a newer clear is scheduled so in-flight tasks no-op.
     pending_host_clear_token: AtomicU64,
@@ -577,7 +619,7 @@ impl RuntimeState {
             selection_monitor: Mutex::new(monitor),
             current_selection: Mutex::new(None),
             consuming_selection_ids: Mutex::new(HashSet::new()),
-            same_text_selection_suppress: Mutex::new(None),
+            presented_selection: Mutex::new(None),
             pending_host_clear_token: AtomicU64::new(0),
             host_clear_in_flight: AtomicBool::new(false),
             close_results_pending: Mutex::new(None),
@@ -599,23 +641,15 @@ impl RuntimeState {
         }
     }
 
-    fn arm_same_text_selection_suppress(&self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        *self.same_text_selection_suppress.lock() = Some(same_text_selection_suppress(
-            text.to_owned(),
-            Instant::now(),
-        ));
-    }
-
-    /// Release same-text suppress after deferred host clear so re-selecting the
-    /// original phrase is not blocked for the full 2s echo window.
-    fn release_same_text_selection_suppress_for(&self, text: &str) {
-        release_same_text_suppress_after_host_clear(
-            &mut self.same_text_selection_suppress.lock(),
-            text,
-        );
+    /// Remember the selection we are about to present, so a later capture that
+    /// reads back the same range is recognized as the still-live selection
+    /// rather than a new one.
+    fn record_presented_selection(&self, selection: &SelectionPayload) {
+        *self.presented_selection.lock() = Some(PresentedSelection {
+            source: selection.source_app.bundle_id.clone(),
+            text: selection.text.clone(),
+            bounds: selection.bounds,
+        });
     }
 
     /// Bump the deferred-clear generation so any in-flight host clear is a no-op.
@@ -661,14 +695,6 @@ impl RuntimeState {
                     );
                     let state = clear_app.state::<RuntimeState>();
                     state.host_clear_in_flight.store(false, Ordering::Release);
-                    // Dismiss mouse-up echo is past; allow intentional same-text
-                    // reselect only if this clear was not superseded meanwhile.
-                    if should_fire_pending_host_clear(
-                        token,
-                        state.pending_host_clear_token.load(Ordering::Acquire),
-                    ) {
-                        state.release_same_text_selection_suppress_for(&clear_text);
-                    }
                 });
             if spawned.is_err() {
                 state.host_clear_in_flight.store(false, Ordering::Release);
@@ -708,7 +734,7 @@ impl RuntimeState {
                 if dismiss.reason == "mouseDown" && self.windows.point_inside_toolbar(app, point) {
                     return;
                 }
-                let (selection_id, dismissed_text) = {
+                let selection_id = {
                     let mut current = self.current_selection.lock();
                     if current.as_ref().is_some_and(|selection| {
                         dismiss_precedes_selection(
@@ -720,17 +746,12 @@ impl RuntimeState {
                     }) {
                         return;
                     }
-                    match current.take() {
-                        Some(selection) => (Some(selection.id), Some(selection.payload.text)),
-                        None => (None, None),
-                    }
+                    current.take().map(|selection| selection.id)
                 };
 
-                // Prevent the same still-selected text from re-presenting the toolbar
-                // on the mouse-up that often follows this dismiss (micro-drag / AX lag).
-                if let Some(text) = dismissed_text.as_deref() {
-                    self.arm_same_text_selection_suppress(text);
-                }
+                // Hiding the toolbar is enough to stop a repeat presentation: the
+                // identity recorded when the selection was presented keeps rejecting
+                // re-reads of the same range, so nothing has to be armed here.
 
                 // Hide off the selection event thread. The native callback still
                 // checks the expected id, so a newer selection cannot be hidden
@@ -834,15 +855,12 @@ impl RuntimeState {
         if !should_present_selection_for_trigger(force_capture, settings.trigger.mode) {
             return;
         }
-        // After copy/dismiss, ignore automatic re-captures of the same text so the
-        // toolbar does not jump to the click and demand a second outside click.
-        // Shortcut force_capture still presents intentionally re-invoked captures.
+        // A capture that reads back the range we already presented is the host
+        // app still reporting the live selection, not the user selecting again.
+        // Presenting it makes the toolbar jump to the cursor.
         if !force_capture
-            && should_suppress_same_text_selection(
-                self.same_text_selection_suppress.lock().as_ref(),
-                &selection.text,
-                Instant::now(),
-            )
+            && judge_selection_presentation(self.presented_selection.lock().as_ref(), &selection)
+                == SelectionPresentation::AlreadyPresented
         {
             return;
         }
@@ -855,8 +873,10 @@ impl RuntimeState {
             return;
         }
 
-        // Selection accepted for toolbar presentation: do not collapse the host
-        // highlight that the user is actively dragging / has just captured.
+        // Selection accepted for toolbar presentation: remember its identity for
+        // the repeat check above, and do not collapse the host highlight that the
+        // user is actively dragging / has just captured.
+        self.record_presented_selection(&selection);
         self.cancel_pending_host_selection_clear();
         let runtime_started = Instant::now();
 
@@ -1605,14 +1625,12 @@ impl RuntimeState {
         self.result_reveals.lock().remove(session_id);
         self.actions.clear_session(session_id);
         // Closing a translate/explain/etc. window often coincides with an
-        // outside click. Suppress re-presenting the original selection text so
-        // the toolbar does not jump to the cursor after the result disappears.
+        // outside click. The presented-selection identity keeps that click from
+        // re-presenting the original text.
         // Host highlight clear is deferred: a synchronous AX/UIA write on the
-        // same gesture races the next drag and can drop the capture. Arm
-        // suppress once here (destroy path must not re-arm for the same close).
+        // same gesture races the next drag and can drop the capture.
         if let Some(meta) = self.result_sessions.lock().remove(session_id) {
             let text = meta.selection.payload.text.clone();
-            self.arm_same_text_selection_suppress(&text);
             if let Some(args) = host_selection_clear_args(
                 &text,
                 Some(meta.selection.payload.source_app.bundle_id.as_str()),
@@ -2779,10 +2797,8 @@ pub async fn run_action(
     let result = match action.kind {
         ActionKind::Copy => match clipboard::write_text(&selection.payload.text) {
             Ok(()) => {
-                // Keep the toolbar for the success icon, but arm same-text
-                // suppression so the next outside click's mouse-up re-capture
-                // cannot re-show the toolbar near the cursor.
-                state.arm_same_text_selection_suppress(&selection.payload.text);
+                // Keep the toolbar for the success icon. A later click cannot
+                // re-present this selection: its identity is already recorded.
                 // Quietly return key focus to the source app (no ActivateAllWindows
                 // flash). Next outside click then deselects + dismisses in one step.
                 let _ =
@@ -2802,7 +2818,6 @@ pub async fn run_action(
             match resolve_search_target(&selection.payload.text, template) {
                 Ok(target) => match open_system_url(&target) {
                     Ok(()) => {
-                        state.arm_same_text_selection_suppress(&selection.payload.text);
                         state.clear_and_hide_current_selection_if(&app, &selection_token);
                         RunActionResult::accepted(None, None)
                     }
@@ -2813,7 +2828,6 @@ pub async fn run_action(
         }
         _ if action.kind.opens_result_without_generation() => {
             let cursor = action_result_cursor(&app, cursor, &selection.payload);
-            let selected_text = selection.payload.text.clone();
             match state.create_ask_result_session(&app, &action.id, &action.name, selection, cursor)
             {
                 Ok((session_id, request_id, reveal_receiver)) => {
@@ -2824,7 +2838,6 @@ pub async fn run_action(
                     .await
                     {
                         Ok(()) => {
-                            state.arm_same_text_selection_suppress(&selected_text);
                             state.clear_and_hide_current_selection_if(&app, &selection_token);
                             // Do NOT restore_source_app_activation here: default
                             // result dismiss is Blur; activating the source app
@@ -2842,8 +2855,6 @@ pub async fn run_action(
         }
         _ if action.kind.is_ai() => {
             let cursor = action_result_cursor(&app, cursor, &selection.payload);
-            // Capture text before the selection moves into the result session.
-            let selected_text = selection.payload.text.clone();
             match state.create_result_session(&app, &action.id, &action.name, selection, cursor) {
                 Ok((session_id, request_id, reveal_receiver)) => {
                     // Window creation has its own bounded error path. Start
@@ -2857,9 +2868,6 @@ pub async fn run_action(
                     .await
                     {
                         Ok(()) => {
-                            // Same as copy: outside click after the result is
-                            // dismissed must not re-present this selection.
-                            state.arm_same_text_selection_suppress(&selected_text);
                             state.clear_and_hide_current_selection_if(&app, &selection_token);
                             // Do NOT restore_source_app_activation here: default
                             // result dismiss is Blur; activating the source app
@@ -4375,79 +4383,247 @@ mod tests {
         assert!(!plan.force_hide);
     }
 
-    #[test]
-    fn same_text_selection_is_suppressed_until_deadline() {
-        let now = Instant::now();
-        let guard = same_text_selection_suppress("hello", now);
-        assert!(should_suppress_same_text_selection(
-            Some(&guard),
-            "hello",
-            now + Duration::from_millis(10)
-        ));
-        assert!(!should_suppress_same_text_selection(
-            Some(&guard),
-            "other",
-            now + Duration::from_millis(10)
-        ));
-        assert!(!should_suppress_same_text_selection(
-            Some(&guard),
-            "hello",
-            now + Duration::from_millis(SAME_TEXT_SELECTION_SUPPRESS_MS + 1)
-        ));
-        assert!(!should_suppress_same_text_selection(None, "hello", now));
+    fn fixture_bounds(x: f64, y: f64, width: f64, height: f64) -> Option<SelectionBounds> {
+        Some(SelectionBounds {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    fn fixture_presented(
+        source: &str,
+        text: &str,
+        bounds: Option<SelectionBounds>,
+    ) -> PresentedSelection {
+        PresentedSelection {
+            source: source.to_owned(),
+            text: text.to_owned(),
+            bounds,
+        }
+    }
+
+    fn fixture_capture(
+        source: &str,
+        text: &str,
+        bounds: Option<SelectionBounds>,
+        trigger: SelectionTrigger,
+        start: (f64, f64),
+        end: (f64, f64),
+    ) -> SelectionPayload {
+        SelectionPayload {
+            text: text.to_owned(),
+            source_app: SourceApplication {
+                bundle_id: source.to_owned(),
+                name: "Fixture".to_owned(),
+            },
+            bounds,
+            start_top: None,
+            start_bottom: None,
+            end_top: None,
+            end_bottom: None,
+            mouse: SelectionMouse {
+                start: Some(SelectionPoint {
+                    x: start.0,
+                    y: start.1,
+                }),
+                end: Some(SelectionPoint { x: end.0, y: end.1 }),
+                current: SelectionPoint { x: end.0, y: end.1 },
+            },
+            direction: SelectionDirection::Forward,
+            is_fullscreen: false,
+            method: SelectionMethod::Accessibility,
+            trigger,
+            timestamp_ms: 1,
+            sequence: 1,
+        }
     }
 
     #[test]
-    fn same_text_suppress_rearm_extends_deadline() {
-        // Document that re-arming replaces the until deadline. Cleanup must arm
-        // only once per close so Destroyed + cleanup do not extend the 2s window.
-        let now = Instant::now();
-        let first = same_text_selection_suppress("hello", now);
-        let rearmed = same_text_selection_suppress("hello", now + Duration::from_millis(500));
-        let after_first_deadline =
-            now + Duration::from_millis(SAME_TEXT_SELECTION_SUPPRESS_MS + 100);
-        assert!(!should_suppress_same_text_selection(
-            Some(&first),
+    fn a_click_that_drifts_over_a_live_selection_is_not_presented_again() {
+        // The bug: translate finishes, the host still reports the old text, and
+        // any click 5-8px off target re-captures it and throws the toolbar at
+        // the cursor.
+        let presented = fixture_presented(
+            "com.example.editor",
             "hello",
-            after_first_deadline
-        ));
-        // Rearm at +500ms still holds past the first arm's deadline.
-        assert!(should_suppress_same_text_selection(
-            Some(&rearmed),
+            fixture_bounds(0.0, 0.0, 100.0, 20.0),
+        );
+        let micro_drag = fixture_capture(
+            "com.example.editor",
             "hello",
-            after_first_deadline
-        ));
-        assert!(!should_suppress_same_text_selection(
-            Some(&rearmed),
-            "hello",
-            now + Duration::from_millis(SAME_TEXT_SELECTION_SUPPRESS_MS + 501)
-        ));
+            fixture_bounds(0.0, 0.0, 100.0, 20.0),
+            SelectionTrigger::Drag,
+            (640.0, 480.0),
+            (646.0, 481.0),
+        );
+        assert_eq!(
+            judge_selection_presentation(Some(&presented), &micro_drag),
+            SelectionPresentation::AlreadyPresented
+        );
+        assert_eq!(
+            judge_selection_presentation(None, &micro_drag),
+            SelectionPresentation::Present
+        );
     }
 
     #[test]
-    fn host_clear_releases_matching_same_text_suppress() {
-        let now = Instant::now();
-        let mut guard = Some(same_text_selection_suppress("hello", now));
-        release_same_text_suppress_after_host_clear(&mut guard, "hello");
-        assert!(guard.is_none());
-        assert!(!should_suppress_same_text_selection(
-            guard.as_ref(),
+    fn a_real_drag_over_the_same_range_is_presented_again() {
+        let presented = fixture_presented(
+            "com.example.editor",
             "hello",
-            now
-        ));
+            fixture_bounds(0.0, 0.0, 100.0, 20.0),
+        );
+        let reselect = fixture_capture(
+            "com.example.editor",
+            "hello",
+            fixture_bounds(0.0, 0.0, 100.0, 20.0),
+            SelectionTrigger::Drag,
+            (4.0, 12.0),
+            (98.0, 14.0),
+        );
+        assert_eq!(
+            judge_selection_presentation(Some(&presented), &reselect),
+            SelectionPresentation::Present
+        );
     }
 
     #[test]
-    fn host_clear_keeps_suppress_for_different_text() {
-        let now = Instant::now();
-        let mut guard = Some(same_text_selection_suppress("copy-path", now));
-        release_same_text_suppress_after_host_clear(&mut guard, "result-text");
-        assert!(guard.is_some());
-        assert!(should_suppress_same_text_selection(
-            guard.as_ref(),
-            "copy-path",
-            now + Duration::from_millis(10)
-        ));
+    fn the_same_words_at_a_different_range_are_a_new_selection() {
+        let presented = fixture_presented(
+            "com.example.editor",
+            "hello",
+            fixture_bounds(0.0, 0.0, 100.0, 20.0),
+        );
+        let elsewhere = fixture_capture(
+            "com.example.editor",
+            "hello",
+            fixture_bounds(0.0, 320.0, 100.0, 20.0),
+            SelectionTrigger::Drag,
+            (2.0, 326.0),
+            (4.0, 326.0),
+        );
+        assert_eq!(
+            judge_selection_presentation(Some(&presented), &elsewhere),
+            SelectionPresentation::Present
+        );
+        // Sub-pixel rounding on the same range still reads as the same range.
+        assert_eq!(
+            selection_bounds_match(
+                fixture_bounds(0.0, 0.0, 100.0, 20.0),
+                fixture_bounds(1.4, 0.0, 100.0, 20.6)
+            ),
+            SelectionBoundsMatch::Same
+        );
+        assert_eq!(
+            selection_bounds_match(
+                fixture_bounds(0.0, 0.0, 100.0, 20.0),
+                fixture_bounds(0.0, 320.0, 100.0, 20.0)
+            ),
+            SelectionBoundsMatch::Different
+        );
+        assert_eq!(
+            selection_bounds_match(fixture_bounds(0.0, 0.0, 100.0, 20.0), None),
+            SelectionBoundsMatch::Unknown
+        );
+    }
+
+    #[test]
+    fn double_click_and_keyboard_triggers_cannot_reuse_a_live_selection() {
+        // A double-click on blank space re-reads whatever the app still has
+        // selected, and without range geometry there is no evidence of a new
+        // selection.
+        let presented = fixture_presented("com.example.editor", "hello", None);
+        for trigger in [
+            SelectionTrigger::DoubleClick,
+            SelectionTrigger::Keyboard,
+            SelectionTrigger::ShiftClick,
+        ] {
+            let capture = fixture_capture(
+                "com.example.editor",
+                "hello",
+                None,
+                trigger,
+                (300.0, 300.0),
+                (300.0, 300.0),
+            );
+            assert_eq!(
+                judge_selection_presentation(Some(&presented), &capture),
+                SelectionPresentation::AlreadyPresented,
+                "trigger {trigger:?} reused the live selection"
+            );
+        }
+        // The shortcut is an explicit request, so it presents.
+        let manual = fixture_capture(
+            "com.example.editor",
+            "hello",
+            None,
+            SelectionTrigger::Manual,
+            (300.0, 300.0),
+            (300.0, 300.0),
+        );
+        assert_eq!(
+            judge_selection_presentation(Some(&presented), &manual),
+            SelectionPresentation::Present
+        );
+    }
+
+    #[test]
+    fn a_different_app_or_text_always_presents() {
+        let presented = fixture_presented("com.example.editor", "hello", None);
+        let other_text = fixture_capture(
+            "com.example.editor",
+            "world",
+            None,
+            SelectionTrigger::Drag,
+            (10.0, 10.0),
+            (11.0, 10.0),
+        );
+        let other_app = fixture_capture(
+            "com.example.browser",
+            "hello",
+            None,
+            SelectionTrigger::Drag,
+            (10.0, 10.0),
+            (11.0, 10.0),
+        );
+        assert_eq!(
+            judge_selection_presentation(Some(&presented), &other_text),
+            SelectionPresentation::Present
+        );
+        assert_eq!(
+            judge_selection_presentation(Some(&presented), &other_app),
+            SelectionPresentation::Present
+        );
+    }
+
+    #[test]
+    fn gesture_reach_divides_a_click_from_a_reselect_without_bounds() {
+        // Pinned because it is the number users feel: below it a drag is a click.
+        assert_eq!(RESELECT_MIN_REACH_PX, 12.0);
+        let reach = |start: (f64, f64), end: (f64, f64)| {
+            selection_gesture_reach(&SelectionMouse {
+                start: Some(SelectionPoint {
+                    x: start.0,
+                    y: start.1,
+                }),
+                end: Some(SelectionPoint { x: end.0, y: end.1 }),
+                current: SelectionPoint { x: end.0, y: end.1 },
+            })
+        };
+        assert!((reach((0.0, 0.0), (9.0, 0.0)) - 9.0).abs() < 0.001);
+        assert!(reach((0.0, 0.0), (5.0, 5.0)) < RESELECT_MIN_REACH_PX);
+        assert!(reach((0.0, 0.0), (12.0, 0.0)) >= RESELECT_MIN_REACH_PX);
+        // No endpoints at all reads as no travel, which is the honest answer.
+        assert_eq!(
+            selection_gesture_reach(&SelectionMouse {
+                start: None,
+                end: None,
+                current: SelectionPoint { x: 40.0, y: 40.0 },
+            }),
+            0.0
+        );
     }
 
     #[test]
@@ -4492,7 +4668,7 @@ mod tests {
             HOST_SELECTION_CLEAR_DELAY_MS
         );
         assert_eq!(HOST_SELECTION_CLEAR_DELAY_MS, 200);
-        assert_eq!(SAME_TEXT_SELECTION_SUPPRESS_MS, 2_000);
+        assert_eq!(SELECTION_BOUNDS_MATCH_TOLERANCE_PX, 2.0);
     }
 
     #[test]

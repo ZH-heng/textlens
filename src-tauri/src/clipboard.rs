@@ -126,12 +126,14 @@ pub(crate) fn snapshot_windows_clipboard() -> Option<WindowsClipboardSnapshot> {
     let mut formats = Vec::with_capacity(format_count as usize);
     let mut total_bytes = 0usize;
     let mut format = 0u32;
+    let mut accounting = WindowsClipboardSnapshotAccounting::default();
     loop {
         format = unsafe { EnumClipboardFormats(format) };
         if format == 0 {
             break;
         }
         if windows_clipboard_format_is_skipped(format) {
+            accounting.observe(format, WindowsClipboardFormatOutcome::NotRestorable);
             continue;
         }
 
@@ -141,12 +143,15 @@ pub(crate) fn snapshot_windows_clipboard() -> Option<WindowsClipboardSnapshot> {
             let metafile = HENHMETAFILE(handle.0);
             let size = unsafe { GetEnhMetaFileBits(metafile, None) } as usize;
             if size == 0 {
+                accounting.observe(format, WindowsClipboardFormatOutcome::Unreadable);
                 continue;
             }
-            // Oversized formats are dropped individually: a huge image must
+            // Oversized formats are dropped individually: a huge format must
             // not abandon the whole restore snapshot (and with it the small
-            // text format that keeps the user's clipboard intact).
+            // text format that keeps the user's clipboard intact). Pixel
+            // formats are held to the fidelity rule below instead.
             if size > remaining {
+                accounting.observe(format, WindowsClipboardFormatOutcome::Unreadable);
                 continue;
             }
             let mut data = vec![0u8; size];
@@ -158,6 +163,7 @@ pub(crate) fn snapshot_windows_clipboard() -> Option<WindowsClipboardSnapshot> {
             let global = HGLOBAL(handle.0);
             let size = unsafe { GlobalSize(global) };
             if size == 0 || size > remaining {
+                accounting.observe(format, WindowsClipboardFormatOutcome::Unreadable);
                 continue;
             }
             let pointer = unsafe { GlobalLock(global) }.cast::<u8>();
@@ -171,9 +177,17 @@ pub(crate) fn snapshot_windows_clipboard() -> Option<WindowsClipboardSnapshot> {
             )
         };
         total_bytes = total_bytes.saturating_add(data.len());
+        accounting.observe(format, WindowsClipboardFormatOutcome::Captured);
         formats.push(WindowsClipboardFormatSnapshot { format, data, kind });
     }
 
+    if !accounting.keeps_every_image() {
+        // A screenshot already on the clipboard cannot be rebuilt from what we
+        // captured. Our synthetic copy would EmptyClipboard and destroy the one
+        // thing the user has not pasted yet, so the fallback is refused.
+        trace_windows_clipboard_text_status(sequence, "snapshot-image-unrestorable");
+        return None;
+    }
     if formats.is_empty() || !windows_clipboard_sequence_matches(sequence) {
         return None;
     }
@@ -210,6 +224,61 @@ fn windows_clipboard_format_is_skipped(format: u32) -> bool {
     synthesized_or_unsupported
         || (u32::from(CF_PRIVATEFIRST.0)..=u32::from(CF_PRIVATELAST.0)).contains(&format)
         || (u32::from(CF_GDIOBJFIRST.0)..=u32::from(CF_GDIOBJLAST.0)).contains(&format)
+}
+
+/// Win32 formats that carry pixel content, by their fixed ids: CF_BITMAP 2,
+/// CF_METAFILEPICT 3, CF_TIFF 6, CF_DIB 8, CF_PALETTE 9, CF_ENHMETAFILE 14,
+/// CF_DIBV5 17, CF_OWNERDISPLAY 0x80, CF_DSPBITMAP 0x82, CF_DSPMETAFILEPICT
+/// 0x83, CF_DSPENHMETAFILE 0x8E. The ids stay numeric so the fidelity rule
+/// below is testable off Windows, and
+/// `image_format_ids_match_the_win32_constants` pins them against the crate.
+#[cfg(any(target_os = "windows", test))]
+fn windows_clipboard_format_carries_image(format: u32) -> bool {
+    matches!(
+        format,
+        2 | 3 | 6 | 8 | 9 | 14 | 17 | 0x80 | 0x82 | 0x83 | 0x8E
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy)]
+enum WindowsClipboardFormatOutcome {
+    /// Listed by `windows_clipboard_format_is_skipped`: never materialized.
+    NotRestorable,
+    /// Readable in principle, but returned no bits or exceeded the budget.
+    Unreadable,
+    Captured,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Default)]
+struct WindowsClipboardSnapshotAccounting {
+    image_present: bool,
+    image_captured: bool,
+    image_unreadable: bool,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl WindowsClipboardSnapshotAccounting {
+    fn observe(&mut self, format: u32, outcome: WindowsClipboardFormatOutcome) {
+        if !windows_clipboard_format_carries_image(format) {
+            return;
+        }
+        self.image_present = true;
+        match outcome {
+            WindowsClipboardFormatOutcome::Captured => self.image_captured = true,
+            WindowsClipboardFormatOutcome::Unreadable => self.image_unreadable = true,
+            WindowsClipboardFormatOutcome::NotRestorable => {}
+        }
+    }
+
+    /// Pixel content survives the restore once one pixel format was
+    /// materialized and none that we could have read was dropped: Windows
+    /// re-synthesizes CF_BITMAP from a restored CF_DIB, so a handle-based
+    /// format in the skip list is not a loss by itself.
+    fn keeps_every_image(&self) -> bool {
+        !self.image_present || (self.image_captured && !self.image_unreadable)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1128,6 +1197,70 @@ mod tests {
         assert!(!windows_clipboard_sequence_is_stable(42, 43));
         assert!(windows_clipboard_sequence_is_stable(0, 0));
         assert!(!windows_clipboard_sequence_is_stable(0, 1));
+    }
+
+    #[test]
+    fn clipboard_snapshot_refuses_to_drop_a_pixel_format() {
+        let mut text_only = WindowsClipboardSnapshotAccounting::default();
+        text_only.observe(13, WindowsClipboardFormatOutcome::Captured);
+        assert!(text_only.keeps_every_image());
+
+        // The readable DIB went over the budget, so the restore would leave
+        // the screenshot behind nothing.
+        let mut lost_dib = WindowsClipboardSnapshotAccounting::default();
+        lost_dib.observe(2, WindowsClipboardFormatOutcome::NotRestorable);
+        lost_dib.observe(8, WindowsClipboardFormatOutcome::Unreadable);
+        assert!(!lost_dib.keeps_every_image());
+
+        // Only handle-based pixel formats, none of them materialized.
+        let mut bitmap_only = WindowsClipboardSnapshotAccounting::default();
+        bitmap_only.observe(2, WindowsClipboardFormatOutcome::NotRestorable);
+        assert!(!bitmap_only.keeps_every_image());
+
+        // A restored CF_DIB is enough: Windows re-synthesizes CF_BITMAP.
+        let mut dib_restored = WindowsClipboardSnapshotAccounting::default();
+        dib_restored.observe(2, WindowsClipboardFormatOutcome::NotRestorable);
+        dib_restored.observe(8, WindowsClipboardFormatOutcome::Captured);
+        assert!(dib_restored.keeps_every_image());
+
+        // A second pixel format we could have read but did not is still a loss.
+        let mut partial_image = WindowsClipboardSnapshotAccounting::default();
+        partial_image.observe(8, WindowsClipboardFormatOutcome::Captured);
+        partial_image.observe(6, WindowsClipboardFormatOutcome::Unreadable);
+        assert!(!partial_image.keeps_every_image());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn image_format_ids_match_the_win32_constants() {
+        use windows::Win32::System::Ole::{
+            CF_BITMAP, CF_DIB, CF_DIBV5, CF_DSPBITMAP, CF_DSPENHMETAFILE, CF_DSPMETAFILEPICT,
+            CF_ENHMETAFILE, CF_HDROP, CF_LOCALE, CF_METAFILEPICT, CF_OWNERDISPLAY, CF_PALETTE,
+            CF_TIFF, CF_UNICODETEXT,
+        };
+
+        for pixel_format in [
+            CF_BITMAP,
+            CF_METAFILEPICT,
+            CF_TIFF,
+            CF_DIB,
+            CF_PALETTE,
+            CF_ENHMETAFILE,
+            CF_DIBV5,
+            CF_OWNERDISPLAY,
+            CF_DSPBITMAP,
+            CF_DSPMETAFILEPICT,
+            CF_DSPENHMETAFILE,
+        ] {
+            assert!(windows_clipboard_format_carries_image(u32::from(
+                pixel_format.0
+            )));
+        }
+        for text_format in [CF_UNICODETEXT, CF_HDROP, CF_LOCALE] {
+            assert!(!windows_clipboard_format_carries_image(u32::from(
+                text_format.0
+            )));
+        }
     }
 
     #[test]

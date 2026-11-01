@@ -59,6 +59,34 @@ void ExpectOpaqueWindowDecision() {
     assert(!AnchorIsOpaqueWindow(signals));
 }
 
+void ExpectClipboardSnapshotRestorable() {
+    ClipboardSnapshotAccounting empty;
+    assert(empty.IsRestorable());
+
+    ClipboardSnapshotAccounting faithful;
+    faithful.restorableRepresentations = 3;
+    faithful.capturedRepresentations = 3;
+    assert(faithful.IsRestorable());
+
+    // One oversized representation skipped out of three: restoring would drop it.
+    ClipboardSnapshotAccounting partial;
+    partial.restorableRepresentations = 3;
+    partial.capturedRepresentations = 2;
+    assert(!partial.IsRestorable());
+
+    // Nothing captured at all (promised/lazy clipboard).
+    ClipboardSnapshotAccounting unreadable;
+    unreadable.restorableRepresentations = 2;
+    assert(!unreadable.IsRestorable());
+
+    // An item we had to drop even though every other representation survived.
+    ClipboardSnapshotAccounting hollowItem;
+    hollowItem.restorableRepresentations = 2;
+    hollowItem.capturedRepresentations = 2;
+    hollowItem.itemsWithoutCapture = 1;
+    assert(!hollowItem.IsRestorable());
+}
+
 void ExpectAppProfiles() {
     const AppTraits wps = ResolveAppTraits("com.kingsoft.wpsoffice.mac", "");
     assert(wps.wps);
@@ -111,6 +139,7 @@ int main() {
     ExpectDegenerateFragment();
     ExpectPointNearBounds();
     ExpectOpaqueWindowDecision();
+    ExpectClipboardSnapshotRestorable();
     ExpectAppProfiles();
     std::cout << "selection policy tests passed\n";
     return 0;

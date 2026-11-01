@@ -116,4 +116,21 @@ inline bool AnchorIsOpaqueWindow(const OpaqueWindowSignals &signals) {
         (!signals.anchorWindowKnown || !signals.trustedAnchorWindow);
 }
 
+/// Faithfulness accounting for the pasteboard snapshot taken before a
+/// synthetic Cmd+C. Restoring writes back only what was captured, so every
+/// representation we could not read (promised/lazy, or larger than the
+/// snapshot budget) is destroyed for good — that is how a Retina screenshot
+/// disappears from the clipboard. `dyn.*` types stay out of the counts: they
+/// are derived forms the pasteboard re-supplies from the static ones.
+struct ClipboardSnapshotAccounting {
+    size_t restorableRepresentations = 0;
+    size_t capturedRepresentations = 0;
+    size_t itemsWithoutCapture = 0;
+
+    bool IsRestorable() const {
+        return capturedRepresentations == restorableRepresentations &&
+            itemsWithoutCapture == 0;
+    }
+};
+
 }  // namespace textlens_selection_policy

@@ -538,6 +538,7 @@ Windows 适配没有另起一套设置文件。现有 macOS 服务商、模型�
 - Terminal、PowerShell、cmd、密码管理器和远程控制程序不启用自动复制回退。
 - 捕获期间发生真实用户输入、前台切换或无法归因的剪贴板变化时放弃本次事务。
 - 只有剪贴板仍由本次 TextLens 捕获修改时才恢复原始多格式内容。
+- 剪贴板携带位图类格式（CF_BITMAP/CF_DIB/CF_TIFF/CF_ENHMETAFILE 等）而快照未能物化其中任一可读格式时，整体放弃本次回退：`EmptyClipboard` 之后的恢复只会写回已捕获的格式，未被捕获的截图位图不可逆丢失。Windows 恢复不追求逐格式等价——已捕获 CF_DIB 时系统会按需重建 CF_BITMAP，因此单独的句柄类格式缺失不算丢失。
 - 选中文本最多读取 1,000,000 个字符，避免异常 provider 导致无界分配。
 
 #### 兼容范围
@@ -789,7 +790,7 @@ Windows 安装包使用 current-user 模式，不要求管理员权限；禁止�
 
 （整理日期：2026-07-21）
 
-- **结果窗：** 外点/关闭结果会话时，在已有同文 suppress 与 force-hide 工具栏之外，best-effort 通过 AX/UIA 折叠仍匹配原文的宿主选区高亮（不可写场景静默跳过）。
+- **结果窗：** 外点/关闭结果会话时，在已有选区身份判定与 force-hide 工具栏之外，best-effort 通过 AX/UIA 折叠仍匹配原文的宿主选区高亮（不可写场景静默跳过）。
 - **TTFT：** 结果 document 在 React mount 前即 `set_ready`，避免首 token 堵在 Rust pending；hydrate 后保留 immediate 字符预算；streaming 显示直通，去掉本地 typewriter 排队。
 - **流式：** SSE 首包即时窗口略增；前端 store 即时预算提高。
 - 产品版本升至 0.3.47。
@@ -925,9 +926,16 @@ Windows 安装包使用 current-user 模式，不要求管理员权限；禁止�
 - 新增 stale 护栏：剪贴板结果与上一次已接受的捕获文本相同、且本次捕获位置距原位置超过 48px 时，视为应用残留的旧模型选区而拒绝（已知取舍：在远处重新划选完全相同的文本也会被拒绝）。
 - 退化片段过滤（实机定位驱动）：ZCode 聊天窗口双击空白处时，Chromium 会真实选中空 Markdown 列表项的标记文本（`1. `），AX 路径据此弹出工具栏。鼠标触发（拖动/双击/Shift 点击）的捕获若去空白后 ≤3 个字符且不含「字母类」字符（ASCII 字母、西里尔、假名、CJK、谚文）一律丢弃——`1. `、`• `、`—` 等标记/符号碎片全部拦截；键盘与快捷键触发不受影响，含单个汉字或单词的正常选词不受影响。AX 与剪贴板两条路径一致应用。已知取舍：双击 3 字符以内的纯数字（如 `42`）不会弹工具栏。
 - 双击边界容差收紧（实机定位驱动）：Chrome 里双击 KaTeX 公式所在行的右侧空白，Chromium 会把无空格的整段公式串当作一个「词」选中（一次双击捕获 107–145 字节公式）。双击选中的词必然在光标之下，因此双击触发的鼠标-选区边界容差从 56px 收紧到 20px——点空白处选中相邻 token 的捕获被拒绝；拖动与 Shift 点击保持 56px（结束位置语义不同，不动）。
-- 回退全出口 trace 日志：`TEXTLENS_SELECTION_TRACE=1` 时输出 `[selection-fallback] …` 原因行（app-policy-denied / secure-event-input / text-element-empty-range-on-click / focused-element-is-image / clipboard-unrestorable-all-lazy / chord-ignored-by-app / non-text-copy / restore-boundary-missed / stale-same-text-far-location / text-matches-app-identity / capture: ok），行首带 app bundle 与触发方式，capture 成功行默认只记长度与 FNV-1a 哈希；另设 `TEXTLENS_TRACE_CONTENT=1` 时才附加前 24 字符前缀（换行/控制字符转义）用于区分「残留旧选区 / 隐式复制 / 垃圾内容」。日志同时镜像到 `~/Library/Logs/TextLens/selection-trace.log`（Finder 启动的 GUI 应用看不到 stderr；默认不落文本）。打包应用启用方式：`launchctl setenv TEXTLENS_SELECTION_TRACE 1` 后重启应用，`launchctl unsetenv TEXTLENS_SELECTION_TRACE 1` 关闭；需要内容前缀时再设置 `TEXTLENS_TRACE_CONTENT`。
-- 快照策略改为「跳过不可读表示」：惰性/超大表示不再整体放弃回退（否则剪贴板历史里只要出现过一次带惰性类型的复制，回退就会被永久卡死），仅当原始剪贴板有内容但全部不可恢复时才放弃；混合场景按可读表示部分恢复（bounded 降级，带 trace）。
+- 回退全出口 trace 日志：`TEXTLENS_SELECTION_TRACE=1` 时输出 `[selection-fallback] …` 原因行（app-policy-denied / secure-event-input / text-element-empty-range-on-click / focused-element-is-image / clipboard-unrestorable（附「captured N of M representations」计数）/ chord-ignored-by-app / non-text-copy / restore-boundary-missed / stale-same-text-far-location / text-matches-app-identity / capture: ok），行首带 app bundle 与触发方式，capture 成功行默认只记长度与 FNV-1a 哈希；另设 `TEXTLENS_TRACE_CONTENT=1` 时才附加前 24 字符前缀（换行/控制字符转义）用于区分「残留旧选区 / 隐式复制 / 垃圾内容」。日志同时镜像到 `~/Library/Logs/TextLens/selection-trace.log`（Finder 启动的 GUI 应用看不到 stderr；默认不落文本）。打包应用启用方式：`launchctl setenv TEXTLENS_SELECTION_TRACE 1` 后重启应用，`launchctl unsetenv TEXTLENS_SELECTION_TRACE 1` 关闭；需要内容前缀时再设置 `TEXTLENS_TRACE_CONTENT`。
+- 快照策略为「不完整即放弃」（回退到 0.4.1 之前的 fail-closed 语义，并覆盖「部分表示」）：惰性/超大表示被跳过时不再按剩余表示恢复，而是整体放弃本次回退。此前「混合场景按可读表示部分恢复」是 PixPin 类截图工具丢失剪贴板图片的根因——Retina 全屏 TIFF 超过 16MB 单表示上限被跳过，恢复时把图片擦掉，只有小区域截图侥幸存活，所以现象是「有概率失效」。已知取舍：剪贴板中残留不可重建内容（文件承诺、超大图）期间，画布类应用的剪贴板回退会被拒绝，AX 路径不受影响。
 - 非文本判定改为白名单：仅当粘贴板携带已知图片/文件类型（TIFF/PNG/JPEG/file-url/promise）且无任何文本类型时才判为非文本响应；未知类型组合继续等待完整预算，避免误杀用特殊 UTI 写文本的应用。
+
+**重复弹出判定改为选区身份（取代 2 秒同文本抑制）：**
+
+- 动作完成后宿主应用仍报告同一段选区，此后的「随手一点」常带 5–8px 位移，原生层按 `distance >= 4px` 判为拖动并重新捕获同一段文本，工具栏就会跳到光标处重新弹出。原先由 Rust 侧 `SAME_TEXT_SELECTION_SUPPRESS_MS = 2000` 兜底，而结果窗关闭后 200ms 的宿主高亮折叠会把抑制提前解除，2 秒之后完全失效。
+- 现在 Rust 侧记录**上一次已呈现的选区身份**（宿主 bundle id + 文本 + 选区 bounds），并只看本次捕获的手势端点间距来判定，见 `runtime.rs: judge_selection_presentation`：文本或宿主不同→呈现；bounds 存在且差超过 2px→是同一段文字的另一次选中，呈现；bounds 相同或缺失时，只有拖动端点间距 ≥ `RESELECT_MIN_REACH_PX = 12.0` 才算用户重新划选，否则丢弃。双击 / Cmd+A / Shift 点击在身份未变化时一律丢弃（残留选区没有任何新手势证据），快捷键 `Manual` 触发与 `force_capture` 始终呈现。
+- 身份在选区被接受并呈现时记录一次，因此 dismiss、复制、搜索、结果窗关闭都不再需要「武装计时器」；`dismiss_precedes_selection` 命中时提前 return 也不会丢失抑制（旧实现里那条路径会在武装抑制之前返回，导致同 tick 的 dismiss 永远不产生抑制）。宿主高亮折叠仍按 `HOST_SELECTION_CLEAR_DELAY_MS = 200` 延后执行，但不再解除任何抑制。
+- 已知取舍：抑制不再随时间失效——在同一段文字上做一次小于 12px 的短拖动不会再弹工具栏，需要重新划出更长的一次拖动、或用快捷键触发。
 
 **macOS 工具栏恢复路径补齐：** 将 Windows 的工具栏 WebView 重建机制（`rebuild_toolbar`、恢复预留/取消状态机、Destroyed 后重建单例）扩展到 macOS。原生 stage 失败、事件投递失败、渲染器三次呈现尝试耗尽时，销毁并重建工具栏单例，新渲染器通过 `toolbar_ready` 重放内存中的选区；每个选区有界一次恢复尝试，防止持续的 WebView 失败造成重建循环。此前 macOS 在这些路径上会直接丢弃本次划词且无恢复手段。
 
@@ -951,6 +959,8 @@ Windows 安装包使用 current-user 模式，不要求管理员权限；禁止�
 - kitty/Alacritty/Ghostty 里划词可弹出工具栏，且空选拖动不会误发中断；Terminal.app/iTerm2 拖动划词走 AX 路径，Cmd+A 触发可用；1Password 不触发合成复制；此前复制过文件时在 WPS 划词（快照含惰性表示则回退放弃，AX 正常则不受影响）。
 - **空白处双击不弹工具栏**；同一位置反复双击同一单词仍可弹出；远处重新划选完全相同的文本被 stale 护栏拒绝（已知取舍）；**微信图片查看器中拖动图片不再触发复制**（AXImage 预检生效；若个别版本未暴露 AXImage，剪贴板也会在一个轮询周期内被恢复）。
 - 合成 Cmd+C 等待期间按键或点击立即取消且剪贴板无残留；等待窗口内用户按 Cmd+C 复制后剪贴板保留用户内容；划词捕获完成后剪贴板恢复为划词前的内容。
+- **截图工具共存（PixPin 类）：** 全屏截图把大图留在剪贴板后，① 在该状态下去 WPS/浏览器 PDF 划词——trace 出现 `skip: clipboard-unrestorable`、工具栏不弹，但截图仍可粘贴；② 剪贴板里是纯文本时划词回退正常且事后剪贴板原样；③ 在截图工具里 Cmd+A 全选再确认，图片不被 TextLens 的恢复擦掉。Windows 同理，trace 行 `status=snapshot-image-unrestorable`。
+- **翻译结束后随手点击页面别处不再弹工具栏**（点击位移 5–8px 也要验）；对同一段文字做一次明显的长距离重划仍应弹出；快捷键对同一段文字始终弹出。
 - 连续划词、划词后复制/搜索/翻译再划词（手册「后续开发建议」九项序列照跑）。
 - macOS 辅助功能授权后约 1 秒内划词自动可用；工具栏渲染器异常时下一次划词可自动重建（recover 日志 `stage=rebuild/delivery-recovery`）。
 - Chromium 网页划词命中 marker-range（trace `capture` 阶段耗时下降、不再出现 clipboard `capture: ok`）；Safari 划词首次触发系统「自动化」授权，允许后见 `applescript-capture: ok` 且剪贴板内容不变；Chrome 开启「允许从 Apple 事件中的 JavaScript」前后各测一次。

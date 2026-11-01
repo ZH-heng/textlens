@@ -162,3 +162,14 @@
 ## 五、工作量与顺序
 
 总量约 15–20 个工作日。建议顺序 0 → 1 → 2 → 3；阶段 4/5 与阶段 3 代码域不重叠，可并行。
+
+## 六、追加轮次（2026-11-01）：与截图工具共存、重复弹出身份判定
+
+起因是三条实机反馈：① PixPin 全选截图有概率丢失剪贴板图片；② 翻译结束后随手一点又弹工具栏；③ 快速双击空白处有概率弹出。
+
+- 阶段 A（完成）：剪贴板快照改为「不完整即放弃」。macOS `SnapshotPasteboard` 统计静态表示的捕获数与无法重建的条目，任一项缺失就整体拒绝回退（不发合成 Cmd+C），`dyn.*` 仍可跳过；新增纯谓词 `ClipboardSnapshotAccounting::IsRestorable` 与原生策略测试。Windows `snapshot_windows_clipboard` 用 `WindowsClipboardSnapshotAccounting` 同一语义：位图类格式未被物化或本可读取却被预算丢弃时返回 `None`，调用方既有 `clipboard-snapshot-failed` 分支即放弃事务。这同时关掉了审计清单里「剪贴板快照丢失」那条 P1。根因是 16MB 单表示上限：Retina 全屏 TIFF 被跳过、恢复时擦掉图片，小区域截图恰好没超阈值——所以现象是「有概率」。
+- 阶段 B（完成）：`runtime.rs` 用「上一次已呈现的选区身份」（bundle id + 文本 + bounds）取代 `SAME_TEXT_SELECTION_SUPPRESS_MS = 2000` 计时抑制，判定只看本次捕获的手势端点间距；同时删除结果窗关闭后 200ms 的提前解除，以及复制/搜索/结果 reveal 五处武装点，dismiss 只负责隐藏工具栏。副带效果：`dismiss_precedes_selection` 命中时提前 return 不再丢失抑制（旧实现在武装之前就返回，同 tick 的 dismiss 永远不产生抑制）。纯函数 `judge_selection_presentation` 配 6 项单测。
+- 阶段 C（完成，实现层次调整）：双击/Cmd+A/Shift 点击在身份未变化时一律丢弃，因此快速双击空白复用残留选区的路径被拦住。**没有**按原计划在原生桥 `:744` 的「无 bounds 就跳过邻近校验」处再加一份身份比对——运行时层已覆盖同一语义且 macOS/Windows 共用一份实现，重复实现只会漂移；桥里既有的 20px 双击边界容差继续负责「点空白选中相邻 token」那一类，两者互补。
+- 阶段 D（未做，待批）：让设置里的「忽略应用」黑名单真正拦在原生捕获之前。现在它只在 `runtime.rs` 捕获之后隐藏工具栏，合成 Cmd+C 照发，是「影响其他软件」的架构缺口；需要给桥加运行期可更新的 deny 通道（当前只有构造期单个 `excluded_bundle_id`），Windows 侧则要统一 `selection_capture` 规则的作用域。
+- 未采纳：检测截图类 overlay 窗口（窗口层级/sharingState/非激活面板）来跳过捕获。判定不稳，且实测症状指向剪贴板而不是遮挡。
+- 验证：`pnpm verify` 全绿（原生策略测试含新增用例，Rust 279 项含 7 项新单测）；Windows 目标仍只能靠 CI（本机 `aws-lc-sys` 交叉编译失败）。三条实机反馈需要用户按手册回归清单复测。

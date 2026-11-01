@@ -1304,28 +1304,26 @@ static PasteboardSnapshot SnapshotPasteboard(NSPasteboard *pasteboard) {
     snapshot.valid = true;
     NSArray<NSPasteboardItem *> *items = pasteboard.pasteboardItems;
     NSUInteger totalSnapshotBytes = 0;
-    NSUInteger skippedRepresentations = 0;
+    textlens_selection_policy::ClipboardSnapshotAccounting accounting;
     for (NSPasteboardItem *item in items) {
         PasteboardItemSnapshot itemSnapshot;
-        for (NSPasteboardType type in item.types) {
+        NSArray<NSPasteboardType> *types = item.types;
+        for (NSPasteboardType type in types) {
             // Dynamic ("dyn.*") representations are derived forms of the
             // static ones and reading one can force a cross-process lazy
             // fetch from the source app. Skip them.
             if ([type hasPrefix:@"dyn."]) {
                 continue;
             }
+            accounting.restorableRepresentations += 1;
             NSData *data = [item dataForType:type];
             if (data == nil || data.length > kClipboardSnapshotMaxRepresentationBytes) {
                 // A promised/lazy (or oversized) representation cannot be
-                // faithfully reconstructed after clearContents. Skipping it
-                // instead of aborting the whole fallback: the capture must
-                // stay available regardless of the clipboard's HISTORY, and
-                // the restore below keeps every readable representation.
-                skippedRepresentations += 1;
+                // reconstructed after clearContents, and the source app will
+                // not re-supply it once we own the pasteboard.
                 continue;
             }
             if (totalSnapshotBytes + data.length > kClipboardSnapshotMaxTotalBytes) {
-                skippedRepresentations += 1;
                 continue;
             }
             totalSnapshotBytes += data.length;
@@ -1333,26 +1331,31 @@ static PasteboardSnapshot SnapshotPasteboard(NSPasteboard *pasteboard) {
             representation.type = StringFromNSString(type);
             representation.data = data;
             itemSnapshot.representations.push_back(std::move(representation));
+            accounting.capturedRepresentations += 1;
         }
-        if (itemSnapshot.representations.empty()) {
-            // The item exposed only unreadable/lazy representations. Drop the
-            // whole item rather than restoring a hollow shell for it.
-            continue;
+        if (itemSnapshot.representations.empty() && types.count > 0) {
+            // The item exposed representations we could not capture — lazy,
+            // oversized, or dynamic-only. It cannot be rebuilt, so it counts
+            // against faithfulness instead of being silently dropped from the
+            // restore.
+            accounting.itemsWithoutCapture += 1;
+        } else if (!itemSnapshot.representations.empty()) {
+            snapshot.items.push_back(std::move(itemSnapshot));
         }
-        snapshot.items.push_back(std::move(itemSnapshot));
     }
-    if (snapshot.items.empty() && items.count > 0) {
-        // The original clipboard had content but none of it is restorable;
-        // restoring would wipe the user's clipboard. Abort this fallback.
+    if (!accounting.IsRestorable()) {
+        // Fail closed: an incomplete snapshot would be written back as the
+        // clipboard's new content, permanently losing whatever we skipped —
+        // most often a screenshot bitmap over the representation budget.
+        // Better to skip this capture than to eat the user's clipboard.
         snapshot.valid = false;
-        TraceClipboardGate("skip: clipboard-unrestorable-all-lazy");
-    } else if (skippedRepresentations > 0) {
-        char line[96];
+        char line[128];
         std::snprintf(
             line,
             sizeof(line),
-            "snapshot: %u representations skipped (restore partial)",
-            static_cast<unsigned>(skippedRepresentations));
+            "skip: clipboard-unrestorable (captured %zu of %zu representations)",
+            accounting.capturedRepresentations,
+            accounting.restorableRepresentations);
         TraceClipboardGate(line);
     }
     return snapshot;

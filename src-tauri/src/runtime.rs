@@ -2834,6 +2834,9 @@ pub async fn run_action(
     };
 
     let selection_token = selection.id.clone();
+    let selection_text = selection.payload.text.clone();
+    let selection_source = selection.payload.source_app.bundle_id.clone();
+    let selection_is_from_result = selection.source_result_session_id.is_some();
     if !state
         .consuming_selection_ids
         .lock()
@@ -2938,6 +2941,18 @@ pub async fn run_action(
         }
         _ => RunActionResult::rejected("暂不支持该动作"),
     };
+    // A toolbar action takes the selection over: collapse the host highlight so
+    // the text does not stay selected after the user picked an option. A result
+    // selection lives inside TextLens's own webview and has no host highlight to
+    // clear. Deferred rather than synchronous: an AX/UIA write on the same
+    // gesture races the next drag and can drop that capture.
+    if result.accepted && !selection_is_from_result {
+        if let Some(clear) =
+            host_selection_clear_args(&selection_text, Some(selection_source.as_str()))
+        {
+            state.schedule_host_selection_clear(app.clone(), clear);
+        }
+    }
     Ok(result)
 }
 

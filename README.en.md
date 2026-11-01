@@ -47,6 +47,8 @@ Enhancements beyond a basic selection assistant:
 - **Ask AI sessions:** Open a result window with selection as context; you can wait before the first model call, then chat multi-turn in that window only.
 - **Thinking & streaming:** Streaming thinking / reasoning display; thinking levels inferred from model names (including “off”); low-latency streaming.
 - **Provider enable/disable:** Disabled providers are hidden from action binding and result model lists (already-bound actions still run).
+- **Plays well with other apps:** When the clipboard holds something TextLens cannot fully preserve (a screenshot, for example), the temporary copy is skipped instead of rewriting your clipboard. Picking a toolbar action clears the highlight in the source app, and a leftover selection no longer brings the toolbar back on an unrelated click.
+- **Keyboard accessible:** Toolbar focus ring, listbox navigation in the model picker, arrow-key radio groups, and keyboard drag-reordering; Settings is organized into seven sections with errors shown on the field that failed.
 - **Lightweight & private:** Standalone Tauri tool; API keys encrypted locally; no selection history; text is sent only when you click an AI action.
 
 ## Tech stack
@@ -103,7 +105,7 @@ These projects also pull transitive dependencies. Before a formal public release
 
 1. Platform selection backends listen for global mouse, keyboard, and scroll events; macOS uses Accessibility/Event Tap, Windows uses UI Automation/low-level input hooks. Windows assigns a token per Hook instance and only installs a new instance when the previous one exits abnormally or is confirmed replaced—no periodic blind reinstall.
 2. On Windows, UIA/OLE capture that may block on third-party providers runs in a separate helper process started from the same executable; timeouts, crashes, or protocol errors isolate and rebuild the helper without saturating the main capture thread.
-3. When standard APIs cannot read allowed custom-drawn apps, the backend briefly uses copy; original clipboard content is restored only if it was not modified again.
+3. When standard APIs cannot read allowed custom-drawn apps, the backend briefly uses copy; original clipboard content is restored only if it was not modified again. If the current clipboard cannot be snapshotted completely (a screenshot, for example), the temporary copy is skipped and the clipboard is left alone.
 4. The Rust runtime validates the selection and positions the toolbar.
 5. On action click, local actions run on device; AI actions create a request session and send text.
 6. reqwest receives OpenAI-compatible Chat Completions SSE; after the first token, each content delta is forwarded immediately to the result window (no extra TTFB batching).
@@ -132,7 +134,7 @@ Main directories:
 - API keys are AES-256-GCM encrypted locally; macOS Keychain and Windows Credential Manager are not used.
 - Webviews use Tauri’s isolation model, a strict CSP, and minimal capabilities.
 - Markdown does not enable raw HTML; scripts, event handlers, dangerous protocols, and remote images are not executed.
-- External links allow HTTP and HTTPS only; logs must not record API keys or selected text.
+- External links allow HTTP and HTTPS only; logs must not record API keys or selected text. Selection tracing is opt-in via `TEXTLENS_SELECTION_TRACE` and records selection length plus a hash by default; a masked prefix appears only with `TEXTLENS_TRACE_CONTENT`.
 - OpenAI-compatible base URLs may be HTTP or HTTPS. HTTP sends keys and content in the clear—use only on localhost or trusted LAN; prefer HTTPS elsewhere.
 - Base URLs need a version prefix such as `https://api.openai.com/v1`, without `/chat/completions`. Connection tests hit `{baseUrl}/models`; actions hit `{baseUrl}/chat/completions`.
 

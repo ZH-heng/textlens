@@ -47,6 +47,8 @@ TextLens 当前没有声明独立的开源许可证。Cherry Studio 改编材料
 - **问AI 会话：** 以划词为上下文打开结果窗，可先不请求模型，再在底部多轮提问；会话仅限当前结果窗。
 - **思考与流式：** 支持 thinking / reasoning 流式展示；按模型名自动推断思考档位（含「关闭思考」）；流式输出跟手显示。
 - **服务商启停：** 禁用的服务商不出现在动作模型选择与结果窗换模列表（已绑定仍可运行）。
+- **与宿主应用共存：** 剪贴板里有截图等无法完整保留的内容时直接放弃临时复制，不动你的剪贴板；点击工具栏动作后自动取消原文的选中高亮；划词工具栏不会因为残留选区被误点而反复弹出。
+- **键盘可达：** 工具栏焦点环、模型列表 listbox 导航、单选组方向键与拖动排序均可用键盘完成；设置页按 7 个分区组织，校验错误就地显示在对应字段。
 - **轻量与隐私：** 基于 Tauri 的独立划词工具；API Key 本地加密；不保存划词历史，仅在用户主动点 AI 动作时发送选中文字。
 
 ## 技术栈
@@ -103,7 +105,7 @@ macOS 使用系统自带的 WKWebView；Windows 使用 Microsoft Edge WebView2 R
 
 1. 平台选区后端监听全局鼠标、键盘和滚轮事件；macOS 使用 Accessibility/Event Tap，Windows 使用 UI Automation/低级输入钩子。Windows 为每个 Hook 实例分配 token，只在实例异常退出或被确认替换时安装新实例，避免周期性盲重装。
 2. Windows 将可能被第三方 provider 阻塞的 UIA/OLE 捕获放在同一可执行文件启动的内部 helper 进程中；helper 超时、崩溃或协议异常时会被隔离并重建，不会占满主进程捕获线程。
-3. 标准接口无法读取允许兼容的自绘应用时，平台后端临时触发复制；仅在剪贴板没有被再次修改时恢复完整原内容。
+3. 标准接口无法读取允许兼容的自绘应用时，平台后端临时触发复制；仅在剪贴板没有被再次修改时恢复完整原内容。若当前剪贴板无法完整快照（例如截图工具留下的位图），这次临时复制直接放弃，不改写剪贴板。
 4. Rust 运行时验证选区并计算工具栏位置。
 5. 用户点击动作后，普通动作在本地执行；AI 动作才会创建请求会话并发送文本。
 6. reqwest 接收 OpenAI-compatible Chat Completions 的 SSE 数据；首 token 后每个 content delta 立即下发到结果窗口（不再为 TTFB 做额外合并）。
@@ -132,7 +134,7 @@ macOS 使用系统自带的 WKWebView；Windows 使用 Microsoft Edge WebView2 R
 - API Key 使用 AES-256-GCM 加密后保存在本地，不访问 macOS 钥匙串或 Windows 凭据管理器。
 - 所有网页窗口使用 context isolation 对应的 Tauri 隔离模型、严格 CSP 和最小 capability。
 - Markdown 不启用原始 HTML；脚本、事件属性、危险协议和远程图片不会被直接执行。
-- 外链只允许 HTTP 和 HTTPS，日志不应记录 API Key 或选中文本。
+- 外链只允许 HTTP 和 HTTPS，日志不应记录 API Key 或选中文本。划词诊断需显式设置 `TEXTLENS_SELECTION_TRACE` 才输出，且默认只记录选区长度与哈希，另设 `TEXTLENS_TRACE_CONTENT` 才附加脱敏前缀。
 - OpenAI-compatible 服务地址支持 HTTP 和 HTTPS。HTTP 会使 API Key 和内容在网络中以未加密方式传输，只建议用于本机或可信局域网；其他场景应使用 HTTPS。
 - 服务地址需要包含版本前缀，例如 https://api.openai.com/v1，但不要包含 /chat/completions。连接测试访问 {baseUrl}/models，正式动作访问 {baseUrl}/chat/completions。
 

@@ -23,9 +23,12 @@ const IDENTITY_TOKENS = [
   '--text',
   '--text-secondary',
   '--text-tertiary',
+  '--border',
+  '--border-strong',
   '--accent',
   '--accent-hover',
-  '--accent-soft'
+  '--accent-soft',
+  '--on-accent'
 ] as const
 
 const CSS_FILES = [stylesCss, themesCss, resultCss, settingsCss, toolbarCss]
@@ -86,5 +89,39 @@ describe('appearance themes', () => {
       /\.button--primary\s*\{[^}]*color:\s*var\(--on-accent\)/
     )
     expect(stylesCss.match(/--on-accent\s*:/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+  })
+
+  it('defines the shared spacing, type and radius scales', () => {
+    const tokens = tokenNames(stylesCss)
+    for (let step = 1; step <= 8; step += 1) {
+      expect(tokens.has(`--space-${step}`), `missing --space-${step}`).toBe(true)
+    }
+    for (const token of [
+      '--text-xs',
+      '--text-sm',
+      '--text-md',
+      '--text-lg',
+      '--text-xl',
+      '--weight-regular',
+      '--weight-medium',
+      '--weight-semibold',
+      '--weight-bold',
+      '--radius-xs',
+      '--radius-sm',
+      '--radius-md',
+      '--radius-lg',
+      '--radius-pill',
+      '--border-subtle',
+      '--scrim'
+    ]) {
+      expect(tokens.has(token), `missing ${token}`).toBe(true)
+    }
+  })
+
+  it('keeps font weights and radii on tokens outside the token block', () => {
+    for (const css of CSS_FILES) {
+      expect(css).not.toMatch(/font-weight:\s*[0-9]/)
+      expect(css).not.toMatch(/border-radius:[^;]*[0-9]+px/)
+    }
   })
 })

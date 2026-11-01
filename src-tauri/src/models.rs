@@ -713,6 +713,9 @@ impl ActionDefinition {
     }
 }
 
+// Unknown fields are intentionally ignored: downgrading to an older build must
+// not reject a file written by a newer one. Known fields still go through
+// normalization and validation, and the version field gates migrations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -826,14 +829,14 @@ pub struct UpdateProviderInput {
     pub models: Option<Vec<ProviderModel>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Point {
-    pub x: i32,
-    pub y: i32,
+    pub x: f64,
+    pub y: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecuteActionRequest {
     pub session_id: String,
@@ -1311,7 +1314,8 @@ impl AppSettings {
                 let model_id = action.model_id.get_or_insert_with(String::new);
                 *provider_id = provider_id.trim().to_owned();
                 *model_id = model_id.trim().to_owned();
-                let mut model_levels: &[ThinkingLevel] = &[];
+                let mut model_levels: std::borrow::Cow<'_, [ThinkingLevel]> =
+                    std::borrow::Cow::Borrowed(&[]);
                 if provider_id.is_empty() {
                     if !model_id.is_empty() {
                         return Err(format!("动作“{}”设置了模型但未设置服务商", action.name));
@@ -1326,10 +1330,26 @@ impl AppSettings {
                             .iter()
                             .find(|model| model.id == *model_id)
                             .ok_or_else(|| format!("动作“{}”引用了不存在的模型", action.name))?;
-                        model_levels = model.thinking_levels.as_slice();
+                        if model.thinking_levels.is_empty() {
+                            // Model lists often arrive without thinking metadata.
+                            // The editor infers gears from the model id, so the
+                            // save path must clamp against the same inference or
+                            // a manually added thinking model silently drops to Off.
+                            model_levels = std::borrow::Cow::Owned(
+                                crate::thinking::infer_protocol_thinking_capability(
+                                    provider.protocol,
+                                    &model.id,
+                                )
+                                .map(|detected| detected.levels)
+                                .unwrap_or_default(),
+                            );
+                        } else {
+                            model_levels =
+                                std::borrow::Cow::Borrowed(model.thinking_levels.as_slice());
+                        }
                     }
                 }
-                action.thinking_mode = clamp_thinking_mode(action.thinking_mode, model_levels);
+                action.thinking_mode = clamp_thinking_mode(action.thinking_mode, &model_levels);
             } else {
                 action.prompt = None;
                 action.provider_id = None;
@@ -1479,6 +1499,19 @@ fn valid_shortcut(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execute_action_request_accepts_fractional_cursor_coordinates() {
+        let request: ExecuteActionRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "session",
+            "windowLabel": "result/session",
+            "actionId": "translate",
+            "text": "selected",
+            "cursor": { "x": 12.5, "y": -3.25 }
+        }))
+        .unwrap();
+        assert_eq!(request.cursor, Some(Point { x: 12.5, y: -3.25 }));
+    }
 
     #[test]
     fn shortcuts_use_tauri_global_hotkey_grammar() {
@@ -1878,6 +1911,37 @@ mod tests {
         settings.actions[0].thinking_mode = ThinkingMode::Medium;
         let normalized = settings.normalize_and_validate().unwrap();
         assert_eq!(normalized.actions[0].thinking_mode, ThinkingMode::Medium);
+
+        // A manually added model carries no stored levels; the editor infers
+        // them from the id, so validation must clamp against the same gears.
+        let mut settings = AppSettings::default();
+        settings.providers[0].models = vec![ProviderModel {
+            id: "gpt6-luna".to_owned(),
+            name: "gpt6-luna".to_owned(),
+            thinking_levels: Vec::new(),
+            thinking_capability: None,
+            thinking_enabled: true,
+            thinking_default: None,
+        }];
+        settings.actions[0].model_id = Some("gpt6-luna".to_owned());
+        settings.actions[0].thinking_mode = ThinkingMode::High;
+        let normalized = settings.normalize_and_validate().unwrap();
+        assert_eq!(normalized.actions[0].thinking_mode, ThinkingMode::High);
+
+        // R1 has no effort parameter, so an inferred empty gear set clamps Off.
+        let mut settings = AppSettings::default();
+        settings.providers[0].models = vec![ProviderModel {
+            id: "deepseek-r1".to_owned(),
+            name: "deepseek-r1".to_owned(),
+            thinking_levels: Vec::new(),
+            thinking_capability: None,
+            thinking_enabled: true,
+            thinking_default: None,
+        }];
+        settings.actions[0].model_id = Some("deepseek-r1".to_owned());
+        settings.actions[0].thinking_mode = ThinkingMode::High;
+        let normalized = settings.normalize_and_validate().unwrap();
+        assert_eq!(normalized.actions[0].thinking_mode, ThinkingMode::Off);
     }
 
     #[test]

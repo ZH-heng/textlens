@@ -14,9 +14,14 @@ use crate::models::{
 // Content deltas are emitted immediately (no coalesce window / byte batching)
 // so translate/explain/summary TTFB and tail fluency stay as low-latency as possible.
 const MAX_PENDING_EVENTS: usize = 256;
+/// Closed sessions only need to absorb late renderer commands for the most
+/// recent result windows. Keeping every tombstone forever slowly grows the
+/// tray process, so retain a bounded tail.
+const MAX_CLOSED_SESSIONS: usize = 64;
 
 pub(super) struct SessionTable {
     entries: HashMap<String, SessionEntry>,
+    closed_order: VecDeque<String>,
     last_session_generation: SessionGeneration,
 }
 
@@ -259,6 +264,7 @@ impl Default for SessionTable {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
+            closed_order: VecDeque::new(),
             last_session_generation: SessionGeneration(0),
         }
     }
@@ -1144,6 +1150,15 @@ impl SessionTable {
             RequestSlot::Preparing { cancellation, .. }
             | RequestSlot::Running { cancellation, .. } => Some(cancellation),
         };
+        self.closed_order.push_back(session_id.to_owned());
+        while self.closed_order.len() > MAX_CLOSED_SESSIONS {
+            let Some(oldest) = self.closed_order.pop_front() else {
+                break;
+            };
+            if matches!(self.entries.get(&oldest), Some(SessionEntry::Closed(_))) {
+                self.entries.remove(&oldest);
+            }
+        }
         CloseTransition { cancellation }
     }
 }
@@ -3269,9 +3284,26 @@ mod tests {
     }
 
     #[test]
+    fn closed_session_tombstones_stay_bounded() {
+        let mut table = SessionTable::default();
+        let total = MAX_CLOSED_SESSIONS + 8;
+        for index in 0..total {
+            let id = format!("session-{index}");
+            table.reserve_initial(initial_input(&id)).unwrap();
+            let _ = table.close(&id);
+        }
+        assert_eq!(table.entries.len(), MAX_CLOSED_SESSIONS);
+        assert!(!table.entries.contains_key("session-0"));
+        assert!(table
+            .entries
+            .contains_key(&format!("session-{}", total - 1)));
+    }
+
+    #[test]
     fn generation_exhaustion_returns_error_without_wrapping_or_partial_mutation() {
         let mut session_exhausted = SessionTable {
             entries: Default::default(),
+            closed_order: Default::default(),
             last_session_generation: SessionGeneration(MAX_WIRE_COUNTER),
         };
         assert_eq!(

@@ -64,7 +64,9 @@ const FAMILY_LEVELS: Record<ThinkingFamily, ThinkingLevel[]> = {
   claude: STANDARD_THREE,
   gemini: STANDARD_THREE,
   deepseekMax: DEEPSEEK_V4_LEVELS,
-  deepseekReasoner: STANDARD_THREE,
+  // DeepSeek R1 / reasoner models reason unconditionally and expose no
+  // reasoning-effort knob, so offering gears would only produce 400s.
+  deepseekReasoner: [],
   qwen: STANDARD_THREE,
   glm: STANDARD_THREE,
   kimi: STANDARD_THREE,
@@ -204,6 +206,9 @@ export function inferredThinkingCapability(
   const family = detectThinkingFamily(modelId.trim().toLowerCase(), protocol)
   if (!family) return null
   const openAiProtocol = protocol === 'openAiChat' || protocol === 'openAiResponses'
+  if (family === 'deepseekReasoner') {
+    return { source: 'heuristic', dialect: null, supportsOff: false }
+  }
   return {
     source: 'heuristic',
     dialect: !openAiProtocol

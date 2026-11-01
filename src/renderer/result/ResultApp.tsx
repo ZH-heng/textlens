@@ -57,6 +57,7 @@ import {
   beginAssistantTurn,
   isAskAction,
   patchStreamingAssistant,
+  transcriptToPlainText,
   type TranscriptTurn
 } from './conversationTranscript'
 import { ResultOutput, stripLeadingBlankLines } from './ResultOutput'
@@ -438,6 +439,7 @@ function ResultSessionApp({
   const contentRef = useRef<HTMLDivElement>(null)
   const contentInnerRef = useRef<HTMLDivElement>(null)
   const modelSwitchRef = useRef<HTMLDivElement>(null)
+  const modelMenuRef = useRef<HTMLDivElement>(null)
   const modelToggleRef = useRef<HTMLButtonElement>(null)
   const copyResetTimer = useRef<number | null>(null)
   const selectionFrame = useRef<number | null>(null)
@@ -618,11 +620,14 @@ function ResultSessionApp({
 
   const chooseModel = useCallback((value: string): void => {
     setModelMenuOpen(false)
+    window.requestAnimationFrame(() => modelToggleRef.current?.focus())
     void switchModel(value)
   }, [switchModel])
 
   const copy = useCallback(async (): Promise<void> => {
-    const content = getActionEventSnapshot().content
+    const content = isAsk && turns.length > 0
+      ? transcriptToPlainText(turns)
+      : getActionEventSnapshot().content
     if (!content) return
     setCommandMessage('')
     try {
@@ -636,7 +641,7 @@ function ResultSessionApp({
     } catch (error) {
       setCommandMessage(getErrorMessage(error, '复制失败'))
     }
-  }, [])
+  }, [isAsk, turns])
 
   const submitFollowUp = useCallback(async (): Promise<void> => {
     const question = followUpQuestion.trim()
@@ -828,20 +833,59 @@ function ResultSessionApp({
         window.requestAnimationFrame(() => modelToggleRef.current?.focus())
       }
     }
+    const focusFrame = window.requestAnimationFrame(() => {
+      const menu = modelMenuRef.current
+      const target =
+        menu?.querySelector<HTMLButtonElement>('[role="option"][aria-selected="true"]:not(:disabled)')
+        ?? menu?.querySelector<HTMLButtonElement>('[role="option"]:not(:disabled)')
+      target?.focus()
+    })
+    const enabledOptions = (): HTMLButtonElement[] => {
+      const menu = modelMenuRef.current
+      return menu
+        ? Array.from(menu.querySelectorAll<HTMLButtonElement>('[role="option"]:not(:disabled)'))
+        : []
+    }
     const onPointerDown = (event: PointerEvent): void => {
       const target = event.target
       if (target instanceof Node && modelSwitchRef.current?.contains(target)) return
       close(false)
     }
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key !== 'Escape') return
-      event.preventDefault()
-      event.stopPropagation()
-      close(true)
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        event.stopPropagation()
+        close(true)
+        return
+      }
+      const options = enabledOptions()
+      if (options.length === 0) return
+      const index = options.indexOf(document.activeElement as HTMLButtonElement)
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault()
+        const delta = event.key === 'ArrowDown' ? 1 : -1
+        const next = index < 0
+          ? (delta > 0 ? 0 : options.length - 1)
+          : (index + delta + options.length) % options.length
+        options[next]?.focus()
+        return
+      }
+      if (event.key === 'Home' || event.key === 'End') {
+        event.preventDefault()
+        options[event.key === 'Home' ? 0 : options.length - 1]?.focus()
+        return
+      }
+      if ((event.key === 'Enter' || event.key === ' ') && index >= 0) {
+        event.preventDefault()
+        options[index]?.click()
+        return
+      }
+      if (event.key === 'Tab') close(false)
     }
     document.addEventListener('pointerdown', onPointerDown, true)
     window.addEventListener('keydown', onKeyDown, true)
     return () => {
+      window.cancelAnimationFrame(focusFrame)
       document.removeEventListener('pointerdown', onPointerDown, true)
       window.removeEventListener('keydown', onKeyDown, true)
     }
@@ -882,14 +926,21 @@ function ResultSessionApp({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [])
 
+  const translationTargetSessionRef = useRef<string | null>(null)
+
   useEffect(() => {
-    if (action?.kind !== 'translate' || !session?.selection || !settings) {
+    if (action?.kind !== 'translate' || !session?.selection || !settingsLoaded) {
+      translationTargetSessionRef.current = null
       setTranslationTarget(null)
       return
     }
+    // Derive the default route once per session. Re-running on every settings
+    // identity change would clobber the user's temporary target-language pick.
+    if (translationTargetSessionRef.current === session.sessionId) return
+    translationTargetSessionRef.current = session.sessionId
     const detected = detectTranslationLanguage(session.selection.text)
     setTranslationTarget(defaultTranslationTarget(detected, settings.translate))
-  }, [action?.kind, session?.sessionId, session?.selection, settings?.translate])
+  }, [action?.kind, session?.sessionId, settingsLoaded])
 
   const openExternal = useCallback(async (url: string): Promise<void> => {
     setCommandMessage('')
@@ -1121,6 +1172,7 @@ function ResultSessionApp({
                   aria-label="切换模型"
                   aria-haspopup="listbox"
                   aria-expanded={modelMenuOpen}
+                  aria-controls="result-model-menu"
                   disabled={modelSwitchDisabled}
                   onClick={() => setModelMenuOpen((current) => !current)}
                 >
@@ -1128,7 +1180,13 @@ function ResultSessionApp({
                   <ChevronDown size={13} aria-hidden="true" />
                 </button>
                 {modelMenuOpen && (
-                  <div className="result-model-menu" role="listbox" aria-label="可用模型">
+                  <div
+                    ref={modelMenuRef}
+                    id="result-model-menu"
+                    className="result-model-menu"
+                    role="listbox"
+                    aria-label="可用模型"
+                  >
                     {modelGroups.map((provider) => (
                       <div
                         key={provider.id}
@@ -1150,6 +1208,7 @@ function ResultSessionApp({
                                 type="button"
                                 role="option"
                                 aria-selected={selected}
+                                tabIndex={selected ? 0 : -1}
                                 disabled={!provider.keyConfigured || modelSwitchDisabled}
                                 onClick={() => chooseModel(choice.value)}
                               >

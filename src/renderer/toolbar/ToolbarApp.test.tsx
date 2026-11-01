@@ -738,7 +738,7 @@ describe('ToolbarApp', () => {
 
     fireEvent.pointerLeave(toolbar)
     expect(translate).not.toHaveAttribute('data-hovered')
-    expect(toolbarCss).toMatch(/\.toolbar-action\[data-hovered='true'\]:not\(:disabled\)\s*\{/)
+    expect(toolbarCss).toMatch(/\.toolbar-action\[data-hovered='true'\]:not\(:disabled\)[^{}]*\{/)
     expect(toolbarCss).not.toMatch(/\.toolbar-action:hover/)
   })
 
@@ -877,22 +877,28 @@ describe('ToolbarApp', () => {
     expect(getSettings.mock.calls.length).toBeGreaterThan(callsAfterStartupFailure)
   })
 
-  it('keeps focus and active states visually neutral and reserves feedback for hover', () => {
-    expect(toolbarCss).not.toMatch(/outline:\s*2px/)
+  it('keeps mouse states neutral but shows a focus ring for keyboard users', () => {
     expect(toolbarCss).toContain('background: var(--surface-muted)')
     expect(toolbarCss).toMatch(
       /\.toolbar-action\s*\{[^}]*transition:\s*background-color\s+\d+ms[^,;]*,\s*color\s+\d+ms/s
     )
 
-    const stateRules = toolbarCss.matchAll(
-      /[^{}]*:(?:focus|focus-visible|active)[^{}]*\{([^}]*)\}/g
+    const focusVisible = toolbarCss.match(/\.toolbar-action:focus-visible[^{}]*\{([^}]*)\}/s)
+    expect(focusVisible?.[1]).toMatch(/outline:\s*2px solid/)
+    expect(toolbarCss).toMatch(
+      /\.toolbar-action:focus\s*\{[^}]*outline:\s*none/s
     )
-    for (const [, declarations] of stateRules) {
+
+    const activeRules = toolbarCss.matchAll(/[^{}]*:active[^{}]*\{([^}]*)\}/g)
+    for (const [, declarations] of activeRules) {
       expect(declarations).not.toMatch(/background\s*:/)
       expect(declarations).not.toMatch(/transform\s*:/)
-      expect(declarations).toMatch(/box-shadow:\s*none/)
-      expect(declarations).toMatch(/outline:\s*none/)
     }
+
+    const hoverOrBusy = toolbarCss.match(
+      /\.toolbar-action\[data-hovered='true'\][^{}]*,[^{}]*\[data-busy='true'\]\s*\{([^}]*)\}/s
+    )
+    expect(hoverOrBusy?.[1]).toMatch(/color:\s*var\(--accent\)/)
   })
 
   it('uses the compact action sizes and has no close-control styling', () => {

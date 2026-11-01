@@ -45,6 +45,10 @@ const RESULT_CURSOR_LEFT_ANCHOR_RATIO: f64 = 0.20;
 const RESULT_VERTICAL_SHIFT_RATIO: f64 = 0.30;
 #[cfg(target_os = "windows")]
 const RESULT_BLUR_VERIFY_DELAY: Duration = Duration::from_millis(60);
+/// Mirrors the Windows window-operation bound: a stalled AppKit main loop must
+/// not freeze the single selection-event consumer indefinitely.
+#[cfg(target_os = "macos")]
+const MACOS_MAIN_THREAD_HOP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "windows")]
 const RESULT_BLUR_VERIFY_ATTEMPTS: usize = 2;
 #[cfg(target_os = "windows")]
@@ -2549,7 +2553,9 @@ pub fn restore_source_app_activation(app: &AppHandle, bundle_id: &str) -> bool {
     {
         return false;
     }
-    receiver.recv().unwrap_or(false)
+    receiver
+        .recv_timeout(MACOS_MAIN_THREAD_HOP_TIMEOUT)
+        .unwrap_or(false)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2584,7 +2590,7 @@ fn configure_toolbar_native(window: &WebviewWindow) -> tauri::Result<()> {
         let _ = sender.send(result);
     })?;
     receiver
-        .recv()
+        .recv_timeout(MACOS_MAIN_THREAD_HOP_TIMEOUT)
         .map_err(|_| tauri::Error::FailedToReceiveMessage)??;
     install_toolbar_mouse_tracking(window)?;
     Ok(())
@@ -2639,7 +2645,7 @@ fn configure_result_native(window: &WebviewWindow, pinned: bool) -> tauri::Resul
         let _ = sender.send(result);
     })?;
     receiver
-        .recv()
+        .recv_timeout(MACOS_MAIN_THREAD_HOP_TIMEOUT)
         .map_err(|_| tauri::Error::FailedToReceiveMessage)??;
     Ok(())
 }
@@ -2772,7 +2778,7 @@ fn commit_toolbar_presentation(window: &WebviewWindow, layout: WindowLayout) -> 
         let _ = sender.send(result);
     })?;
     receiver
-        .recv()
+        .recv_timeout(MACOS_MAIN_THREAD_HOP_TIMEOUT)
         .map_err(|_| tauri::Error::FailedToReceiveMessage)??;
     Ok(())
 }
@@ -2792,7 +2798,7 @@ fn order_front_without_focus(window: &WebviewWindow) -> tauri::Result<()> {
         let _ = sender.send(result);
     })?;
     receiver
-        .recv()
+        .recv_timeout(MACOS_MAIN_THREAD_HOP_TIMEOUT)
         .map_err(|_| tauri::Error::FailedToReceiveMessage)??;
     Ok(())
 }
@@ -2843,7 +2849,7 @@ fn set_native_alpha_raw(window: &WebviewWindow, alpha: f64) -> tauri::Result<()>
         let _ = sender.send(result);
     })?;
     receiver
-        .recv()
+        .recv_timeout(MACOS_MAIN_THREAD_HOP_TIMEOUT)
         .map_err(|_| tauri::Error::FailedToReceiveMessage)??;
     Ok(())
 }

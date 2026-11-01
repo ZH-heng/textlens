@@ -5,6 +5,7 @@ import '../styles.css'
 import '../themes.css'
 import './toolbar.css'
 import { installTauriBridge } from '../lib/tauriBridge'
+import { WindowErrorBoundary } from '../lib/ErrorBoundary'
 import { applyTheme, storedTheme } from '../lib/theme'
 import { ToolbarApp } from './ToolbarApp'
 
@@ -19,6 +20,8 @@ if (!root) {
 
 createRoot(root).render(
   <StrictMode>
-    <ToolbarApp />
+    <WindowErrorBoundary>
+      <ToolbarApp />
+    </WindowErrorBoundary>
   </StrictMode>
 )

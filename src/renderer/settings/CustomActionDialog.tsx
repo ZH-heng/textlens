@@ -215,6 +215,17 @@ export function CustomActionDialog({
   )
 
   useEffect(() => {
+    const bodyOverflow = document.body.style.overflow
+    const rootOverflow = document.documentElement.style.overflow
+    document.body.style.overflow = 'hidden'
+    document.documentElement.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = bodyOverflow
+      document.documentElement.style.overflow = rootOverflow
+    }
+  }, [])
+
+  useEffect(() => {
     nameRef.current?.focus()
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') onCancel()
@@ -332,7 +343,7 @@ export function CustomActionDialog({
           </button>
         </header>
         <form className="dialog-form" onSubmit={submit}>
-          <div className="dialog-form-grid">
+          <div className={`dialog-form-grid${action ? ' dialog-form-grid--single' : ''}`}>
             <label className="field">
               <span className="field__label">动作名称</span>
               <input
@@ -347,18 +358,20 @@ export function CustomActionDialog({
                 }}
               />
             </label>
-            <label className="field">
-              <span className="field__label">动作类型</span>
-              <select
-                className="control"
-                value={kind}
-                onChange={(event) => changeKind(event.target.value as ActionKind)}
-              >
-                {Object.entries(ACTION_KIND_NAMES).map(([value, label]) => (
-                  <option value={value} key={value}>{label}</option>
-                ))}
-              </select>
-            </label>
+            {!action && (
+              <label className="field">
+                <span className="field__label">动作类型</span>
+                <select
+                  className="control"
+                  value={kind}
+                  onChange={(event) => changeKind(event.target.value as ActionKind)}
+                >
+                  {Object.entries(ACTION_KIND_NAMES).map(([value, label]) => (
+                    <option value={value} key={value}>{label}</option>
+                  ))}
+                </select>
+              </label>
+            )}
           </div>
 
           <label className="field">

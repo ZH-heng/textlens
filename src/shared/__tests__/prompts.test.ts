@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -13,6 +15,23 @@ import {
   type ActionDefinition,
   type ActionKind
 } from '..'
+
+const rustModelsSource = readFileSync(
+  resolve(process.cwd(), 'src-tauri/src/models.rs'),
+  'utf8'
+)
+
+function rustPromptDefault(name: string): string {
+  const source = rustModelsSource
+  const raw = new RegExp(`pub const ${name}: &str = r#"([\\s\\S]*?)"#;`, 'u').exec(source)
+  if (raw) return raw[1]!
+  const quoted = new RegExp(
+    `pub const ${name}: &str = "((?:\\\\.|[^"\\\\])*)";`,
+    'u'
+  ).exec(source)
+  if (!quoted) throw new Error(`missing Rust prompt default ${name}`)
+  return JSON.parse(`"${quoted[1]}"`) as string
+}
 
 const action = (kind: ActionKind): ActionDefinition => {
   const base = { id: kind, name: kind, icon: 'sparkles', kind, enabled: true, order: 0 }
@@ -51,7 +70,7 @@ Rules:
       '用 {{language}} 概括以下内容的核心观点、关键事实、结论与必要限定；不编造原文没有的信息。内容复杂时可用简洁 Markdown。直接输出摘要。\n\n{{text}}'
     )
     expect(DEFAULT_ACTION_PROMPTS.explain).toBe(
-      '请解释下面的内容。要求：使用 {{language}} 语言进行回复；请不要包含对本提示词的任何解释，直接给出回复： \n\n{{text}}'
+      '用 {{language}} 对所选内容做**整体解释**：用通俗语言说明这段话在讲什么、核心意思是什么。不要逐词逐句拆解，也不要对每个术语做百科式展开；仅当文中出现对理解整体至关重要的术语时，用一两句补充。信息不足时说明，勿臆测。表述简洁，可用 Markdown。直接输出解释。\n\n{{text}}'
     )
     expect(DEFAULT_ACTION_PROMPTS.refine).toBe(
       '请对用XML标签<INPUT>包裹的用户输入内容进行优化或润色，并保持原内容的含义和完整性。要求：你的输出应当与用户输入内容的语言相同；请不要包含对本提示词的任何解释，直接给出回复；请不要输出XML标签，直接输出优化后的内容: \n\n<INPUT>{{text}}</INPUT>'
@@ -168,7 +187,7 @@ Rules:
       sourceBoundarySeed: 'explain-test'
     })
     expect(explainResult.userPrompt).toBe(
-      `请解释下面的内容。要求：使用 en-US 语言进行回复；请不要包含对本提示词的任何解释，直接给出回复： \n\n${explainResult.sourceBoundary!.begin}\nsource\n${explainResult.sourceBoundary!.end}`
+      `用 en-US 对所选内容做**整体解释**：用通俗语言说明这段话在讲什么、核心意思是什么。不要逐词逐句拆解，也不要对每个术语做百科式展开；仅当文中出现对理解整体至关重要的术语时，用一两句补充。信息不足时说明，勿臆测。表述简洁，可用 Markdown。直接输出解释。\n\n${explainResult.sourceBoundary!.begin}\nsource\n${explainResult.sourceBoundary!.end}`
     )
     expect(summaryResult.userPrompt).not.toContain(
       OUTPUT_LANGUAGE_PLACEHOLDER
@@ -226,5 +245,13 @@ Rules:
     const built = buildActionPrompt(action('ask'), '选中的句子')
     expect(built.userPrompt).toContain('选中的句子')
     expect(built.userPrompt).toContain('<selection>')
+  })
+
+  it('keeps Rust prompt defaults in lockstep with the shared built-ins', () => {
+    expect(rustPromptDefault('DEFAULT_TRANSLATE_PROMPT')).toBe(DEFAULT_ACTION_PROMPTS.translate)
+    expect(rustPromptDefault('DEFAULT_SUMMARY_PROMPT')).toBe(DEFAULT_ACTION_PROMPTS.summary)
+    expect(rustPromptDefault('DEFAULT_EXPLAIN_PROMPT')).toBe(DEFAULT_ACTION_PROMPTS.explain)
+    expect(rustPromptDefault('DEFAULT_REFINE_PROMPT')).toBe(DEFAULT_ACTION_PROMPTS.refine)
+    expect(rustPromptDefault('DEFAULT_ASK_PROMPT')).toBe(DEFAULT_ACTION_PROMPTS.ask)
   })
 })

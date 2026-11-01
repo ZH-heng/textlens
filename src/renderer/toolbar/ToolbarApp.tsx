@@ -557,6 +557,7 @@ export function ToolbarApp(): JSX.Element {
               key={action.id}
               data-toolbar-control={`action:${action.id}`}
               data-hovered={hoveredControlId === `action:${action.id}` ? 'true' : undefined}
+              data-busy={busy ? 'true' : undefined}
               title={action.name}
               aria-label={action.name}
               disabled={busy}

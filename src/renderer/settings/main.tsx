@@ -5,6 +5,7 @@ import '../styles.css'
 import '../themes.css'
 import './settings.css'
 import { installTauriBridge } from '../lib/tauriBridge'
+import { WindowErrorBoundary } from '../lib/ErrorBoundary'
 import { applyTheme, storedTheme } from '../lib/theme'
 import { SettingsApp } from './SettingsApp'
 
@@ -19,6 +20,8 @@ if (!root) {
 
 createRoot(root).render(
   <StrictMode>
-    <SettingsApp />
+    <WindowErrorBoundary>
+      <SettingsApp />
+    </WindowErrorBoundary>
   </StrictMode>
 )

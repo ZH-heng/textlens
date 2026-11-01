@@ -244,6 +244,9 @@ impl ThinkingFamily {
         match self {
             ThinkingFamily::Gpt => openai_full_levels(),
             ThinkingFamily::DeepSeekMax => deepseek_v4_levels(),
+            // R1/reasoner models reason unconditionally and expose no
+            // reasoning-effort parameter, so there is no gear to offer.
+            ThinkingFamily::DeepSeekReasoner => Vec::new(),
             _ => standard_levels(),
         }
     }
@@ -443,6 +446,9 @@ fn detect_openai_family(id: &str) -> Option<ThinkingFamily> {
 pub fn infer_thinking_capability(model_id: &str) -> Option<DetectedThinkingCapability> {
     let id = model_id.trim().to_ascii_lowercase();
     let family = detect_openai_family(&id)?;
+    if family == ThinkingFamily::DeepSeekReasoner {
+        return Some(detected_from_family(family, None, false));
+    }
     Some(detected_from_family(
         family,
         Some(family.openai_dialect()),
@@ -1157,7 +1163,6 @@ mod tests {
             "grok-4-fast",
             "magistral-medium-2506",
             "gpt-oss-120b",
-            "deepseek-r1",
         ] {
             let detected =
                 infer_protocol_thinking_capability(ProviderProtocol::OpenAiChat, id).unwrap();
@@ -1168,6 +1173,15 @@ mod tests {
                 "{id}"
             );
         }
+
+        // DeepSeek R1/reasoner always reasons and accepts no effort field;
+        // exposing gears would make every level request fail.
+        let deepseek_reasoner =
+            infer_protocol_thinking_capability(ProviderProtocol::OpenAiChat, "deepseek-r1")
+                .unwrap();
+        assert!(deepseek_reasoner.levels.is_empty());
+        assert_eq!(deepseek_reasoner.capability.dialect, None);
+        assert!(!deepseek_reasoner.capability.supports_off);
 
         for id in [
             "gpt-4o",

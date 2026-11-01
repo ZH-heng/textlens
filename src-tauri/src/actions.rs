@@ -129,7 +129,7 @@ impl ChatMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct FrozenActionRequest {
     window_label: String,
     action_id: String,
@@ -157,7 +157,7 @@ struct SessionRoute {
     thinking: thinking::ThinkingRequestPlan,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ActionSessionContext {
     session_generation: SessionGeneration,
     request_generation: RequestGeneration,
@@ -176,7 +176,7 @@ struct RetryPreparationOptions {
     model_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum FrozenPreparationSeed {
     Initial {
         request: FrozenActionRequest,
@@ -216,7 +216,7 @@ pub(crate) struct ActionBeginReady {
     pub route: Option<SessionRouteIdentity>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct PreparedSessionData {
     frozen_request: FrozenActionRequest,
     route: SessionRoute,
@@ -603,19 +603,20 @@ impl ActionServiceState {
             let content = self
                 .sessions
                 .completed_content_for(ticket)
-                .expect("Applied Completed keeps its authoritative snapshot")
-                .to_owned();
-            let context = self
-                .contexts
-                .get_mut(&ticket.session_id)
-                .filter(|context| {
-                    context.session_generation == ticket.session_generation
-                        && context.request_generation == ticket.request_generation
-                })
-                .expect("Running network tickets have a matching installed context");
-            let mut committed = context.last_messages.clone();
-            committed.push(ChatMessage::assistant(content));
-            context.committed_messages = committed;
+                .map(str::to_owned);
+            let context = self.contexts.get_mut(&ticket.session_id).filter(|context| {
+                context.session_generation == ticket.session_generation
+                    && context.request_generation == ticket.request_generation
+            });
+            // Both lookups are guaranteed by the Applied transition, but a
+            // logic bug must not panic inside a network task.
+            debug_assert!(content.is_some(), "Applied Completed keeps its snapshot");
+            debug_assert!(context.is_some(), "Running tickets keep their context");
+            if let (Some(content), Some(context)) = (content, context) {
+                let mut committed = context.last_messages.clone();
+                committed.push(ChatMessage::assistant(content));
+                context.committed_messages = committed;
+            }
         }
         Ok(transition)
     }
@@ -1796,7 +1797,7 @@ fn resolve_route(
         .models
         .iter()
         .find(|model| model.id == model_id)
-        .expect("prepared_provider validated the selected model");
+        .ok_or_else(|| ActionServiceError::Validation("选择的模型不存在，请重新选择".to_owned()))?;
     let thinking = thinking::resolve_thinking_for_request(
         provider.protocol,
         model_id,
@@ -2361,7 +2362,7 @@ fn valid_routing_id(value: &str, max_len: usize) -> bool {
 }
 
 fn valid_model_id(value: &str) -> bool {
-    !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+    !value.trim().is_empty() && value.chars().count() <= 256 && !value.chars().any(char::is_control)
 }
 
 fn valid_window_label(value: &str) -> bool {

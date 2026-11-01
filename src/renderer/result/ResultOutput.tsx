@@ -283,7 +283,7 @@ function ResultOutputInstance({
   // request reveals Markdown syntax, keep that renderer through completion so
   // the terminal event does not replace the whole plain-text DOM.
   const richModeRef = useRef(false)
-  if (shouldRenderRichMarkdown(content, contentScalarCount)) {
+  if (!richModeRef.current && shouldRenderRichMarkdown(content, contentScalarCount)) {
     richModeRef.current = true
   }
   const eligible = richModeRef.current &&

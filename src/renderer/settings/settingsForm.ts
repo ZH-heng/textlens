@@ -80,60 +80,107 @@ export function removeProviderModelFromSettings(
   }
 }
 
+export type SettingsFieldError =
+  | 'translation'
+  | 'captureShortcut'
+  | 'actions'
+  | `provider:${string}:baseUrl`
+  | `action:${string}`
+
 export function buildSettingsUpdate(settings: PublicSettings):
   | { valid: true; value: SettingsUpdate }
-  | { valid: false; message: string } {
+  | { valid: false; message: string; field?: SettingsFieldError } {
   if (settings.translate.defaultLanguage === settings.translate.targetLanguage) {
-    return { valid: false, message: '默认语言和翻译语言不能相同' }
+    return { valid: false, field: 'translation', message: '默认语言和翻译语言不能相同' }
   }
 
   const captureShortcut = settings.captureShortcut.trim()
   if (!isValidTauriGlobalShortcut(captureShortcut)) {
     return {
       valid: false,
+      field: 'captureShortcut',
       message: '捕获快捷键格式无效，请使用例如 CommandOrControl+Shift+S 的格式'
     }
   }
   if (settings.trigger.mode === 'shortcut' && captureShortcut === '') {
     return {
       valid: false,
+      field: 'captureShortcut',
       message: '快捷键触发模式需要设置捕获快捷键'
     }
   }
 
   for (const provider of settings.providers) {
     const validation = validateOpenAiBaseUrl(provider.baseUrl.trim())
-    if (!validation.valid) return { valid: false, message: `“${provider.name}”：${validation.reason}` }
+    if (!validation.valid) {
+      return {
+        valid: false,
+        field: `provider:${provider.id}:baseUrl`,
+        message: `“${provider.name}”：${validation.reason}`
+      }
+    }
   }
 
   const actions = sortAndNumberActions(settings.actions)
   const enabledCount = actions.filter((action) => action.enabled).length
-  if (enabledCount < 1) return { valid: false, message: '至少需要启用一个工具栏动作' }
+  if (enabledCount < 1) {
+    return { valid: false, field: 'actions', message: '至少需要启用一个工具栏动作' }
+  }
   if (enabledCount > MAX_ENABLED_ACTIONS) {
-    return { valid: false, message: `最多只能启用 ${MAX_ENABLED_ACTIONS} 个动作` }
+    return {
+      valid: false,
+      field: 'actions',
+      message: `最多只能启用 ${MAX_ENABLED_ACTIONS} 个动作`
+    }
   }
   const customCount = actions.filter((action) => action.kind === 'custom').length
   if (customCount > MAX_CUSTOM_ACTIONS) {
-    return { valid: false, message: `最多只能创建 ${MAX_CUSTOM_ACTIONS} 个自定义动作` }
+    return {
+      valid: false,
+      field: 'actions',
+      message: `最多只能创建 ${MAX_CUSTOM_ACTIONS} 个自定义动作`
+    }
   }
 
   const providersById = new Map(settings.providers.map((provider) => [provider.id, provider]))
   for (const action of actions) {
     if (!isLucideIconName(action.icon)) {
-      return { valid: false, message: `“${action.name}”使用了无效的 Lucide 图标` }
+      return {
+        valid: false,
+        field: `action:${action.id}`,
+        message: `“${action.name}”使用了无效的 Lucide 图标`
+      }
     }
     if (isSearchActionDefinition(action) && !action.searchEngineId) {
-      return { valid: false, message: `“${action.name}”需要选择搜索引擎` }
+      return {
+        valid: false,
+        field: `action:${action.id}`,
+        message: `“${action.name}”需要选择搜索引擎`
+      }
     }
     if (!isAiActionDefinition(action)) continue
     if (!action.prompt.includes(TEXT_PLACEHOLDER)) {
-      return { valid: false, message: `“${action.name}”的提示词必须包含 ${TEXT_PLACEHOLDER}` }
+      return {
+        valid: false,
+        field: `action:${action.id}`,
+        message: `“${action.name}”的提示词必须包含 ${TEXT_PLACEHOLDER}`
+      }
     }
     if (action.providerId) {
       const provider = providersById.get(action.providerId)
-      if (!provider) return { valid: false, message: `“${action.name}”引用了不存在的服务商` }
+      if (!provider) {
+        return {
+          valid: false,
+          field: `action:${action.id}`,
+          message: `“${action.name}”引用了不存在的服务商`
+        }
+      }
       if (action.modelId && !provider.models.some((model) => model.id === action.modelId)) {
-        return { valid: false, message: `“${action.name}”引用了不存在的模型` }
+        return {
+          valid: false,
+          field: `action:${action.id}`,
+          message: `“${action.name}”引用了不存在的模型`
+        }
       }
     }
   }

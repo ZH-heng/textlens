@@ -1,4 +1,8 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
+
+import resultSessionSnapshotFixture from './fixtures/result-session-snapshot.json'
 
 import {
   AI_OUTPUT_LIMIT,
@@ -6,6 +10,7 @@ import {
   DEFAULT_ACTION_PROMPTS,
   DEFAULT_APP_SETTINGS,
   DEFAULT_PROVIDER_ID,
+  DEFAULT_SELECTION_CAPTURE_SETTINGS,
   DEFAULT_PUBLIC_SETTINGS,
   MAX_ENABLED_ACTIONS,
   SETTINGS_VERSION,
@@ -106,6 +111,15 @@ describe('settings schemas and defaults', () => {
 
     const migrated = migrateAppSettings({ ...DEFAULT_APP_SETTINGS, version: 11 })
     expect(migrated.appearance).toEqual({ theme: 'warm' })
+  })
+
+  it('rejects settings written by a newer schema version', () => {
+    const newer = { ...DEFAULT_APP_SETTINGS, version: SETTINGS_VERSION + 1 }
+    expect(() => migrateAppSettings(newer)).toThrow(/设置版本/)
+    expect(() => migratePublicSettings({
+      ...DEFAULT_PUBLIC_SETTINGS,
+      version: SETTINGS_VERSION + 1
+    })).toThrow(/设置版本/)
   })
 
   it('migrates v11 settings to visible capture compatibility rules', () => {
@@ -690,7 +704,7 @@ Return only the translated content. Do not include explanations, labels, tags, o
     expect(migrated.actions.find((action) => action.id === 'explain')).toMatchObject({
       prompt: DEFAULT_ACTION_PROMPTS.explain
     })
-    expect(DEFAULT_ACTION_PROMPTS.explain).toContain('请解释下面的内容')
+    expect(DEFAULT_ACTION_PROMPTS.explain).toContain('整体解释')
     expect(DEFAULT_ACTION_PROMPTS.explain).toContain('{{language}}')
     expect(migratedCustom.actions.find((action) => action.id === 'explain')).toMatchObject({
       prompt: customExplain
@@ -937,6 +951,17 @@ describe('action stream event schemas', () => {
       ...overrides
     })
 
+  it('accepts the shared Rust/TS result snapshot fixture', () => {
+    const parsed = resultSessionSnapshotSchema.parse(resultSessionSnapshotFixture)
+    expect(parsed).toMatchObject({
+      sessionId: 'session-fixture',
+      actionId: 'translate',
+      status: 'streaming',
+      content: '你好',
+      contentScalarCount: 2
+    })
+  })
+
   it('validates paired optional routes and exact snapshot scalar counts', () => {
     expect(resultSessionSnapshotSchema.safeParse(snapshot()).success).toBe(true)
     expect(
@@ -993,5 +1018,23 @@ describe('action stream event schemas', () => {
         generationNotice: { ...generationNotice, unexpected: true }
       })).success
     ).toBe(false)
+  })
+})
+
+describe('Rust shared defaults', () => {
+  it('keeps selection capture defaults aligned with the shared source', () => {
+    const rustModelsSource = readFileSync(
+      resolve(process.cwd(), 'src-tauri/src/models.rs'),
+      'utf8'
+    )
+    const block = /impl Default for SelectionCaptureSettings \{([\s\S]*?)\n\}/u.exec(
+      rustModelsSource
+    )?.[1] ?? ''
+    const applications = [...block.matchAll(/"([^"]+\.exe)"/gu)].map((match) => match[1])
+    expect(applications).toEqual(
+      DEFAULT_SELECTION_CAPTURE_SETTINGS.applications.map((rule) => rule.application)
+    )
+    expect(block.match(/SelectionCaptureStrategy::Clipboard/gu) ?? []).toHaveLength(1)
+    expect(block).toContain('default_strategy: SelectionCaptureStrategy::SelectionHook')
   })
 })

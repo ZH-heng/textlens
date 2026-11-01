@@ -42,7 +42,7 @@ body {
   background-color: color-mix(in srgb, var(--surface-solid) 88%, var(--surface-muted));
   border: 1px solid var(--border-strong);
   border: 1px solid color-mix(in srgb, var(--border-strong) 55%, transparent);
-  border-radius: 10px;
+  border-radius: var(--radius-control);
   box-shadow:
     inset 0 1px 0 var(--highlight),
     var(--shadow-sm);
@@ -61,11 +61,11 @@ body {
   padding: 0 10px;
   color: var(--text-secondary);
   font-size: 12px;
-  font-weight: 570;
+  font-weight: var(--weight-semibold);
   white-space: nowrap;
   background: transparent;
   border: 0;
-  border-radius: 7px;
+  border-radius: var(--radius-tag);
   box-shadow: none;
   outline: none;
   transition:
@@ -103,17 +103,28 @@ body {
   text-overflow: clip;
 }
 
-.toolbar-action[data-hovered='true']:not(:disabled) {
+.toolbar-action[data-hovered='true']:not(:disabled),
+.toolbar-action[data-busy='true'] {
   color: var(--accent);
   background: color-mix(in srgb, var(--accent-soft) 72%, var(--surface-solid));
   box-shadow: none;
 }
 
-.toolbar-action:focus,
-.toolbar-action:focus-visible,
-.toolbar-action:active {
+/* Mouse focus stays neutral: feedback belongs to hover, not to the click the
+   toolbar window receives on open. Keyboard focus must still be visible. */
+.toolbar-action:focus {
   box-shadow: none;
   outline: none;
+}
+
+.toolbar-action:active {
+  box-shadow: none;
+}
+
+.toolbar-action:focus-visible,
+.toolbar-message__action:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent);
+  outline-offset: 1px;
 }
 
 .toolbar-empty {
@@ -134,7 +145,7 @@ body {
   font-size: 12px;
   background: color-mix(in srgb, var(--danger-soft) 52%, var(--surface-solid));
   border: 1px solid color-mix(in srgb, var(--danger) 18%, transparent);
-  border-radius: 10px;
+  border-radius: var(--radius-control);
   box-shadow:
     inset 0 1px 0 var(--highlight),
     var(--shadow-sm);
@@ -161,7 +172,7 @@ body {
 .toolbar-message__content strong {
   color: var(--text);
   font-size: 12px;
-  font-weight: 650;
+  font-weight: var(--weight-bold);
 }
 
 .toolbar-message__action {
@@ -173,11 +184,11 @@ body {
   padding: 0 7px;
   color: var(--text);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: var(--weight-semibold);
   white-space: nowrap;
   background: var(--surface-muted);
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--radius-tag);
 }
 
 .toolbar-message__action[data-hovered='true'] {

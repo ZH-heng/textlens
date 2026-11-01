@@ -507,6 +507,19 @@ struct PendingResultSize {
     size: SettingsWindowSize,
 }
 
+/// Releases the per-selection launch token on every exit path, including the
+/// early rejections and cancellations inside the async action command.
+struct SelectionConsumptionGuard<'a> {
+    set: &'a Mutex<HashSet<String>>,
+    id: String,
+}
+
+impl Drop for SelectionConsumptionGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.id);
+    }
+}
+
 pub struct RuntimeState {
     pub settings: Arc<SettingsRepository>,
     pub actions: ActionService,
@@ -528,6 +541,10 @@ pub struct RuntimeState {
     /// indefinitely, so later clears are dropped instead of accumulating
     /// blocking runtime tasks.
     host_clear_in_flight: AtomicBool,
+    /// Latest unpinned result ids awaiting the 16ms reveal commit, and whether
+    /// the single delayed closer is already running.
+    close_results_pending: Mutex<Option<Vec<String>>>,
+    close_results_scheduled: AtomicBool,
     result_creation: Mutex<()>,
     result_sessions: Mutex<HashMap<String, ResultSessionMeta>>,
     result_reveals: Mutex<HashMap<String, ResultRevealHandshake>>,
@@ -563,6 +580,8 @@ impl RuntimeState {
             same_text_selection_suppress: Mutex::new(None),
             pending_host_clear_token: AtomicU64::new(0),
             host_clear_in_flight: AtomicBool::new(false),
+            close_results_pending: Mutex::new(None),
+            close_results_scheduled: AtomicBool::new(false),
             result_creation: Mutex::new(()),
             result_sessions: Mutex::new(HashMap::new()),
             result_reveals: Mutex::new(HashMap::new()),
@@ -693,7 +712,9 @@ impl RuntimeState {
                     let mut current = self.current_selection.lock();
                     if current.as_ref().is_some_and(|selection| {
                         dismiss_precedes_selection(
+                            selection.payload.sequence,
                             selection.payload.timestamp_ms,
+                            dismiss.sequence,
                             dismiss.timestamp_ms,
                         )
                     }) {
@@ -801,7 +822,7 @@ impl RuntimeState {
     }
 
     fn handle_selection(&self, app: &AppHandle, selection: SelectionPayload, force_capture: bool) {
-        let settings = self.settings.get_settings();
+        let settings = self.settings.get_settings_arc();
         if !settings.enabled || !SelectionMonitor::is_accessibility_trusted() {
             self.windows.hide_toolbar(app);
             *self.current_selection.lock() = None;
@@ -928,16 +949,34 @@ impl RuntimeState {
         if session_ids.is_empty() {
             return;
         }
+        *self.close_results_pending.lock() = Some(session_ids);
+        if self.close_results_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let app = app.clone();
         let _ = thread::Builder::new()
             .name("textlens-close-selection-results".to_owned())
-            .spawn(move || {
+            .spawn(move || loop {
                 // Let ToolbarApp's layout effect enqueue the native visible
                 // commit before closing result windows on the same UI thread.
                 thread::sleep(Duration::from_millis(16));
                 let state = app.state::<RuntimeState>();
-                if !state.shutting_down.load(Ordering::Acquire) {
-                    state.close_unpinned_result_sessions(&app, session_ids);
+                let pending = state.close_results_pending.lock().take();
+                if let Some(session_ids) = pending {
+                    if !state.shutting_down.load(Ordering::Acquire) {
+                        state.close_unpinned_result_sessions(&app, session_ids);
+                    }
+                }
+                state
+                    .close_results_scheduled
+                    .store(false, Ordering::Release);
+                if state.close_results_pending.lock().is_none() {
+                    break;
+                }
+                // A newer schedule arrived while this closer was running; keep
+                // the same timer instead of spawning one thread per mouse-up.
+                if state.close_results_scheduled.swap(true, Ordering::AcqRel) {
+                    break;
                 }
             });
     }
@@ -1345,8 +1384,8 @@ impl RuntimeState {
             action_id: action_id.to_owned(),
             text: selection.payload.text.clone(),
             cursor: Some(ActionPoint {
-                x: cursor.x.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32,
-                y: cursor.y.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32,
+                x: cursor.x,
+                y: cursor.y,
             }),
             target_language: None,
         };
@@ -1973,7 +2012,7 @@ fn build_tray_menu(
         .enabled(permission_enabled)
         .build(app)?;
     let open_settings = MenuItemBuilder::with_id(TRAY_SETTINGS_ID, "打开设置…").build(app)?;
-    let version = MenuItemBuilder::new(format!("TextLens {}", app.package_info().version))
+    let version = MenuItemBuilder::new(format!("TextLens {}", display_version(app)))
         .enabled(false)
         .build(app)?;
     let quit = MenuItemBuilder::with_id(TRAY_QUIT_ID, "退出 TextLens").build(app)?;
@@ -1986,6 +2025,32 @@ fn build_tray_menu(
         .separator()
         .item(&quit)
         .build()
+}
+
+/// The menu must show the installed bundle version, not the Cargo semver:
+/// four-part installer versions (0.4.2.3) are applied to Info.plist after the
+/// Tauri build, so `package_info()` would still report the three-part base.
+fn display_version(app: &AppHandle) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        use core_foundation::{bundle::CFBundle, string::CFString};
+        let dictionary = CFBundle::main_bundle().info_dictionary();
+        let identifier = dictionary
+            .find(&CFString::from_static_string("CFBundleIdentifier"))
+            .and_then(|value| value.downcast::<CFString>())
+            .map(|value| value.to_string());
+        if identifier.as_deref() == Some(app.config().identifier.as_str()) {
+            if let Some(version) = dictionary
+                .find(&CFString::from_static_string("CFBundleShortVersionString"))
+                .and_then(|value| value.downcast::<CFString>())
+                .map(|value| value.to_string())
+                .filter(|value| !value.trim().is_empty())
+            {
+                return version;
+            }
+        }
+    }
+    app.package_info().version.to_string()
 }
 
 fn refresh_tray(app: &AppHandle, settings: &PublicSettings) {
@@ -2706,6 +2771,10 @@ pub async fn run_action(
     {
         return Ok(RunActionResult::rejected("该选区动作正在启动，请稍候"));
     }
+    let _consuming = SelectionConsumptionGuard {
+        set: &state.consuming_selection_ids,
+        id: selection_token.clone(),
+    };
 
     let result = match action.kind {
         ActionKind::Copy => match clipboard::write_text(&selection.payload.text) {
@@ -2728,13 +2797,7 @@ pub async fn run_action(
                 search_engine_id.as_deref(),
             ) {
                 Ok(value) => value,
-                Err(message) => {
-                    state
-                        .consuming_selection_ids
-                        .lock()
-                        .remove(&selection_token);
-                    return Ok(RunActionResult::rejected(message));
-                }
+                Err(message) => return Ok(RunActionResult::rejected(message)),
             };
             match resolve_search_target(&selection.payload.text, template) {
                 Ok(target) => match open_system_url(&target) {
@@ -2815,10 +2878,6 @@ pub async fn run_action(
         }
         _ => RunActionResult::rejected("暂不支持该动作"),
     };
-    state
-        .consuming_selection_ids
-        .lock()
-        .remove(&selection_token);
     Ok(result)
 }
 
@@ -3082,6 +3141,7 @@ pub fn show_result_selection(
             .unwrap_or_default()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64,
+        sequence: 0,
     };
     let current = CurrentSelection {
         id: Uuid::new_v4().to_string(),
@@ -3382,11 +3442,19 @@ fn should_hide_toolbar_for_selection(
     }
 }
 
-fn dismiss_precedes_selection(selection_timestamp_ms: u64, dismiss_timestamp_ms: u64) -> bool {
-    // Windows hook and WinEvent timestamps have millisecond resolution. If a
-    // delayed dismiss lands in the same tick as the completed selection, the
-    // selection wins; a genuine later input receives a newer hook generation
-    // and timestamp.
+fn dismiss_precedes_selection(
+    selection_sequence: u64,
+    selection_timestamp_ms: u64,
+    dismiss_sequence: u64,
+    dismiss_timestamp_ms: u64,
+) -> bool {
+    // Native producers that supply a monotonic sequence get exact ordering.
+    // Otherwise fall back to the millisecond timestamp: Windows hook and
+    // WinEvent timestamps share a tick, and a delayed dismiss in the same tick
+    // must not kill the selection that just completed.
+    if selection_sequence != 0 && dismiss_sequence != 0 {
+        return dismiss_sequence <= selection_sequence;
+    }
     dismiss_timestamp_ms <= selection_timestamp_ms
 }
 
@@ -3401,7 +3469,7 @@ fn action_result_cursor(
             x: cursor.x,
             y: cursor.y,
         });
-        return windows_physical_cursor(
+        windows_physical_cursor(
             renderer_cursor,
             native_cursor,
             Some(WindowPoint {
@@ -3409,7 +3477,10 @@ fn action_result_cursor(
                 y: selection.mouse.current.y,
             }),
         )
-        .expect("the physical selection cursor is always available as a fallback");
+        .unwrap_or(WindowPoint {
+            x: selection.mouse.current.x,
+            y: selection.mouse.current.y,
+        })
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -3665,6 +3736,7 @@ mod tests {
             ActionNotice, ActionSnapshot, EventSequence, HandshakeGeneration, RequestGeneration,
             ResultReadyAck, SessionGeneration,
         },
+        selection::SelectionBounds,
     };
 
     fn result_meta() -> ResultSessionMeta {
@@ -3692,6 +3764,7 @@ mod tests {
                     method: SelectionMethod::Accessibility,
                     trigger: SelectionTrigger::Manual,
                     timestamp_ms: 0,
+                    sequence: 0,
                 },
                 source_result_session_id: Some("s".to_owned()),
             },
@@ -3810,6 +3883,58 @@ mod tests {
         let result = compose_result_ready_snapshot(result_meta(), initial_preparing_begin());
         assert_eq!(result.provider_id, None);
         assert_eq!(result.model_id, None);
+    }
+
+    #[test]
+    fn result_snapshot_matches_the_shared_renderer_fixture() {
+        let mut meta = result_meta();
+        meta.selection.id = "selection-fixture".to_owned();
+        meta.selection.payload.text = "Hello".to_owned();
+        meta.selection.payload.source_app = SourceApplication {
+            bundle_id: "com.example.fixture".to_owned(),
+            name: "Fixture App".to_owned(),
+        };
+        meta.selection.payload.bounds = Some(SelectionBounds {
+            x: 100.0,
+            y: 200.0,
+            width: 120.0,
+            height: 24.0,
+        });
+        meta.selection.payload.direction = SelectionDirection::Forward;
+        meta.selection.payload.is_fullscreen = false;
+        let begin = ActionBeginReady {
+            snapshot: ActionSnapshot {
+                session_id: "session-fixture".to_owned(),
+                session_generation: SessionGeneration(1),
+                request_id: "request-fixture".to_owned(),
+                request_generation: RequestGeneration(1),
+                action_id: "translate".to_owned(),
+                status: ActionSnapshotStatus::Running,
+                content: "你好".to_owned(),
+                thinking_content: String::new(),
+                last_sequence: EventSequence(7),
+                last_content_sequence: EventSequence(6),
+                content_scalar_count: 2,
+                generation_notice: None,
+                error_code: None,
+                error_message: None,
+                retryable: false,
+            },
+            ack: ResultReadyAck {
+                session_id: "session-fixture".to_owned(),
+                session_generation: SessionGeneration(1),
+                request_generation: RequestGeneration(1),
+                last_sequence: EventSequence(7),
+                handshake_generation: HandshakeGeneration(1),
+            },
+            route: None,
+        };
+        let actual = serde_json::to_value(compose_result_ready_snapshot(meta, begin)).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../src/shared/__tests__/fixtures/result-session-snapshot.json"
+        ))
+        .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -4222,9 +4347,12 @@ mod tests {
 
     #[test]
     fn stale_dismiss_cannot_clear_a_newer_selection() {
-        assert!(dismiss_precedes_selection(2_000, 1_999));
-        assert!(dismiss_precedes_selection(2_000, 2_000));
-        assert!(!dismiss_precedes_selection(2_000, 2_001));
+        assert!(dismiss_precedes_selection(0, 2_000, 0, 1_999));
+        assert!(dismiss_precedes_selection(0, 2_000, 0, 2_000));
+        assert!(!dismiss_precedes_selection(0, 2_000, 0, 2_001));
+        // Sequences win over timestamps when both producers provide them.
+        assert!(dismiss_precedes_selection(5, 1, 5, 9_999));
+        assert!(!dismiss_precedes_selection(5, 9_999, 6, 1));
     }
 
     #[test]

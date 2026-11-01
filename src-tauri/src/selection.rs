@@ -118,6 +118,11 @@ pub struct SelectionPayload {
     pub method: SelectionMethod,
     pub trigger: SelectionTrigger,
     pub timestamp_ms: u64,
+    /// Monotonic emission counter from the native monitor. Zero means the
+    /// producer does not supply one (Windows), so ordering falls back to the
+    /// millisecond timestamp.
+    #[serde(default)]
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,6 +133,8 @@ pub struct DismissEvent {
     pub mouse: SelectionPoint,
     pub target_pid: i64,
     pub timestamp_ms: u64,
+    #[serde(default)]
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,12 +205,16 @@ enum WireEvent {
         method: SelectionMethod,
         trigger: SelectionTrigger,
         timestamp_ms: u64,
+        #[serde(default)]
+        sequence: u64,
     },
     Dismiss {
         reason: String,
         mouse: SelectionPoint,
         target_pid: i64,
         timestamp_ms: u64,
+        #[serde(default)]
+        sequence: u64,
     },
 }
 
@@ -225,6 +236,7 @@ impl From<WireEvent> for SelectionEvent {
                 method,
                 trigger,
                 timestamp_ms,
+                sequence,
             } => Self::Selection(SelectionPayload {
                 text,
                 source_app,
@@ -239,17 +251,20 @@ impl From<WireEvent> for SelectionEvent {
                 method,
                 trigger,
                 timestamp_ms,
+                sequence,
             }),
             WireEvent::Dismiss {
                 reason,
                 mouse,
                 target_pid,
                 timestamp_ms,
+                sequence,
             } => Self::Dismiss(DismissEvent {
                 reason,
                 mouse,
                 target_pid,
                 timestamp_ms,
+                sequence,
             }),
         }
     }
@@ -876,6 +891,19 @@ mod tests {
         };
         assert_eq!(dismiss.reason, "scroll");
         assert_eq!(dismiss.target_pid, 7);
+        assert_eq!(dismiss.sequence, 0);
+    }
+
+    #[test]
+    fn parses_native_event_sequence() {
+        let event = parse_native_event(
+            r#"{"type":"dismiss","reason":"scroll","mouse":{"x":10.0,"y":20.0},"targetPid":7,"timestampMs":99,"sequence":4}"#,
+        )
+        .expect("valid dismiss event");
+        let SelectionEvent::Dismiss(dismiss) = event else {
+            panic!("expected dismiss");
+        };
+        assert_eq!(dismiss.sequence, 4);
     }
 
     #[test]
@@ -1158,6 +1186,7 @@ mod tests {
             method: SelectionMethod::Accessibility,
             trigger: SelectionTrigger::Drag,
             timestamp_ms: 1,
+            sequence: 0,
         }
     }
 }

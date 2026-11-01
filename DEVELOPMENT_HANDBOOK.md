@@ -382,7 +382,7 @@ helper 等待期间排队的 Foreground 事件还可能在 SelectionEvent 发出
 
 - 鼠标捕获先尝试 `ElementFromPoint`，没有文本时再尝试 focused element。
 - Control View 和 Raw View 祖先用于查找 TextPattern。
-- 明确 `IsPassword=true` 仍然拒绝；无法可靠读取祖先密码属性时，可以继续尝试 UIA 文本，但禁止自动剪贴板复制。
+- 明确 `IsPassword=true` 仍然拒绝；无法可靠读取祖先密码属性（`None`）时，UIA 文本仍可读取，但合成 Ctrl+C 仅对已列入复制兼容白名单的应用放行，其他应用一律拒绝——未知密码状态不得静默开启剪贴板路径。
 - UIA 元素与前台应用的关系允许父子进程的两个方向，并为同一可执行文件的 renderer sibling 提供受限支持。
 - UIA 已得到有效文本但矩形不可靠时，丢弃错误边界并使用鼠标释放位置显示工具栏，不再丢弃文本。
 - ChatGPT/Codex、EmEditor、常见浏览器和明确的 Text、Document、Edit、Hyperlink 控件加入安全剪贴板兼容判断。
@@ -495,7 +495,7 @@ Windows 工具栏始终按工具窗口处理，不进入任务栏，也不激活
 
 ### 设置变化
 
-Windows 适配没有另起一套设置文件。现有 macOS 服务商、模型、动作、提示词和加密 API Key 可以直接沿用。当前设置 schema 为 v6，主要增加的是 Windows 应用生命周期设置，其他变化通过原字段扩展和默认迁移完成。
+Windows 适配没有另起一套设置文件。现有 macOS 服务商、模型、动作、提示词和加密 API Key 可以直接沿用。当前设置 schema 为 v13，新增能力通过原字段扩展、默认值和迁移阶梯完成。写入使用临时文件 + 原子替换，替换前尽力保留上一份 `settings.json.bak`；反序列化有意忽略未知字段，以便旧版本回退时不会因新版字段而拒绝整份配置，已知字段仍经过 normalize/validate。
 
 | 设置区域 | 当前能力 | 开发过程中的变化 |
 | --- | --- | --- |
@@ -925,7 +925,7 @@ Windows 安装包使用 current-user 模式，不要求管理员权限；禁止�
 - 新增 stale 护栏：剪贴板结果与上一次已接受的捕获文本相同、且本次捕获位置距原位置超过 48px 时，视为应用残留的旧模型选区而拒绝（已知取舍：在远处重新划选完全相同的文本也会被拒绝）。
 - 退化片段过滤（实机定位驱动）：ZCode 聊天窗口双击空白处时，Chromium 会真实选中空 Markdown 列表项的标记文本（`1. `），AX 路径据此弹出工具栏。鼠标触发（拖动/双击/Shift 点击）的捕获若去空白后 ≤3 个字符且不含「字母类」字符（ASCII 字母、西里尔、假名、CJK、谚文）一律丢弃——`1. `、`• `、`—` 等标记/符号碎片全部拦截；键盘与快捷键触发不受影响，含单个汉字或单词的正常选词不受影响。AX 与剪贴板两条路径一致应用。已知取舍：双击 3 字符以内的纯数字（如 `42`）不会弹工具栏。
 - 双击边界容差收紧（实机定位驱动）：Chrome 里双击 KaTeX 公式所在行的右侧空白，Chromium 会把无空格的整段公式串当作一个「词」选中（一次双击捕获 107–145 字节公式）。双击选中的词必然在光标之下，因此双击触发的鼠标-选区边界容差从 56px 收紧到 20px——点空白处选中相邻 token 的捕获被拒绝；拖动与 Shift 点击保持 56px（结束位置语义不同，不动）。
-- 回退全出口 trace 日志：`TEXTLENS_SELECTION_TRACE=1` 时输出 `[selection-fallback] …` 原因行（app-policy-denied / secure-event-input / text-element-empty-range-on-click / focused-element-is-image / clipboard-unrestorable-all-lazy / chord-ignored-by-app / non-text-copy / restore-boundary-missed / stale-same-text-far-location / text-matches-app-identity / capture: ok），行首带 app bundle 与触发方式，capture 成功行附带前 24 字符前缀（换行/控制字符转义）用于区分「残留旧选区 / 隐式复制 / 垃圾内容」；同时镜像到 `~/Library/Logs/TextLens/selection-trace.log`（Finder 启动的 GUI 应用看不到 stderr；只记原因与短前缀，不落全文）。打包应用启用方式：`launchctl setenv TEXTLENS_SELECTION_TRACE 1` 后重启应用，`launchctl unsetenv TEXTLENS_SELECTION_TRACE 1` 关闭。
+- 回退全出口 trace 日志：`TEXTLENS_SELECTION_TRACE=1` 时输出 `[selection-fallback] …` 原因行（app-policy-denied / secure-event-input / text-element-empty-range-on-click / focused-element-is-image / clipboard-unrestorable-all-lazy / chord-ignored-by-app / non-text-copy / restore-boundary-missed / stale-same-text-far-location / text-matches-app-identity / capture: ok），行首带 app bundle 与触发方式，capture 成功行默认只记长度与 FNV-1a 哈希；另设 `TEXTLENS_TRACE_CONTENT=1` 时才附加前 24 字符前缀（换行/控制字符转义）用于区分「残留旧选区 / 隐式复制 / 垃圾内容」。日志同时镜像到 `~/Library/Logs/TextLens/selection-trace.log`（Finder 启动的 GUI 应用看不到 stderr；默认不落文本）。打包应用启用方式：`launchctl setenv TEXTLENS_SELECTION_TRACE 1` 后重启应用，`launchctl unsetenv TEXTLENS_SELECTION_TRACE 1` 关闭；需要内容前缀时再设置 `TEXTLENS_TRACE_CONTENT`。
 - 快照策略改为「跳过不可读表示」：惰性/超大表示不再整体放弃回退（否则剪贴板历史里只要出现过一次带惰性类型的复制，回退就会被永久卡死），仅当原始剪贴板有内容但全部不可恢复时才放弃；混合场景按可读表示部分恢复（bounded 降级，带 trace）。
 - 非文本判定改为白名单：仅当粘贴板携带已知图片/文件类型（TIFF/PNG/JPEG/file-url/promise）且无任何文本类型时才判为非文本响应；未知类型组合继续等待完整预算，避免误杀用特殊 UTI 写文本的应用。
 
@@ -957,3 +957,14 @@ Windows 安装包使用 current-user 模式，不要求管理员权限；禁止�
 - 连续快速划词不再被上一次剪贴板回退阻塞；微信图片查看器拖动图片不再触发复制（`skip: wechat-bare-window-drag`），聊天窗口文字拖动行为不变。
 - 设置页 macOS 不显示「划词获取」分区；停用服务商后其绑定动作执行报「该服务商已停用，请在设置中启用后再试」。
 - 结果框：思考折叠后正文紧贴紧凑思考条、无首部空行空洞；思考展开恢复全宽滚动。
+
+### 0.4.x 稳定性重构（开发分支，待发布）
+
+以下改动位于 `fix/review-stability`，不是已发布版本记录；Windows 相关改动仍需通过 CI 的 `verify:windows` 或真机编译验证。
+
+- **捕获结构：** macOS 应用差异集中到纯 C++ 表 `apps/macos/native/app_profiles.h`（bundle 精确/前缀/名称匹配，clipboard/appleScript/surfaceGuard 能力），微信画布与不透明窗口门闩保留并泛化；受信任文本窗口缓存改为 bundle + pid + window + 15 分钟 TTL，避免跨应用误用。
+- **事件排序：** 原生 selection/dismiss 事件附带进程内单调 `sequence`，Rust 侧优先按序号仲裁，缺少序号的生产者（Windows）回退到毫秒时间戳；不再依赖系统时钟。
+- **诊断：** trace 默认只记选区长度与哈希，`TEXTLENS_TRACE_CONTENT=1` 才输出 24 字符前缀。
+- **设置热路径：** 设置读路径使用 `Arc` 快照，写盘与 fsync 不再阻塞选区线程；写入串行化并按 generation 避免启动默认值覆盖用户刚落盘的设置；写入前保留 `.bak`，未知字段宽松忽略。
+- **设置界面：** 7 个分区（常规/权限与诊断/外观/AI 服务商/工具栏动作/语言与翻译/捕获与过滤），字段级错误定位、过滤标签编辑器、测试连接/获取模型前显式保存提示、显式翻译方向交换。
+- **主题与弹出窗：** 五套主题补齐明暗对称 token；间距/字号/字重/圆角全部 token 化并在测试中禁用数字字重与 px 圆角。工具栏恢复键盘 focus ring；模型下拉补齐 listbox 键盘导航；主题/触发方式 radiogroup 使用 roving tabindex；问AI 模式复制序列化完整多轮 transcript。

@@ -5,6 +5,7 @@ import {
   AI_TEXT_LIMIT,
   BUILTIN_SEARCH_ENGINE_IDS,
   DEFAULT_RESULT_FONT_SIZE,
+  DEFAULT_SELECTION_CAPTURE_SETTINGS,
   MAX_ACTIONS,
   MAX_CUSTOM_ACTIONS,
   MAX_ENABLED_ACTIONS,
@@ -540,16 +541,6 @@ export type FilterSettings = z.infer<typeof filterSettingsSchema>
 export const selectionCaptureStrategySchema = z.enum(['selection-hook', 'clipboard', 'auto'])
 export type SelectionCaptureStrategy = z.infer<typeof selectionCaptureStrategySchema>
 
-const DEFAULT_SELECTION_CAPTURE_RULES = [
-  { application: 'acrobat.exe', strategy: 'clipboard' as const },
-  { application: 'acrord32.exe', strategy: 'clipboard' as const },
-  { application: 'acrocef.exe', strategy: 'clipboard' as const },
-  { application: 'rdrcef.exe', strategy: 'clipboard' as const },
-  { application: 'docbox.exe', strategy: 'clipboard' as const },
-  { application: 'docboxrenderer.exe', strategy: 'clipboard' as const },
-  { application: 'emeditor.exe', strategy: 'clipboard' as const }
-]
-
 export const selectionCaptureRuleSchema = z
   .object({
     application: z.string().trim().min(1).max(512),
@@ -561,8 +552,13 @@ export type SelectionCaptureRule = z.infer<typeof selectionCaptureRuleSchema>
 
 export const selectionCaptureSettingsSchema = z
   .object({
-    defaultStrategy: selectionCaptureStrategySchema.default('selection-hook'),
-    applications: z.array(selectionCaptureRuleSchema).max(64).default(DEFAULT_SELECTION_CAPTURE_RULES)
+    defaultStrategy: selectionCaptureStrategySchema.default(
+      DEFAULT_SELECTION_CAPTURE_SETTINGS.defaultStrategy
+    ),
+    applications: z
+      .array(selectionCaptureRuleSchema)
+      .max(64)
+      .default(DEFAULT_SELECTION_CAPTURE_SETTINGS.applications.map((rule) => ({ ...rule })))
   })
   .strict()
   .superRefine((value, context) => {
@@ -590,8 +586,8 @@ const commonSettingsShape = {
   application: applicationSettingsSchema,
   filter: filterSettingsSchema,
   selectionCapture: selectionCaptureSettingsSchema.default({
-    defaultStrategy: 'selection-hook',
-    applications: DEFAULT_SELECTION_CAPTURE_RULES
+    defaultStrategy: DEFAULT_SELECTION_CAPTURE_SETTINGS.defaultStrategy,
+    applications: DEFAULT_SELECTION_CAPTURE_SETTINGS.applications.map((rule) => ({ ...rule }))
   }),
   actions: actionsSchema
 } as const

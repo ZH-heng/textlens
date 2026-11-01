@@ -136,10 +136,17 @@ pub(crate) fn snapshot_windows_clipboard() -> Option<WindowsClipboardSnapshot> {
         }
 
         let handle = unsafe { GetClipboardData(format) }.ok()?;
+        let remaining = WINDOWS_CLIPBOARD_SNAPSHOT_LIMIT.saturating_sub(total_bytes);
         let (data, kind) = if format == u32::from(CF_ENHMETAFILE.0) {
             let metafile = HENHMETAFILE(handle.0);
             let size = unsafe { GetEnhMetaFileBits(metafile, None) } as usize;
             if size == 0 {
+                continue;
+            }
+            // Oversized formats are dropped individually: a huge image must
+            // not abandon the whole restore snapshot (and with it the small
+            // text format that keeps the user's clipboard intact).
+            if size > remaining {
                 continue;
             }
             let mut data = vec![0u8; size];
@@ -150,7 +157,7 @@ pub(crate) fn snapshot_windows_clipboard() -> Option<WindowsClipboardSnapshot> {
         } else {
             let global = HGLOBAL(handle.0);
             let size = unsafe { GlobalSize(global) };
-            if size == 0 {
+            if size == 0 || size > remaining {
                 continue;
             }
             let pointer = unsafe { GlobalLock(global) }.cast::<u8>();
@@ -163,10 +170,7 @@ pub(crate) fn snapshot_windows_clipboard() -> Option<WindowsClipboardSnapshot> {
                 WindowsClipboardFormatKind::GlobalMemory,
             )
         };
-        total_bytes = total_bytes.checked_add(data.len())?;
-        if total_bytes > WINDOWS_CLIPBOARD_SNAPSHOT_LIMIT {
-            return None;
-        }
+        total_bytes = total_bytes.saturating_add(data.len());
         formats.push(WindowsClipboardFormatSnapshot { format, data, kind });
     }
 

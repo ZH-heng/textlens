@@ -45,8 +45,8 @@ describe('inferThinkingLevels', () => {
     expect(inferThinkingLevels('gpt-oss-120b')).toEqual(['low', 'medium', 'high'])
   })
 
-  it('detects deepseek-r1 / qwen3 thinking / claude extended patterns', () => {
-    expect(inferThinkingLevels('deepseek-r1')).toEqual(['low', 'medium', 'high'])
+  it('detects qwen3 thinking and Claude extended patterns', () => {
+    expect(inferThinkingLevels('deepseek-r1')).toEqual([])
     expect(inferThinkingLevels('qwen3-235b-a22b')).toEqual(['low', 'medium', 'high'])
     expect(inferThinkingLevels('claude-opus-4-thinking')).toContain('high')
   })
@@ -150,6 +150,11 @@ describe('thinking defaults and protocol capability', () => {
       source: 'heuristic',
       dialect: null
     })
+    expect(inferredThinkingCapability('deepseek-r1', 'openAiChat')).toEqual({
+      source: 'heuristic',
+      dialect: null,
+      supportsOff: false
+    })
   })
 })
 
@@ -181,7 +186,7 @@ describe('effectiveThinkingLevels', () => {
   })
 
   it('falls back to model-id heuristics when metadata is empty', () => {
-    expect(effectiveThinkingLevels('deepseek-r1', [])).toEqual(['low', 'medium', 'high'])
+    expect(effectiveThinkingLevels('deepseek-r1', [])).toEqual([])
     expect(effectiveThinkingLevels('gpt-4o-mini', [])).toEqual([])
   })
 })

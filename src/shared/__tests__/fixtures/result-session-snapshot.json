@@ -1,0 +1,34 @@
+{
+  "sessionId": "session-fixture",
+  "sessionGeneration": 1,
+  "requestId": "request-fixture",
+  "requestGeneration": 1,
+  "actionId": "translate",
+  "selection": {
+    "selectionId": "selection-fixture",
+    "text": "Hello",
+    "sourceApp": {
+      "name": "Fixture App",
+      "bundleId": "com.example.fixture"
+    },
+    "anchor": {
+      "kind": "selection",
+      "x": 100.0,
+      "y": 200.0,
+      "width": 120.0,
+      "height": 24.0
+    },
+    "direction": "forward",
+    "isFullscreen": false
+  },
+  "status": "streaming",
+  "content": "你好",
+  "thinkingContent": "",
+  "lastSequence": 7,
+  "lastContentSequence": 6,
+  "contentScalarCount": 2,
+  "handshakeGeneration": 1,
+  "errorMessage": "",
+  "retryable": false,
+  "pinned": false
+}

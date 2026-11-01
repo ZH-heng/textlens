@@ -65,6 +65,57 @@ describe('promptAfterKindChange', () => {
   })
 })
 
+describe('CustomActionDialog layout', () => {
+  const action: ActionDefinition = {
+    id: 'copy-second',
+    name: '复制',
+    icon: 'clipboard',
+    kind: 'copy',
+    enabled: false,
+    order: 7
+  }
+
+  it('offers the action type only when adding a new action', () => {
+    const { unmount } = render(createElement(CustomActionDialog, {
+      action,
+      providers: [],
+      onCancel: vi.fn(),
+      onSave: vi.fn()
+    }))
+    expect(screen.queryByText('动作类型')).not.toBeInTheDocument()
+    expect(document.querySelector('.dialog-form-grid')).toHaveClass('dialog-form-grid--single')
+    unmount()
+
+    render(createElement(CustomActionDialog, {
+      action: null,
+      providers: [],
+      onCancel: vi.fn(),
+      onSave: vi.fn()
+    }))
+    expect(screen.getByText('动作类型')).toBeInTheDocument()
+    expect(document.querySelector('.dialog-form-grid')).not.toHaveClass('dialog-form-grid--single')
+  })
+
+  it('locks the background scroll while open and restores it on close', () => {
+    document.body.style.overflow = 'scroll'
+    document.documentElement.style.overflow = 'scroll'
+    const { unmount } = render(createElement(CustomActionDialog, {
+      action,
+      providers: [],
+      onCancel: vi.fn(),
+      onSave: vi.fn()
+    }))
+    expect(document.body.style.overflow).toBe('hidden')
+    expect(document.documentElement.style.overflow).toBe('hidden')
+
+    unmount()
+    expect(document.body.style.overflow).toBe('scroll')
+    expect(document.documentElement.style.overflow).toBe('scroll')
+    document.body.style.overflow = ''
+    document.documentElement.style.overflow = ''
+  })
+})
+
 describe('CustomActionDialog model + thinking', () => {
   const modelRoute = (providerId: string, modelId: string): string =>
     JSON.stringify([providerId, modelId])
@@ -110,7 +161,7 @@ describe('CustomActionDialog model + thinking', () => {
     }))
   })
 
-  it('hides disabled providers and infers thinking from model id', () => {
+  it('hides disabled providers and leaves reasoner-only models without thinking controls', () => {
     render(createElement(CustomActionDialog, {
       action: null,
       providers: [
@@ -145,7 +196,7 @@ describe('CustomActionDialog model + thinking', () => {
     fireEvent.change(modelSelect, {
       target: { value: modelRoute('provider-on', 'deepseek-r1') }
     })
-    expect(screen.getByLabelText('思考强度')).toBeInTheDocument()
+    expect(screen.queryByLabelText('思考强度')).not.toBeInTheDocument()
   })
 
   it('hides thinking select when model has no thinking levels', () => {

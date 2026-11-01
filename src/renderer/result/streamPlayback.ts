@@ -176,6 +176,8 @@ function countBacklogScalars(value: string, from: number, cap: number): number {
 export class SmoothStreamController {
   private target = ''
   private displayed = ''
+  /** UTF-16 offset of `displayed` inside `target`; stays a prefix while streaming. */
+  private displayedLength = 0
   /** Scalar count of `displayed`, maintained incrementally so per-frame
       consumers never rescan the full revealed text. */
   private displayedScalarCount = 0
@@ -201,12 +203,15 @@ export class SmoothStreamController {
   }
 
   needsTick(): boolean {
-    return this.streaming && this.displayed !== this.target
+    // `displayed` is always a prefix of `target` while streaming, so the
+    // offset comparison stays O(1) instead of comparing the whole string.
+    return this.streaming && this.displayedLength < this.target.length
   }
 
   reset(): void {
     this.target = ''
     this.displayed = ''
+    this.displayedLength = 0
     this.displayedScalarCount = 0
     this.streaming = false
     this.residual = 0
@@ -224,6 +229,7 @@ export class SmoothStreamController {
 
     if (!streaming) {
       this.displayed = target
+      this.displayedLength = target.length
       this.displayedScalarCount = countUnicodeScalars(target)
       this.residual = 0
       this.lastTickAt = null
@@ -237,14 +243,16 @@ export class SmoothStreamController {
       !this.displayed.startsWith(target)
     ) {
       this.displayed = target
+      this.displayedLength = target.length
       this.displayedScalarCount = countUnicodeScalars(target)
       this.residual = 0
       this.lastTickAt = now || null
       return this.displayed
     }
 
-    if (this.displayed.length > target.length) {
+    if (this.displayedLength > target.length) {
       this.displayed = target
+      this.displayedLength = target.length
       this.displayedScalarCount = countUnicodeScalars(target)
       this.residual = 0
       this.lastTickAt = now || null
@@ -252,12 +260,13 @@ export class SmoothStreamController {
     }
 
     // First visible answer chunk: small immediate peek for TTFB, rest typewrites.
-    if (this.displayed.length === 0 && target.length > 0) {
+    if (this.displayedLength === 0 && target.length > 0) {
       const burst =
         this.config.firstBurstMax <= 0
           ? target.length
           : advanceByUnicodeScalars(target, 0, this.config.firstBurstMax)
       this.displayed = target.slice(0, burst)
+      this.displayedLength = burst
       this.displayedScalarCount = countUnicodeScalars(this.displayed)
       this.residual = 0
       // Anchor the clock so the next tick uses a real frame delta, not a huge gap.
@@ -273,14 +282,7 @@ export class SmoothStreamController {
    * Pass `performance.now()` (or a test clock) so release rate is frame-rate stable.
    */
   tick(now: number): string {
-    if (!this.streaming || this.displayed === this.target) {
-      this.lastTickAt = now
-      return this.displayed
-    }
-    if (!this.target.startsWith(this.displayed)) {
-      this.displayed = this.target
-      this.displayedScalarCount = countUnicodeScalars(this.displayed)
-      this.residual = 0
+    if (!this.streaming || this.displayedLength >= this.target.length) {
       this.lastTickAt = now
       return this.displayed
     }
@@ -294,7 +296,7 @@ export class SmoothStreamController {
     const cap = this.config.maxStep * 4
     const backlog = countBacklogScalars(
       this.target,
-      this.displayed.length,
+      this.displayedLength,
       Math.max(cap, this.config.catchUpBacklog)
     )
     if (backlog <= 0) return this.displayed
@@ -308,11 +310,14 @@ export class SmoothStreamController {
     this.residual = residual
     if (step <= 0) return this.displayed
 
-    const end = advanceByUnicodeScalars(this.target, this.displayed.length, step)
+    const start = this.displayedLength
+    const end = advanceByUnicodeScalars(this.target, start, step)
     this.displayedScalarCount += countUnicodeScalars(
-      this.target.slice(this.displayed.length, end)
+      this.target.slice(start, end)
     )
-    this.displayed = this.target.slice(0, end)
+    // Append the new delta instead of re-slicing the whole prefix every frame.
+    this.displayed += this.target.slice(start, end)
+    this.displayedLength = end
     return this.displayed
   }
 }

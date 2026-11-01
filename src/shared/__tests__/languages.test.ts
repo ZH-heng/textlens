@@ -1,12 +1,28 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import {
   TRANSLATION_LANGUAGE_CODES,
   TRANSLATION_LANGUAGES,
+  TRANSLATION_TARGET_ENGLISH_NAMES,
+  UI_LOCALES,
   defaultTranslationTarget,
   detectTranslationLanguage,
   translationTargetEnglishName
 } from '../languages'
+
+const rustModelsSource = readFileSync(
+  resolve(process.cwd(), 'src-tauri/src/models.rs'),
+  'utf8'
+)
+
+function enumSerdeCodes(name: string): string[] {
+  const block = new RegExp(`pub enum ${name} \\{([\\s\\S]*?)\\n\\}`, 'u').exec(
+    rustModelsSource
+  )?.[1] ?? ''
+  return [...block.matchAll(/#\[serde\(rename = "([^"]+)"\)\]/gu)].map((match) => match[1]!)
+}
 
 describe('translation languages', () => {
   it('exposes JA/KO/RU/DE/FR alongside zh/en with short result codes', () => {
@@ -24,6 +40,18 @@ describe('translation languages', () => {
     expect(TRANSLATION_LANGUAGE_CODES['ru-RU']).toBe('RU')
     expect(TRANSLATION_LANGUAGE_CODES['de-DE']).toBe('DE')
     expect(TRANSLATION_LANGUAGE_CODES['fr-FR']).toBe('FR')
+  })
+
+  it('keeps Rust locale/language enums and prompt names in lockstep', () => {
+    expect(enumSerdeCodes('Locale')).toEqual([...UI_LOCALES])
+    expect(enumSerdeCodes('TranslationLanguage')).toEqual([...TRANSLATION_LANGUAGES])
+    const englishNames = /pub fn english_name\(self\) -> &'static str \{([\s\S]*?)\n    \}/u
+      .exec(rustModelsSource)?.[1] ?? ''
+    expect(
+      [...englishNames.matchAll(/Self::\w+ => "([^"]+)"/gu)].map((match) => match[1])
+    ).toEqual(
+      TRANSLATION_LANGUAGES.map((code) => TRANSLATION_TARGET_ENGLISH_NAMES[code])
+    )
   })
 
   it('detects CJK / Hangul / Cyrillic source languages', () => {

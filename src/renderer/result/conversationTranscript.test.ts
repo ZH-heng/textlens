@@ -4,6 +4,7 @@ import {
   beginAssistantTurn,
   isAskAction,
   patchStreamingAssistant,
+  transcriptToPlainText,
   type TranscriptTurn
 } from './conversationTranscript'
 
@@ -40,5 +41,18 @@ describe('conversationTranscript', () => {
   it('does not patch when there is no assistant turn', () => {
     const turns = appendUserTurn([], '问题')
     expect(patchStreamingAssistant(turns, '回复', true)).toBe(turns)
+  })
+
+  it('serializes turns with role labels and skips empty ones', () => {
+    const turns: TranscriptTurn[] = [
+      { id: 'u1', role: 'user', content: '第一问', streaming: false },
+      { id: 'a1', role: 'assistant', content: '第一答', streaming: false },
+      { id: 'u2', role: 'user', content: '第二问', streaming: false },
+      { id: 'a2', role: 'assistant', content: '   ', streaming: true }
+    ]
+    expect(transcriptToPlainText(turns)).toBe(
+      '你：\n第一问\n\nAI：\n第一答\n\n你：\n第二问'
+    )
+    expect(transcriptToPlainText([])).toBe('')
   })
 })

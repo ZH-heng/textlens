@@ -32,9 +32,35 @@
   --shadow-lg: 0 18px 50px rgba(78, 64, 44, 0.18);
   --highlight: rgba(255, 255, 255, 0.65);
   --focus-ring: 0 0 0 3px var(--accent-soft);
+  --border-subtle: color-mix(in srgb, var(--border) 65%, transparent);
+  --scrim: rgba(24, 22, 18, 0.28);
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 28px;
+  --space-8: 32px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-lg: 15px;
+  --text-xl: 18px;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+  --radius-2xs: 3px;
+  --radius-xs: 4px;
+  --radius-chip: 5px;
+  --radius-tag: 6px;
   --radius-sm: 8px;
+  --radius-card: 9px;
+  --radius-control: 10px;
   --radius-md: 12px;
   --radius-lg: 16px;
+  --radius-pill: 999px;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -63,6 +89,7 @@
     --shadow-md: 0 8px 26px rgba(0, 0, 0, 0.3);
     --shadow-lg: 0 18px 54px rgba(0, 0, 0, 0.38);
     --highlight: rgba(255, 255, 255, 0.045);
+    --scrim: rgba(0, 0, 0, 0.46);
   }
 }
 
@@ -139,7 +166,7 @@ textarea:disabled {
   color: var(--text-secondary);
   background: transparent;
   border: 0;
-  border-radius: 9px;
+  border-radius: var(--radius-card);
 }
 
 .icon-button:hover:not(:disabled) {
@@ -159,10 +186,10 @@ textarea:disabled {
   justify-content: center;
   min-height: 36px;
   padding: 7px 14px;
-  font-weight: 590;
+  font-weight: var(--weight-semibold);
   background: var(--surface-solid);
   border: 1px solid var(--border-strong);
-  border-radius: 9px;
+  border-radius: var(--radius-card);
 }
 
 .button:hover:not(:disabled) {
@@ -197,7 +224,7 @@ textarea:disabled {
 
 .field__label {
   font-size: 13px;
-  font-weight: 620;
+  font-weight: var(--weight-semibold);
 }
 
 .field__hint {
@@ -213,7 +240,7 @@ textarea:disabled {
   padding: 8px 11px;
   background: var(--surface-solid);
   border: 1px solid var(--border-strong);
-  border-radius: 9px;
+  border-radius: var(--radius-card);
   outline: none;
 }
 
@@ -236,7 +263,7 @@ textarea.control {
   color: var(--text-secondary);
   background: var(--surface-muted);
   border: 1px solid var(--border);
-  border-radius: 9px;
+  border-radius: var(--radius-card);
 }
 
 .notice--error {

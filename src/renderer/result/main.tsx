@@ -6,6 +6,7 @@ import '../themes.css'
 import './result.css'
 import { installTauriBridge } from '../lib/tauriBridge'
 import { runDetached } from '../lib/asyncEffects'
+import { WindowErrorBoundary } from '../lib/ErrorBoundary'
 import { applyTheme, storedTheme } from '../lib/theme'
 import { startActionEventStore } from './actionEventStore'
 import { ResultApp } from './ResultApp'
@@ -49,6 +50,8 @@ runDetached(bootstrap?.start(), {
 
 createRoot(root).render(
   <StrictMode>
-    <ResultApp bootstrap={bootstrap} />
+    <WindowErrorBoundary>
+      <ResultApp bootstrap={bootstrap} />
+    </WindowErrorBoundary>
   </StrictMode>
 )

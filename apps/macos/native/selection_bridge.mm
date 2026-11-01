@@ -12,6 +12,8 @@
  */
 
 #import "selection_bridge.h"
+#include "app_profiles.h"
+#include "selection_policy.h"
 
 #import <ApplicationServices/ApplicationServices.h>
 #import <AppKit/AppKit.h>
@@ -47,6 +49,17 @@ constexpr uint64_t kMaximumDragDurationMs = 15'000;
 constexpr uint64_t kDoubleClickDurationMs = 500;
 constexpr double kDoubleClickDistance = 4.0;
 constexpr size_t kMaximumQueuedTasks = 64;
+// Global liveness flag so bounded AX/clipboard loops can abort during stop()
+// instead of waiting out their full budgets.
+static std::atomic<bool> gCaptureRunning{false};
+
+static bool CaptureIsCurrent(
+    const std::atomic<uint64_t> *captureGeneration,
+    uint64_t expectedGeneration) {
+    return gCaptureRunning.load(std::memory_order_acquire) &&
+        (captureGeneration == nullptr ||
+         captureGeneration->load(std::memory_order_acquire) == expectedGeneration);
+}
 // Bounds every AX round-trip to a single app so one slow/hung process can't
 // stall the shared single-threaded capture worker for every other app.
 constexpr float kAXMessagingTimeoutSeconds = 0.08f;
@@ -77,6 +90,8 @@ constexpr CFTimeInterval kEventTapHealthCheckIntervalSeconds = 5.0;
 // generation-cancellable so it only ever reads what the user just selected.
 constexpr int64_t kSyntheticEventMarker = 0x544c4d41434f534cLL; // "TLMACOSL"
 constexpr uint64_t kClipboardFallbackBudgetMs = 480;
+constexpr uint64_t kClipboardPollIntervalInitialMs = 2;
+constexpr uint64_t kClipboardPollIntervalMaxMs = 12;
 constexpr uint64_t kClipboardPollIntervalMs = 12;
 // Apps that ignore pid-targeted events get one retry posted at session level.
 constexpr uint64_t kClipboardSessionRetryAfterMs = 200;
@@ -204,7 +219,8 @@ struct AccessibilityReadContext {
     uint64_t deadlineMs = 0;
 
     bool IsCurrent() const {
-        return (generation == nullptr ||
+        return gCaptureRunning.load(std::memory_order_acquire) &&
+            (generation == nullptr ||
                 generation->load(std::memory_order_acquire) == expectedGeneration) &&
             MonotonicMilliseconds() < deadlineMs;
     }
@@ -252,8 +268,8 @@ static void TraceSelectionTiming(const char *stage, uint64_t durationMs) {
 // One line per clipboard-fallback gate decision; enables field diagnosis of
 // "why did/didn't a synthetic copy fire" without changing default behavior.
 // Mirrored to ~/Library/Logs/TextLens/selection-trace.log because a
-// Finder-launched app's stderr is not visible. Never logs text content —
-// lengths and reasons only.
+// Finder-launched app's stderr is not visible. Text appears only as length and
+// hash unless TEXTLENS_TRACE_CONTENT opts into a masked prefix.
 static void TraceClipboardGate(const char *decision) {
     if (!SelectionTimingEnabled()) {
         return;
@@ -277,6 +293,14 @@ static void TraceClipboardGate(const char *decision) {
         static_cast<unsigned long long>(MonotonicMilliseconds()),
         decision);
     std::fclose(file);
+}
+
+// Total order for selection/dismiss arbitration. Wall-clock timestamps can
+// repeat or step backwards; the sequence is assigned once per emitted event and
+// only ever grows.
+static uint64_t NextEventSequence() {
+    static std::atomic<uint64_t> sequence{0};
+    return sequence.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 static uint64_t TimestampMilliseconds() {
@@ -687,10 +711,14 @@ static CGFloat PointNearSelectionBoundsTolerance(Trigger trigger) {
 }
 
 static bool PointNearSelectionBounds(CGPoint point, CGRect bounds, CGFloat tolerance) {
-    return point.x >= CGRectGetMinX(bounds) - tolerance &&
-        point.x <= CGRectGetMaxX(bounds) + tolerance &&
-        point.y >= CGRectGetMinY(bounds) - tolerance &&
-        point.y <= CGRectGetMaxY(bounds) + tolerance;
+    return textlens_selection_policy::PointNearBounds(
+        point.x,
+        point.y,
+        CGRectGetMinX(bounds),
+        CGRectGetMinY(bounds),
+        CGRectGetWidth(bounds),
+        CGRectGetHeight(bounds),
+        tolerance);
 }
 
 // A double-click on rendered-but-empty content (markdown bullets "• ", empty
@@ -699,61 +727,8 @@ static bool PointNearSelectionBounds(CGPoint point, CGRect bounds, CGFloat toler
 // fragments — at most three characters and none of them letter-like — are
 // dropped; keyboard/manual gestures stay deliberate and unaffected, and any
 // CJK/kana/Hangul or Latin letter keeps the capture.
-static bool CodePointIsLetterish(uint32_t codePoint) {
-    return (codePoint >= 'a' && codePoint <= 'z') ||
-        (codePoint >= 'A' && codePoint <= 'Z') ||
-        (codePoint >= 0x0400 && codePoint <= 0x04FF) ||   // Cyrillic
-        (codePoint >= 0x3040 && codePoint <= 0x30FF) ||   // kana
-        (codePoint >= 0x3400 && codePoint <= 0x4DBF) ||   // CJK ext A
-        (codePoint >= 0x4E00 && codePoint <= 0x9FFF) ||   // CJK unified
-        (codePoint >= 0xAC00 && codePoint <= 0xD7AF) ||   // Hangul
-        (codePoint >= 0xF900 && codePoint <= 0xFAFF) ||   // CJK compat
-        (codePoint >= 0x20000 && codePoint <= 0x3FFFF);   // CJK ext B+
-}
-
 static bool SelectionTextIsDegenerateFragment(const std::string &text) {
-    size_t start = 0;
-    size_t end = text.size();
-    while (start < end && std::isspace(static_cast<unsigned char>(text[start])) != 0) {
-        ++start;
-    }
-    while (end > start && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
-        --end;
-    }
-    if (end == start) {
-        return true;
-    }
-    size_t codePoints = 0;
-    bool hasLetterish = false;
-    size_t index = start;
-    while (index < end) {
-        const unsigned char lead = static_cast<unsigned char>(text[index]);
-        size_t length = 1;
-        uint32_t codePoint = lead;
-        if ((lead & 0xE0) == 0xC0 && index + 1 < end) {
-            length = 2;
-            codePoint = lead & 0x1F;
-        } else if ((lead & 0xF0) == 0xE0 && index + 2 < end) {
-            length = 3;
-            codePoint = lead & 0x0F;
-        } else if ((lead & 0xF8) == 0xF0 && index + 3 < end) {
-            length = 4;
-            codePoint = lead & 0x07;
-        }
-        for (size_t offset = 1; offset < length; ++offset) {
-            codePoint = (codePoint << 6) |
-                (static_cast<unsigned char>(text[index + offset]) & 0x3F);
-        }
-        if (CodePointIsLetterish(codePoint)) {
-            hasLetterish = true;
-        }
-        index += length;
-        codePoints += 1;
-        if (codePoints > 3) {
-            return false;
-        }
-    }
-    return !hasLetterish;
+    return textlens_selection_policy::IsDegenerateFragment(text);
 }
 
 static bool SelectionCandidateMatchesInput(const SelectionInfo &candidate) {
@@ -1106,7 +1081,12 @@ public:
         }
         if (elements_.size() >= kMaxEntries) {
             // FIFO eviction; entries are interchangeable, so no LRU needed.
-            elements_.erase(order_.front());
+            const pid_t evicted = order_.front();
+            auto entry = elements_.find(evicted);
+            if (entry != elements_.end()) {
+                CFRelease(entry->second);
+                elements_.erase(entry);
+            }
             order_.pop_front();
         }
         elements_[pid] = element;
@@ -1130,6 +1110,51 @@ private:
 
 static ApplicationElementCache gApplicationElementCache;
 
+static void ReadFocusedWindowTitleForFallback(
+    NSRunningApplication *application,
+    std::string &title,
+    const std::atomic<uint64_t> *captureGeneration,
+    uint64_t expectedGeneration,
+    uint64_t deadlineMs) {
+    if (application == nil || !title.empty() || MonotonicMilliseconds() >= deadlineMs ||
+        !CaptureIsCurrent(captureGeneration, expectedGeneration)) {
+        return;
+    }
+    AXUIElementRef applicationElement =
+        gApplicationElementCache.CopyElement(application.processIdentifier);
+    if (applicationElement == nullptr) {
+        return;
+    }
+    ConfigureAccessibilityElement(applicationElement);
+    AXUIElementSetMessagingTimeout(applicationElement, kAXGeometryMessagingTimeoutSeconds);
+    AXUIElementRef window = CopyFocusedWindow(applicationElement);
+    CFRelease(applicationElement);
+    if (window == nullptr) {
+        return;
+    }
+    if (!CaptureIsCurrent(captureGeneration, expectedGeneration) ||
+        MonotonicMilliseconds() >= deadlineMs) {
+        CFRelease(window);
+        return;
+    }
+    AXUIElementSetMessagingTimeout(window, kAXGeometryMessagingTimeoutSeconds);
+    CFTypeRef value = nullptr;
+    if (AXUIElementCopyAttributeValue(window, kAXTitleAttribute, &value) == kAXErrorSuccess &&
+        value != nullptr) {
+        if (CaptureIsCurrent(captureGeneration, expectedGeneration) &&
+            MonotonicMilliseconds() < deadlineMs &&
+            CFGetTypeID(value) == CFStringGetTypeID()) {
+            std::string candidate;
+            if (StringFromCFString(static_cast<CFStringRef>(value), candidate) &&
+                !IsBlank(candidate)) {
+                title = std::move(candidate);
+            }
+        }
+        CFRelease(value);
+    }
+    CFRelease(window);
+}
+
 static bool ReadViaAccessibility(
     NSRunningApplication *application,
     SelectionInfo &info,
@@ -1152,7 +1177,6 @@ static bool ReadViaAccessibility(
         focused = CopyFocusedWindow(applicationElement);
     }
     AXUIElementRef focusedWindow = CopyFocusedWindow(applicationElement);
-    ReadWindowTitle(focusedWindow, info.windowTitle, context);
 
     const bool protectedFocus = focused != nullptr && ElementIsProtected(focused, context);
     bool found = false;
@@ -1188,14 +1212,25 @@ static bool ReadViaAccessibility(
     }
 
     if (found && context.IsCurrent()) {
+        // The title only matters to the "selected text is the window chrome"
+        // filter, so read it after a candidate exists instead of paying an AX
+        // round trip on every mouse-up.
+        if (info.text.size() <= 2048) {
+            ReadWindowTitle(focusedWindow, info.windowTitle, context);
+            if (SelectionTextMatchesSourceIdentity(info)) {
+                found = false;
+            }
+        }
+    } else if (!context.IsCurrent()) {
+        found = false;
+    }
+    if (found && context.IsCurrent()) {
         info.fullscreen = ReadFullscreen(applicationElement, context);
         if (context.IsCurrent()) {
             info.method = SelectionMethod::Accessibility;
         } else {
             found = false;
         }
-    } else if (!context.IsCurrent()) {
-        found = false;
     }
     if (focused != nullptr) CFRelease(focused);
     if (focusedWindow != nullptr) CFRelease(focusedWindow);
@@ -1203,62 +1238,10 @@ static bool ReadViaAccessibility(
     return found;
 }
 
-static std::string LowercaseAscii(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
-        return static_cast<char>(std::tolower(character));
-    });
-    return value;
-}
-
-static bool IsWpsSelectionApplication(
-    const std::string &normalizedBundleId,
-    const std::string &normalizedAppName) {
-    // Regional / channel variants use several Kingsoft / WPS identifiers.
-    if (normalizedBundleId.rfind("com.kingsoft.", 0) == 0 ||
-        normalizedBundleId.rfind("cn.wps.", 0) == 0 ||
-        normalizedBundleId.rfind("com.wps.", 0) == 0 ||
-        normalizedBundleId.find("wpsoffice") != std::string::npos ||
-        normalizedBundleId.find("wps-office") != std::string::npos) {
-        return true;
-    }
-    // Fallback when bundle id is missing or atypical but the display name is
-    // clearly a WPS product (Writer / Spreadsheets / Presentation / PDF).
-    return normalizedAppName.find("wps") != std::string::npos ||
-        normalizedAppName.find("wpsoffice") != std::string::npos ||
-        normalizedAppName.find("kingsoft") != std::string::npos;
-}
-
 static bool IsDocumentOrOfficeSelectionApplication(
     const std::string &bundleId,
     const std::string &appName) {
-    const std::string normalizedBundleId = LowercaseAscii(bundleId);
-    const std::string normalizedAppName = LowercaseAscii(appName);
-    if (IsWpsSelectionApplication(normalizedBundleId, normalizedAppName)) {
-        return true;
-    }
-    static const char *const prefixes[] = {
-        "com.adobe.",
-        "com.microsoft.word",
-        "com.microsoft.excel",
-        "com.microsoft.powerpoint",
-        "com.apple.preview",
-        "com.apple.iwork.pages",
-        "com.apple.iwork.numbers",
-        "com.apple.iwork.keynote",
-        "org.libreoffice.",
-        "org.openoffice.",
-    };
-    for (const char *prefix : prefixes) {
-        if (normalizedBundleId.rfind(prefix, 0) == 0) {
-            return true;
-        }
-    }
-    return normalizedAppName.find("acrobat") != std::string::npos ||
-        normalizedAppName.find("preview") != std::string::npos ||
-        normalizedAppName == "word" ||
-        normalizedAppName == "excel" ||
-        normalizedAppName == "powerpoint" ||
-        normalizedAppName.find("libreoffice") != std::string::npos;
+    return textlens_app_profiles::ResolveAppTraits(bundleId, appName).documentOffice;
 }
 
 // Declared in <HIServices/SecureInput.h>; redeclared here because that SDK
@@ -1301,8 +1284,17 @@ static std::mutex gLastClipboardCaptureMutex;
 
 // Last WeChat window that produced a real text capture. The image viewer is a
 // separate window; a shallow AX hit inside a window that already yielded text
-// is a chat surface, not the viewer.
-static std::atomic<CGWindowID> gLastWeChatTextWindow{kCGNullWindowID};
+// is a chat surface, not the viewer. The pid and timestamp keep a recycled
+// CGWindowID (or a relaunched WeChat) from inheriting stale trust.
+struct TrustedTextWindowState {
+    std::string bundleId;
+    pid_t pid = 0;
+    CGWindowID window = kCGNullWindowID;
+    uint64_t atMs = 0;
+};
+static std::mutex gTrustedTextWindowMutex;
+static TrustedTextWindowState gTrustedTextWindow;
+constexpr uint64_t kTrustedTextWindowTtlMs = 15 * 60 * 1000;
 
 static PasteboardSnapshot SnapshotPasteboard(NSPasteboard *pasteboard) {
     PasteboardSnapshot snapshot;
@@ -1479,7 +1471,10 @@ struct ClipboardFocusProbe {
     }
 };
 
-static ClipboardFocusProbe ProbeClipboardFocus(NSRunningApplication *application) {
+static ClipboardFocusProbe ProbeClipboardFocus(
+    NSRunningApplication *application,
+    const std::atomic<uint64_t> *captureGeneration,
+    uint64_t expectedGeneration) {
     ClipboardFocusProbe probe;
     if (application == nil) {
         return probe;
@@ -1493,8 +1488,11 @@ static ClipboardFocusProbe ProbeClipboardFocus(NSRunningApplication *application
     // that answered the text read can still hang on these follow-up reads.
     ConfigureAccessibilityElement(applicationElement);
     for (int attempt = 0; attempt < 3; ++attempt) {
+        if (!CaptureIsCurrent(captureGeneration, expectedGeneration)) {
+            break;
+        }
         if (attempt > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         AXUIElementRef focused = CopyFocusedElement(applicationElement);
         if (focused == nullptr) {
@@ -1599,6 +1597,9 @@ struct PointerHitTestOutcome {
     // window drag (the press point now exposes the window behind).
     bool hasWindowFrame = false;
     CGRect windowFrame = CGRectZero;
+    // False when the bounded scan ran out of time or was superseded; an
+    // incomplete scan must not be read as "no content surface".
+    bool complete = true;
     int axError = 0;
     std::string roleChain;
 };
@@ -1659,8 +1660,10 @@ static bool CopyAXWindowFrame(AXUIElementRef element, CGRect &frame) {
 static bool SubtreeContainsContentSurface(
     AXUIElementRef element,
     int depth,
-    size_t &remaining) {
-    if (element == nullptr || depth < 0 || remaining == 0) {
+    size_t &remaining,
+    uint64_t deadlineMs) {
+    if (element == nullptr || depth < 0 || remaining == 0 ||
+        MonotonicMilliseconds() >= deadlineMs) {
         return false;
     }
     --remaining;
@@ -1675,7 +1678,10 @@ static bool SubtreeContainsContentSurface(
     }
     bool found = false;
     const CFIndex count = std::min<CFIndex>(CFArrayGetCount(children), 32);
-    for (CFIndex index = 0; index < count && !found && remaining > 0; ++index) {
+    for (CFIndex index = 0;
+         index < count && !found && remaining > 0 &&
+         MonotonicMilliseconds() < deadlineMs;
+         ++index) {
         AXUIElementRef child = static_cast<AXUIElementRef>(
             const_cast<void *>(CFArrayGetValueAtIndex(children, index)));
         std::string role;
@@ -1692,7 +1698,7 @@ static bool SubtreeContainsContentSurface(
         if (IsContentSurfaceRole(role)) {
             found = true;
         } else if (depth > 0) {
-            found = SubtreeContainsContentSurface(child, depth - 1, remaining);
+            found = SubtreeContainsContentSurface(child, depth - 1, remaining, deadlineMs);
         }
     }
     CFRelease(children);
@@ -1702,10 +1708,17 @@ static bool SubtreeContainsContentSurface(
 static PointerHitTestOutcome PointerHitTestAtPosition(
     NSRunningApplication *application,
     CGPoint point,
-    bool includeWindowFrame = false,
-    bool inspectWindowContent = false) {
+    bool includeWindowFrame,
+    bool inspectWindowContent,
+    uint64_t deadlineMs,
+    const std::atomic<uint64_t> *captureGeneration = nullptr,
+    uint64_t expectedGeneration = 0) {
     PointerHitTestOutcome outcome;
     if (application == nil) {
+        return outcome;
+    }
+    if (MonotonicMilliseconds() >= deadlineMs) {
+        outcome.complete = false;
         return outcome;
     }
     AXUIElementRef applicationElement =
@@ -1729,12 +1742,20 @@ static PointerHitTestOutcome PointerHitTestAtPosition(
 
     static const char *const kRoleSeparator = ">";
     AXUIElementRef current = hit;
-    CFRetain(current);
+    // `hit` already carries the +1 from AXUIElementCopyElementAtPosition.
+    // Every parent is released when we move on, and the final current/hit are
+    // released below; retaining `hit` here would leak one element per call.
     // WeChat's image viewer hides the image below several wrapper groups; a
     // three-level scan stops before the window and cannot tell it apart from
     // a chat bubble. Deep-scan only the WeChat call sites (includeWindowFrame).
     const int scanDepth = includeWindowFrame ? 5 : 3;
     for (int level = 0; level < scanDepth && !outcome.isImage && current != nullptr; ++level) {
+        if ((captureGeneration != nullptr &&
+             captureGeneration->load(std::memory_order_acquire) != expectedGeneration) ||
+            MonotonicMilliseconds() >= deadlineMs) {
+            outcome.complete = false;
+            break;
+        }
         std::string role;
         CFTypeRef roleValue = nullptr;
         if (AXUIElementCopyAttributeValue(current, kAXRoleAttribute, &roleValue) ==
@@ -1774,7 +1795,10 @@ static PointerHitTestOutcome PointerHitTestAtPosition(
                 !outcome.hasTextRole && !outcome.hasContentRole) {
                 size_t remaining = 48;
                 outcome.windowHasContentSurface =
-                    SubtreeContainsContentSurface(current, 2, remaining);
+                    SubtreeContainsContentSurface(current, 2, remaining, deadlineMs);
+                if (MonotonicMilliseconds() >= deadlineMs) {
+                    outcome.complete = false;
+                }
             }
             break;
         }
@@ -1810,24 +1834,88 @@ static PointerHitTestOutcome PointerHitTestAtPosition(
 // image with visible feedback. A shallow button inside the chat window still
 // has the chat split view below the window and is not treated as opaque.
 static bool PointerHitTestIsOpaqueWindowSurface(const PointerHitTestOutcome &outcome) {
-    return outcome.resolved && outcome.reachedWindow &&
-        !outcome.hasTextRole && !outcome.hasContentRole &&
-        !outcome.windowHasContentSurface;
+    textlens_selection_policy::OpaqueWindowSignals signals;
+    signals.resolved = outcome.resolved;
+    signals.complete = outcome.complete;
+    signals.reachedWindow = outcome.reachedWindow;
+    signals.hasTextRole = outcome.hasTextRole;
+    signals.hasContentRole = outcome.hasContentRole;
+    signals.windowHasContentSurface = outcome.windowHasContentSurface;
+    return textlens_selection_policy::IsOpaqueWindowSurface(signals);
 }
 
 // Even an opaque chain is a text surface when the anchor window already
-// produced a real text capture. WeChat's image viewer is a new, different
+// produced a real text capture. A canvas app's image viewer is a new, different
 // window, so it never inherits that trust.
-static bool WeChatAnchorIsOpaqueWindow(
+static bool TrustedWindowAllowsFallback(
     const PointerHitTestOutcome &outcome,
-    CGWindowID anchorWindow) {
+    CGWindowID anchorWindow,
+    pid_t applicationPid,
+    const std::string &bundleId) {
     if (!PointerHitTestIsOpaqueWindowSurface(outcome)) {
         return false;
     }
-    if (anchorWindow == kCGNullWindowID) {
-        return true;
+    textlens_selection_policy::OpaqueWindowSignals signals;
+    signals.resolved = outcome.resolved;
+    signals.complete = outcome.complete;
+    signals.reachedWindow = outcome.reachedWindow;
+    signals.hasTextRole = outcome.hasTextRole;
+    signals.hasContentRole = outcome.hasContentRole;
+    signals.windowHasContentSurface = outcome.windowHasContentSurface;
+    signals.anchorWindowKnown = anchorWindow != kCGNullWindowID;
+    if (signals.anchorWindowKnown) {
+        std::lock_guard<std::mutex> lock(gTrustedTextWindowMutex);
+        const bool sameBundle = !bundleId.empty() &&
+            gTrustedTextWindow.bundleId == bundleId;
+        const bool samePid = applicationPid != 0 &&
+            gTrustedTextWindow.pid == applicationPid;
+        const bool sameWindow = anchorWindow == gTrustedTextWindow.window;
+        const uint64_t now = MonotonicMilliseconds();
+        const uint64_t age = now >= gTrustedTextWindow.atMs
+            ? now - gTrustedTextWindow.atMs
+            : 0;
+        signals.trustedAnchorWindow = sameBundle && samePid && sameWindow &&
+            gTrustedTextWindow.atMs != 0 && age <= kTrustedTextWindowTtlMs;
     }
-    return anchorWindow != gLastWeChatTextWindow.load(std::memory_order_relaxed);
+    return textlens_selection_policy::AnchorIsOpaqueWindow(signals);
+}
+
+static CGWindowID TrustedTextWindowNumberForBundle(const std::string &bundleId) {
+    std::lock_guard<std::mutex> lock(gTrustedTextWindowMutex);
+    return gTrustedTextWindow.bundleId == bundleId
+        ? gTrustedTextWindow.window
+        : kCGNullWindowID;
+}
+
+// Seed the trusted-window cache from every successful mouse-gesture capture,
+// including the automatic worker/fallback paths. Previously only the manual
+// shortcut path stored it, so auto mode never trusted a chat window.
+static void RememberTrustedTextWindow(
+    const SelectionInfo &info,
+    NSRunningApplication *application) {
+    if (application == nil || !info.hasMouseEnd) {
+        return;
+    }
+    if (textlens_app_profiles::ResolveAppTraits(info.bundleId, info.appName).surfaceGuard ==
+        textlens_app_profiles::SurfaceGuard::None) {
+        return;
+    }
+    if (info.trigger != Trigger::Drag && info.trigger != Trigger::DoubleClick &&
+        info.trigger != Trigger::ShiftClick) {
+        return;
+    }
+    const CGPoint anchor =
+        info.trigger == Trigger::Drag && info.hasMouseStart ? info.mouseStart : info.mouseEnd;
+    const CGWindowID window =
+        TopmostWindowNumberAtPoint(application.processIdentifier, anchor);
+    if (window == kCGNullWindowID) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(gTrustedTextWindowMutex);
+    gTrustedTextWindow.bundleId = info.bundleId;
+    gTrustedTextWindow.pid = application.processIdentifier;
+    gTrustedTextWindow.window = window;
+    gTrustedTextWindow.atMs = MonotonicMilliseconds();
 }
 
 // True when a TEXT-role focused element explicitly reports an empty selected
@@ -1852,47 +1940,18 @@ static bool FocusProbeTextElementExplicitlyEmpty(const ClipboardFocusProbe &prob
 // fallback; apps whose AX selection already works never reach it either.
 // GPU-rendered terminals (kitty/Alacritty/Ghostty/WezTerm) implement Cmd+C as
 // pure copy — a selection-less copy is a no-op there — so they are allowed.
-enum class ClipboardFallbackPolicy {
-    Allowed,
-    // Smart-Cmd+C terminals send SIGINT when nothing is selected. Only
-    // keyboard gestures (Cmd+A, shift+arrows) qualify: they always leave a
-    // real selection behind, so the chord can only ever copy.
-    KeyboardOnly,
-    Denied,
-};
+using ClipboardFallbackPolicy = textlens_app_profiles::ClipboardPolicy;
 
 static ClipboardFallbackPolicy ClipboardFallbackPolicyForApplication(
     const std::string &bundleId,
     const std::string &appName,
     Trigger trigger) {
-    const std::string normalizedBundle = LowercaseAscii(bundleId);
-    static const char *const deniedBundlePrefixes[] = {
-        // Password managers: a synthetic copy could lift a secret into the
-        // selection pipeline and on into an AI request.
-        "com.1password.1password",
-        "com.agilebits.",
-        "org.keepassxc.keepassxc",
-        "com.bitwarden.desktop",
-        // Finder drag-select is an icon rubber-band; Cmd+C would copy files.
-        "com.apple.finder",
-    };
-    for (const char *prefix : deniedBundlePrefixes) {
-        if (normalizedBundle.rfind(prefix, 0) == 0) {
-            return ClipboardFallbackPolicy::Denied;
-        }
+    const auto policy = textlens_app_profiles::ResolveAppTraits(bundleId, appName).clipboard;
+    if (policy == ClipboardFallbackPolicy::KeyboardOnly &&
+        trigger != Trigger::Keyboard) {
+        return ClipboardFallbackPolicy::Denied;
     }
-    const std::string normalizedName = LowercaseAscii(appName);
-    const bool smartInterruptTerminal =
-        normalizedBundle.rfind("com.apple.terminal", 0) == 0 ||
-        normalizedBundle.rfind("com.googlecode.iterm2", 0) == 0 ||
-        normalizedName.find("terminal") != std::string::npos ||
-        normalizedName.find("iterm") != std::string::npos;
-    if (smartInterruptTerminal) {
-        return trigger == Trigger::Keyboard
-            ? ClipboardFallbackPolicy::KeyboardOnly
-            : ClipboardFallbackPolicy::Denied;
-    }
-    return ClipboardFallbackPolicy::Allowed;
+    return policy;
 }
 
 // True when the current pasteboard contents carry KNOWN non-text data
@@ -1942,10 +2001,19 @@ static void TraceClipboardGateFor(const SelectionInfo &info, const char *detail)
     TraceClipboardGate(line);
 }
 
-// First characters of the captured text for the opt-in trace file only —
-// enough to tell WHAT an empty-space copy returned (stale selection vs
-// current line vs junk) without dumping user content. Newlines and control
-// characters are masked.
+static bool TraceContentEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("TEXTLENS_TRACE_CONTENT");
+        return value != nullptr &&
+            (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+             std::strcmp(value, "TRUE") == 0);
+    }();
+    return enabled;
+}
+
+// Opt-in only: a short, control-character-masked prefix of the captured text.
+// Enabled separately from TEXTLENS_SELECTION_TRACE so ordinary diagnosis logs
+// never contain user content.
 static std::string TraceTextPrefix(const std::string &text) {
     NSString *raw = NSStringFromString(text);
     if (raw == nil) {
@@ -1969,6 +2037,28 @@ static std::string TraceTextPrefix(const std::string &text) {
     return StringFromNSString(clean);
 }
 
+static std::string TraceTextDigest(const std::string &text) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (const unsigned char byte : text) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    char buffer[17];
+    std::snprintf(buffer, sizeof(buffer), "%016llx", static_cast<unsigned long long>(hash));
+    return std::string(buffer);
+}
+
+// Default trace payload: length + stable hash. The 24-character prefix is only
+// appended when TEXTLENS_TRACE_CONTENT is explicitly enabled.
+static std::string TraceTextSummary(const std::string &text) {
+    std::string summary =
+        "len=" + std::to_string(text.size()) + " hash=" + TraceTextDigest(text);
+    if (TraceContentEnabled()) {
+        summary += " prefix=\"" + TraceTextPrefix(text) + "\"";
+    }
+    return summary;
+}
+
 static bool CaptureViaClipboard(
     NSRunningApplication *application,
     SelectionInfo &info,
@@ -1982,8 +2072,7 @@ static bool CaptureViaClipboard(
         return false;
     }
     auto generationCurrent = [&]() {
-        return captureGeneration == nullptr ||
-            captureGeneration->load(std::memory_order_acquire) == expectedGeneration;
+        return CaptureIsCurrent(captureGeneration, expectedGeneration);
     };
     if (!generationCurrent()) {
         // Cheapest gate first: no AX work should happen for a gesture that
@@ -1992,7 +2081,8 @@ static bool CaptureViaClipboard(
         return false;
     }
 
-    ClipboardFocusProbe focus = ProbeClipboardFocus(application);
+    ClipboardFocusProbe focus =
+        ProbeClipboardFocus(application, captureGeneration, expectedGeneration);
     if (focus.isProtected) {
         TraceClipboardGateFor(info, "skip: protected-focus");
         return false;
@@ -2023,11 +2113,20 @@ static bool CaptureViaClipboard(
         // gestures keep the fallback because the cursor may be parked
         // anywhere while the user selects by keyboard.
         const bool isWeChat = info.bundleId == "com.tencent.xinWeChat";
-        const bool inspectWindowContent = isWeChat &&
+        const bool canvasChat = textlens_app_profiles::ResolveAppTraits(
+            info.bundleId, info.appName).surfaceGuard !=
+            textlens_app_profiles::SurfaceGuard::None;
+        const bool inspectWindowContent = canvasChat &&
             (info.trigger == Trigger::DoubleClick ||
              info.trigger == Trigger::ShiftClick);
         const PointerHitTestOutcome hitTest = PointerHitTestAtPosition(
-            application, info.mouseCurrent, isWeChat, inspectWindowContent);
+            application,
+            info.mouseCurrent,
+            isWeChat,
+            inspectWindowContent,
+            std::min(deadlineMs, MonotonicMilliseconds() + 180),
+            captureGeneration,
+            expectedGeneration);
         char hitLine[192];
         if (hitTest.resolved) {
             std::snprintf(
@@ -2071,7 +2170,7 @@ static bool CaptureViaClipboard(
         // A double-click or shift-click inside WeChat's image viewer lands on
         // the same opaque window surface as a drag. There is no text to copy;
         // the chord would copy the image with visible feedback.
-        if (isWeChat &&
+        if (canvasChat &&
             (info.trigger == Trigger::DoubleClick || info.trigger == Trigger::ShiftClick)) {
             const CGWindowID anchorWindow = TopmostWindowNumberAtPoint(
                 application.processIdentifier, info.mouseCurrent);
@@ -2081,9 +2180,13 @@ static bool CaptureViaClipboard(
                 sizeof(windowNumberLine),
                 "pointer-window-number: point=%u trusted=%u",
                 anchorWindow,
-                gLastWeChatTextWindow.load(std::memory_order_relaxed));
+                TrustedTextWindowNumberForBundle(info.bundleId));
             TraceClipboardGate(windowNumberLine);
-            if (WeChatAnchorIsOpaqueWindow(hitTest, anchorWindow)) {
+            if (TrustedWindowAllowsFallback(
+                    hitTest,
+                    anchorWindow,
+                    application.processIdentifier,
+                    info.bundleId)) {
                 TraceClipboardGateFor(info, "skip: wechat-opaque-window-click");
                 return false;
             }
@@ -2096,9 +2199,15 @@ static bool CaptureViaClipboard(
         // the two. Compare the drag start instead: a text selection starts on
         // text inside the same window, while a window drag leaves the press
         // point over the window behind.
-        if (isWeChat && info.trigger == Trigger::Drag && info.hasMouseStart) {
-            const PointerHitTestOutcome startHit =
-                PointerHitTestAtPosition(application, info.mouseStart, true, true);
+        if (canvasChat && info.trigger == Trigger::Drag && info.hasMouseStart) {
+            const PointerHitTestOutcome startHit = PointerHitTestAtPosition(
+                application,
+                info.mouseStart,
+                true,
+                true,
+                std::min(deadlineMs, MonotonicMilliseconds() + 220),
+                captureGeneration,
+                expectedGeneration);
             char startLine[192];
             if (startHit.resolved) {
                 std::snprintf(
@@ -2129,7 +2238,7 @@ static bool CaptureViaClipboard(
                 "pointer-window-numbers: start=%u end=%u trusted=%u",
                 startWindow,
                 endWindow,
-                gLastWeChatTextWindow.load(std::memory_order_relaxed));
+                TrustedTextWindowNumberForBundle(info.bundleId));
             TraceClipboardGate(windowNumberLine);
             if (startHit.hasWindowFrame && hitTest.hasWindowFrame) {
                 char windowLine[144];
@@ -2161,7 +2270,11 @@ static bool CaptureViaClipboard(
             // numbers alone cannot see this: the drag starts and ends inside
             // the same viewer window. A window that already produced text is
             // trusted so shallow chat hits keep working.
-            if (WeChatAnchorIsOpaqueWindow(startHit, startWindow)) {
+            if (TrustedWindowAllowsFallback(
+                    startHit,
+                    startWindow,
+                    application.processIdentifier,
+                    info.bundleId)) {
                 TraceClipboardGateFor(info, "skip: wechat-opaque-window-drag-start");
                 return false;
             }
@@ -2216,9 +2329,10 @@ static bool CaptureViaClipboard(
         bool postedSessionRetry = false;
         NSInteger nonTextStablePolls = 0;
         std::string copiedText;
+        uint64_t pollIntervalMs = kClipboardPollIntervalInitialMs;
         while (generationCurrent() && MonotonicMilliseconds() < fallbackDeadlineMs) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kClipboardPollIntervalMs));
+            std::this_thread::sleep_for(std::chrono::milliseconds(pollIntervalMs));
+            pollIntervalMs = std::min(pollIntervalMs * 2, kClipboardPollIntervalMaxMs);
             const NSInteger changeCount = pasteboard.changeCount;
             if (changeCount == originalChangeCount) {
                 if (!postedSessionRetry &&
@@ -2303,6 +2417,14 @@ static bool CaptureViaClipboard(
             TraceClipboardGateFor(info, "abort: interrupted-or-blank-oversized");
             return false;
         }
+        if (info.windowTitle.empty()) {
+            ReadFocusedWindowTitleForFallback(
+                application,
+                info.windowTitle,
+                captureGeneration,
+                expectedGeneration,
+                fallbackDeadlineMs);
+        }
         SelectionInfo candidate = info;
         ClearSelectionGeometry(candidate);
         candidate.text = std::move(copiedText);
@@ -2342,15 +2464,15 @@ static bool CaptureViaClipboard(
             TraceClipboardGateFor(info, "reject: stale-same-text-far-location");
             return false;
         }
-        char okLine[256];
+        char okLine[320];
         std::snprintf(
             okLine,
             sizeof(okLine),
-            "app=%s trigger=%s capture: ok bytes=%zu prefix=\"%s\"",
+            "app=%s trigger=%s capture: ok bytes=%zu %s",
             info.bundleId.c_str(),
             TriggerTag(info.trigger),
             candidate.text.size(),
-            TraceTextPrefix(candidate.text).c_str());
+            TraceTextSummary(candidate.text).c_str());
         TraceClipboardGate(okLine);
         info = std::move(candidate);
         return true;
@@ -2368,25 +2490,13 @@ static bool CaptureViaClipboard(
 // only answer when "Allow JavaScript from Apple Events" is enabled; when it
 // is not, osascript fails fast and the clipboard fallback proceeds.
 static bool IsAppleScriptSelectionBrowser(const std::string &bundleId) {
-    static const char *const browsers[] = {
-        "com.apple.Safari",
-        "com.google.Chrome",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "com.vivaldi.Vivaldi",
-        "com.operasoftware.Opera",
-        "Company.TheBrowser.Arc",
-    };
-    for (const char *candidate : browsers) {
-        if (bundleId == candidate) {
-            return true;
-        }
-    }
-    return false;
+    return textlens_app_profiles::ResolveAppTraits(bundleId, "").applescript !=
+        textlens_app_profiles::AppleScriptDialect::None;
 }
 
 static std::string AppleScriptSelectionScript(const std::string &bundleId) {
-    if (bundleId == "com.apple.Safari") {
+    if (textlens_app_profiles::ResolveAppTraits(bundleId, "").applescript ==
+        textlens_app_profiles::AppleScriptDialect::Safari) {
         return "tell application \"Safari\" to do JavaScript "
                "\"window.getSelection().toString();\" in current tab of front window";
     }
@@ -2471,15 +2581,15 @@ static bool CaptureViaAppleScript(NSRunningApplication *application, SelectionIn
         TraceClipboardGateFor(info, "reject: applescript-candidate-invalid");
         return false;
     }
-    char okLine[256];
+    char okLine[320];
     std::snprintf(
         okLine,
         sizeof(okLine),
-        "app=%s trigger=%s applescript-capture: ok bytes=%zu prefix=\"%s\"",
+        "app=%s trigger=%s applescript-capture: ok bytes=%zu %s",
         info.bundleId.c_str(),
         TriggerTag(info.trigger),
         candidate.text.size(),
-        TraceTextPrefix(candidate.text).c_str());
+        TraceTextSummary(candidate.text).c_str());
     TraceClipboardGate(okLine);
     info = std::move(candidate);
     return true;
@@ -2563,15 +2673,15 @@ static bool CaptureViaAccessibilityPipeline(
             TraceClipboardGateFor(info, "abort: blank-ax-selection");
             return false;
         }
-        char okLine[256];
+        char okLine[320];
         std::snprintf(
             okLine,
             sizeof(okLine),
-            "app=%s trigger=%s ax-capture: ok bytes=%zu prefix=\"%s\"",
+            "app=%s trigger=%s ax-capture: ok bytes=%zu %s",
             info.bundleId.c_str(),
             TriggerTag(trigger),
             info.text.size(),
-            TraceTextPrefix(info.text).c_str());
+            TraceTextSummary(info.text).c_str());
         TraceClipboardGate(okLine);
         return true;
     }
@@ -2634,7 +2744,8 @@ static bool CaptureSelection(
     EnhancedUiCache &enhancedUiCache,
     LastClipboardCapture &lastClipboardCapture,
     const std::atomic<uint64_t> *captureGeneration = nullptr,
-    uint64_t expectedGeneration = 0) {
+    uint64_t expectedGeneration = 0,
+    std::mutex *captureMutex = nullptr) {
     @autoreleasepool {
         if (!AXIsProcessTrusted()) {
             return false;
@@ -2651,15 +2762,24 @@ static bool CaptureSelection(
         info.hasMouseEnd = hasMouseEnd;
 
         bool fallbackAllowed = false;
-        bool captured = CaptureViaAccessibilityPipeline(
-            application,
-            info,
-            trigger,
-            enhancedUiCache,
-            captureGeneration,
-            expectedGeneration,
-            fallbackAllowed);
-        if (!captured && fallbackAllowed) {
+        bool captured = false;
+        {
+            // Only the AX half shares the worker's capture slot. The clipboard
+            // fallback can run for ~1s and must not block the next gesture.
+            std::unique_lock<std::mutex> captureLock;
+            if (captureMutex != nullptr) {
+                captureLock = std::unique_lock<std::mutex>(*captureMutex);
+            }
+            captured = CaptureViaAccessibilityPipeline(
+                application,
+                info,
+                trigger,
+                enhancedUiCache,
+                captureGeneration,
+                expectedGeneration,
+                fallbackAllowed);
+        }
+        if (!captured && fallbackAllowed && gCaptureRunning.load(std::memory_order_acquire)) {
             captured = CaptureViaFallbackChain(
                 application,
                 info,
@@ -2670,18 +2790,8 @@ static bool CaptureSelection(
         }
         if (!captured) {
             TraceClipboardGateFor(info, "abort: no-selection-found");
-        } else if (info.bundleId == "com.tencent.xinWeChat" && hasMouseEnd &&
-                   (trigger == Trigger::Drag || trigger == Trigger::DoubleClick ||
-                    trigger == Trigger::ShiftClick)) {
-            // Remember the window that actually yielded text. A later shallow
-            // hit in this window is a chat surface, not the image viewer.
-            const CGPoint anchor =
-                trigger == Trigger::Drag && hasMouseStart ? mouseStart : mouseEnd;
-            const CGWindowID window =
-                TopmostWindowNumberAtPoint(application.processIdentifier, anchor);
-            if (window != kCGNullWindowID) {
-                gLastWeChatTextWindow.store(window, std::memory_order_relaxed);
-            }
+        } else {
+            RememberTrustedTextWindow(info, application);
         }
         return captured;
     }
@@ -2777,6 +2887,7 @@ static std::string SelectionJSON(const SelectionInfo &info) {
         @"method": MethodName(info.method),
         @"trigger": TriggerName(info.trigger),
         @"timestampMs": @(TimestampMilliseconds()),
+        @"sequence": @(NextEventSequence()),
     };
     return SerializeJSONObject(object);
 }
@@ -2792,6 +2903,7 @@ static std::string DismissJSON(const Task &task) {
         @"mouse": PointObject(task.mouseCurrent),
         @"targetPid": @(task.targetPid),
         @"timestampMs": @(TimestampMilliseconds()),
+        @"sequence": @(NextEventSequence()),
     });
 }
 
@@ -2960,6 +3072,7 @@ struct TextLensSelectionMonitor {
         }
         keyboardSelectionPending = false;
         running.store(true, std::memory_order_release);
+        gCaptureRunning.store(true, std::memory_order_release);
 
         try {
             workerThread = std::thread(&TextLensSelectionMonitor::workerMain, this);
@@ -3000,6 +3113,7 @@ struct TextLensSelectionMonitor {
     int32_t stop() {
         std::lock_guard<std::mutex> lifecycleLock(lifecycleMutex);
         bool wasRunning = running.exchange(false, std::memory_order_acq_rel);
+        gCaptureRunning.store(false, std::memory_order_release);
         {
             std::lock_guard<std::mutex> runLoopLock(runLoopMutex);
             if (eventRunLoop != nullptr) {
@@ -3030,8 +3144,9 @@ struct TextLensSelectionMonitor {
     }
 
     bool captureCurrent(SelectionInfo &info) {
-        std::lock_guard<std::mutex> captureLock(captureMutex);
         CGPoint mouse = CurrentMousePosition();
+        const uint64_t generation =
+            captureGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
         return CaptureSelection(
             excludedBundleId,
             Trigger::Manual,
@@ -3042,7 +3157,10 @@ struct TextLensSelectionMonitor {
             mouse,
             info,
             enhancedUiCache,
-            lastClipboardCapture);
+            lastClipboardCapture,
+            &captureGeneration,
+            generation,
+            &captureMutex);
     }
 
     static CGEventRef eventTapCallback(
@@ -3318,6 +3436,7 @@ struct TextLensSelectionMonitor {
                     completedAt - task.enqueuedAtMs);
                 if (captured) {
                     if (task.generation == captureGeneration.load(std::memory_order_acquire)) {
+                        RememberTrustedTextWindow(info, application);
                         emit(SelectionJSON(info));
                     }
                     continue;
@@ -3380,14 +3499,8 @@ struct TextLensSelectionMonitor {
                 // must read the same app the AX half observed. An app that
                 // quit in between resolves to nil here, which aborts the
                 // fallback quietly.
-                NSRunningApplication *application = nil;
-                for (NSRunningApplication *candidate in
-                     [NSWorkspace sharedWorkspace].runningApplications) {
-                    if (candidate.processIdentifier == task.targetPid) {
-                        application = candidate;
-                        break;
-                    }
-                }
+                NSRunningApplication *application =
+                    [NSRunningApplication runningApplicationWithProcessIdentifier:task.targetPid];
                 const uint64_t startedAt = MonotonicMilliseconds();
                 SelectionInfo info = std::move(task.info);
                 const bool captured = application != nil && CaptureViaFallbackChain(
@@ -3405,6 +3518,7 @@ struct TextLensSelectionMonitor {
                 const bool stillCurrent =
                     task.generation == captureGeneration.load(std::memory_order_acquire);
                 if (captured && stillCurrent) {
+                    RememberTrustedTextWindow(info, application);
                     emit(SelectionJSON(info));
                 } else if (!captured && stillCurrent) {
                     TraceClipboardGateFor(info, "abort: no-selection-found");

@@ -70,6 +70,7 @@ describe('settings form helpers', () => {
       translate: { defaultLanguage: 'zh-CN', targetLanguage: 'zh-CN' }
     })).toEqual({
       valid: false,
+      field: 'translation',
       message: '默认语言和翻译语言不能相同'
     })
   })
@@ -80,6 +81,7 @@ describe('settings form helpers', () => {
       captureShortcut: 'Ctrl+Return'
     })).toEqual({
       valid: false,
+      field: 'captureShortcut',
       message: '捕获快捷键格式无效，请使用例如 CommandOrControl+Shift+S 的格式'
     })
   })
@@ -91,6 +93,7 @@ describe('settings form helpers', () => {
       captureShortcut: ''
     })).toEqual({
       valid: false,
+      field: 'captureShortcut',
       message: '快捷键触发模式需要设置捕获快捷键'
     })
   })
@@ -128,6 +131,7 @@ describe('settings form helpers', () => {
     })
     expect(result).toEqual({
       valid: false,
+      field: 'action:custom-test',
       message: `“自定义”的提示词必须包含 ${TEXT_PLACEHOLDER}`
     })
   })

@@ -2,10 +2,13 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 use thiserror::Error;
 use uuid::Uuid;
@@ -56,7 +59,12 @@ pub trait SecretStore: Send + Sync {
 
 pub struct SettingsRepository {
     path: PathBuf,
-    state: RwLock<AppSettings>,
+    /// Snapshot readers clone the `Arc` under this lock and then release it, so
+    /// a settings write (including its fsync) never blocks the selection loop.
+    state: RwLock<Arc<AppSettings>>,
+    /// Serializes writers without holding the snapshot lock across disk I/O.
+    write_serial: Arc<Mutex<()>>,
+    persist_generation: Arc<AtomicU64>,
     secrets: Arc<dyn SecretStore>,
 }
 
@@ -77,8 +85,27 @@ impl SettingsRepository {
     }
 
     pub fn new_with_legacy_migration(path: impl Into<PathBuf>) -> Result<Self, SettingsError> {
-        let path = path.into();
-        let repository = Self::new(&path)?;
+        Self::new_with_legacy_migration_impl(path.into(), false)
+    }
+
+    /// Startup variant: normalizes and migrates on the calling thread, but
+    /// hands the initial rewrite (including its fsync) to a worker so the
+    /// first window can appear without waiting for disk I/O.
+    pub fn new_with_legacy_migration_deferred(
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, SettingsError> {
+        Self::new_with_legacy_migration_impl(path.into(), true)
+    }
+
+    fn new_with_legacy_migration_impl(
+        path: PathBuf,
+        defer_persist: bool,
+    ) -> Result<Self, SettingsError> {
+        let repository = if defer_persist {
+            Self::new_deferred(&path)?
+        } else {
+            Self::new(&path)?
+        };
         let Some(legacy_path) = legacy_settings_path(&path) else {
             return Ok(repository);
         };
@@ -99,15 +126,29 @@ impl SettingsRepository {
         Ok(repository)
     }
 
+    fn new_deferred(path: &Path) -> Result<Self, SettingsError> {
+        let secrets = Arc::new(LocalEncryptedStore::for_settings_file(path)?);
+        Self::with_secret_store_options(path.to_path_buf(), secrets, true)
+    }
+
     pub fn with_secret_store(
         path: impl Into<PathBuf>,
         secrets: Arc<dyn SecretStore>,
     ) -> Result<Self, SettingsError> {
-        let path = path.into();
+        Self::with_secret_store_options(path.into(), secrets, false)
+    }
+
+    fn with_secret_store_options(
+        path: PathBuf,
+        secrets: Arc<dyn SecretStore>,
+        defer_persist: bool,
+    ) -> Result<Self, SettingsError> {
         let loaded = load_settings(&path)?;
         let repository = Self {
             path,
-            state: RwLock::new(loaded.settings),
+            state: RwLock::new(Arc::new(loaded.settings)),
+            write_serial: Arc::new(Mutex::new(())),
+            persist_generation: Arc::new(AtomicU64::new(0)),
             secrets,
         };
 
@@ -121,7 +162,28 @@ impl SettingsRepository {
                 .set(&secret_account(DEFAULT_PROVIDER_ID), key.trim())?;
         }
         if loaded.must_persist {
-            repository.persist(&repository.state.read())?;
+            if defer_persist {
+                let path = repository.path.clone();
+                let settings = repository.state.read().clone();
+                let write_serial = Arc::clone(&repository.write_serial);
+                let persist_generation = Arc::clone(&repository.persist_generation);
+                std::thread::spawn(move || {
+                    let _serial = write_serial.lock();
+                    // A real settings write that landed first already persisted
+                    // the normalized snapshot; never overwrite it with startup
+                    // state.
+                    if persist_generation.load(Ordering::Acquire) != 0 {
+                        return;
+                    }
+                    if let Err(error) = persist_settings_file(&path, &settings) {
+                        eprintln!("[settings] deferred startup persist failed: {error:?}");
+                    } else {
+                        persist_generation.fetch_add(1, Ordering::AcqRel);
+                    }
+                });
+            } else {
+                repository.persist(repository.state.read().as_ref())?;
+            }
         }
         Ok(repository)
     }
@@ -131,11 +193,17 @@ impl SettingsRepository {
     }
 
     pub fn get_settings(&self) -> AppSettings {
+        self.get_settings_arc().as_ref().clone()
+    }
+
+    /// Cheap snapshot for hot paths: the returned `Arc` stays valid even while
+    /// a settings write persists to disk.
+    pub fn get_settings_arc(&self) -> Arc<AppSettings> {
         self.state.read().clone()
     }
 
     pub fn get_public_settings(&self) -> Result<PublicSettings, SettingsError> {
-        let settings = self.state.read().clone();
+        let settings = self.state.read().as_ref().clone();
         let mut status = Vec::with_capacity(settings.providers.len());
         for provider in &settings.providers {
             status.push((
@@ -360,8 +428,9 @@ impl SettingsRepository {
         // Hold the writer lock across ensure + secret write so concurrent
         // delete_provider cannot remove the provider between check and set,
         // leaving an orphan secret entry.
+        let _serial = self.write_serial.lock();
         {
-            let state = self.state.write();
+            let state = self.state.read();
             if !state
                 .providers
                 .iter()
@@ -386,8 +455,9 @@ impl SettingsRepository {
     ) -> Result<PublicSettings, SettingsError> {
         // Same write-lock scope as set_provider_api_key / delete_provider:
         // ensure and secret delete must not race with provider lifecycle.
+        let _serial = self.write_serial.lock();
         {
-            let state = self.state.write();
+            let state = self.state.read();
             if !state
                 .providers
                 .iter()
@@ -419,6 +489,7 @@ impl SettingsRepository {
         &self,
         legacy: &SettingsRepository,
     ) -> Result<bool, SettingsError> {
+        let _serial = self.write_serial.lock();
         let current = self.get_settings();
         let defaults = AppSettings::default()
             .normalize_and_validate()
@@ -457,7 +528,8 @@ impl SettingsRepository {
                 Err(rollback_error) => Err(rollback_error),
             };
         }
-        *self.state.write() = legacy_settings;
+        self.persist_generation.fetch_add(1, Ordering::AcqRel);
+        *self.state.write() = Arc::new(legacy_settings);
         Ok(true)
     }
 
@@ -492,17 +564,17 @@ impl SettingsRepository {
     where
         F: FnOnce(&mut AppSettings) -> Result<(), SettingsError>,
     {
-        // Hold the writer guard through persistence so concurrent Tauri
-        // commands cannot both derive from the same stale snapshot and lose
-        // one another's changes.
-        let mut state = self.state.write();
-        let mut candidate = state.clone();
+        // Writers serialize on a dedicated lock so the snapshot lock can be
+        // released while this candidate is on disk.
+        let _serial = self.write_serial.lock();
+        let mut candidate = self.state.read().as_ref().clone();
         operation(&mut candidate)?;
         candidate = candidate
             .normalize_and_validate()
             .map_err(SettingsError::Validation)?;
         self.persist(&candidate)?;
-        *state = candidate;
+        self.persist_generation.fetch_add(1, Ordering::AcqRel);
+        *self.state.write() = Arc::new(candidate);
         Ok(())
     }
 
@@ -513,8 +585,8 @@ impl SettingsRepository {
         // Hold the settings writer lock across both stores. This prevents a
         // provider key from being recreated concurrently between validation,
         // encrypted-secret cleanup and the JSON commit.
-        let mut state = self.state.write();
-        let previous = state.clone();
+        let _serial = self.write_serial.lock();
+        let previous = self.state.read().as_ref().clone();
         let mut candidate = previous.clone();
         operation(&mut candidate)?;
         candidate = candidate
@@ -542,22 +614,24 @@ impl SettingsRepository {
             .collect::<Result<Vec<_>, _>>()?;
 
         self.persist(&candidate)?;
+        self.persist_generation.fetch_add(1, Ordering::AcqRel);
         for account in &removed_accounts {
             if let Err(delete_error) = self.secrets.delete(account) {
                 let restore_result = self.restore_secret_snapshots(&secret_snapshots);
                 if let Err(rollback_error) = self.persist(&previous) {
                     // The candidate is still the durable JSON state. Keep the
                     // in-memory copy aligned with it even though cleanup failed.
-                    *state = candidate;
+                    *self.state.write() = Arc::new(candidate);
                     return Err(rollback_error);
                 }
+                self.persist_generation.fetch_add(1, Ordering::AcqRel);
                 return match restore_result {
                     Ok(()) => Err(delete_error),
                     Err(restore_error) => Err(restore_error),
                 };
             }
         }
-        *state = candidate;
+        *self.state.write() = Arc::new(candidate);
         Ok(())
     }
 
@@ -579,35 +653,43 @@ impl SettingsRepository {
     }
 
     fn persist(&self, settings: &AppSettings) -> Result<(), SettingsError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let bytes = serde_json::to_vec_pretty(settings)?;
-        let temporary = self
-            .path
-            .with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let write_result = (|| -> Result<(), std::io::Error> {
-            let mut file = options.open(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            // Windows refuses ReplaceFileW/MoveFileExW while this process
-            // still owns an open handle to the replacement file.
-            drop(file);
-            atomic_file::replace_file(&temporary, &self.path)?;
-            Ok(())
-        })();
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        write_result.map_err(SettingsError::Io)
+        persist_settings_file(&self.path, settings)
     }
+}
+
+fn persist_settings_file(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        // Best-effort snapshot of the previous file so a bad write or a broken
+        // later build can be recovered manually. A failed copy must not block
+        // saving the new state.
+        let _ = fs::copy(path, path.with_extension("json.bak"));
+    }
+    let bytes = serde_json::to_vec_pretty(settings)?;
+    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        // Windows refuses ReplaceFileW/MoveFileExW while this process
+        // still owns an open handle to the replacement file.
+        drop(file);
+        atomic_file::replace_file(&temporary, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result.map_err(SettingsError::Io)
 }
 
 fn secret_account(provider_id: &str) -> String {
@@ -1504,6 +1586,25 @@ mod tests {
                 .as_deref(),
             Some("current-secret")
         );
+    }
+
+    #[test]
+    fn keeps_a_backup_of_the_previous_settings_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut first = AppSettings::default();
+        first.result.font_size = 15;
+        persist_settings_file(&path, &first).unwrap();
+
+        let mut second = first.clone();
+        second.result.font_size = 17;
+        persist_settings_file(&path, &second).unwrap();
+
+        let backed_up: AppSettings =
+            serde_json::from_slice(&fs::read(path.with_extension("json.bak")).unwrap()).unwrap();
+        assert_eq!(backed_up.result.font_size, 15);
+        let current: AppSettings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(current.result.font_size, 17);
     }
 
     #[test]

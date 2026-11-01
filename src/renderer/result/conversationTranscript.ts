@@ -50,6 +50,13 @@ export function beginAssistantTurn(turns: TranscriptTurn[], turnId: string): Tra
   ]
 }
 
+export function transcriptToPlainText(turns: TranscriptTurn[]): string {
+  return turns
+    .filter((turn) => turn.content.trim().length > 0)
+    .map((turn) => `${turn.role === 'user' ? '你' : 'AI'}：\n${turn.content}`)
+    .join('\n\n')
+}
+
 export function patchStreamingAssistant(
   turns: TranscriptTurn[],
   content: string,

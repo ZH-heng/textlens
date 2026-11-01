@@ -67,7 +67,7 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let settings_path = app.path().app_config_dir()?.join("settings.json");
-            let settings = Arc::new(SettingsRepository::new_with_legacy_migration(
+            let settings = Arc::new(SettingsRepository::new_with_legacy_migration_deferred(
                 settings_path,
             )?);
             let actions = ActionService::new(settings.clone())?;

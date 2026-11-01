@@ -948,7 +948,11 @@ fn capture_with_timeout_on_lane(
         // this as an empty capture and let the existing bounded retry recover
         // the user's current gesture instead of requiring a second drag.
         Err(CaptureExecutorError::Disconnected) => (Ok(None), false),
-        Err(CaptureExecutorError::TimedOut | CaptureExecutorError::Cancelled) => (Ok(None), false),
+        Err(
+            CaptureExecutorError::TimedOut
+            | CaptureExecutorError::Cancelled
+            | CaptureExecutorError::CancelledCooperative,
+        ) => (Ok(None), false),
     }
 }
 
@@ -1582,8 +1586,11 @@ impl SelectionWorker {
                     .mouse_down_at
                     .take()
                     .map(|at| now.saturating_duration_since(at));
+                // A missing mouse-down (hook started mid-gesture) must not
+                // demote a real drag to a click; movement still gates the
+                // trigger in classify_windows_mouse_selection.
                 let drag_duration_valid =
-                    press_duration.is_some_and(|duration| duration <= MAX_DRAG_DURATION);
+                    press_duration.is_none_or(|duration| duration <= MAX_DRAG_DURATION);
                 let click_duration_valid =
                     press_duration.is_some_and(|duration| duration <= DOUBLE_CLICK_INTERVAL);
                 let began_on_self = std::mem::take(&mut self.mouse_down_on_self);
@@ -2083,6 +2090,7 @@ impl SelectionWorker {
                 mouse: raw_selection_point(point),
                 target_pid: i64::from(window_process_id(target_window)),
                 timestamp_ms,
+                sequence: 0,
             }))
         });
     }
@@ -2093,6 +2101,9 @@ enum CaptureExecutorError {
     Disconnected,
     TimedOut,
     Cancelled,
+    /// The helper answered a cancel request promptly; it is still healthy and
+    /// must not be recycled just because the gesture was superseded.
+    CancelledCooperative,
 }
 
 struct CaptureExecutor {
@@ -2157,6 +2168,12 @@ impl CaptureExecutor {
                 }
                 self.begin_warming_helper();
                 Err(CaptureExecutorError::Disconnected)
+            }
+            // A prompt cancel reply proves the helper still owns a healthy
+            // STA/OLE apartment; keep it to avoid process churn on every
+            // keystroke mid-capture.
+            Err(CaptureExecutorError::CancelledCooperative) => {
+                Err(CaptureExecutorError::CancelledCooperative)
             }
             Err(error) => {
                 if let Some(mut helper) = self.helper.take() {
@@ -2461,7 +2478,7 @@ impl SelectionHelperProcess {
                     result,
                 })) if event_request_id == request_id => {
                     if cancel_reason.is_some() {
-                        return Err(CaptureExecutorError::Cancelled);
+                        return Err(CaptureExecutorError::CancelledCooperative);
                     }
                     let result = match result {
                         HelperCaptureResult::Selection {
@@ -2624,19 +2641,24 @@ fn parent_capture_context_is_valid(
         return false;
     }
     let foreground_pid = window_process_id(foreground);
-    if foreground_pid == 0 || foreground_pid == own_process_id {
-        return false;
-    }
-    let related = foreground.0 as isize == source_window
-        || process_belongs_to_capture_source(foreground_pid, process_id, &mut process_parents);
-    if !related {
-        return false;
-    }
-    if require_generation_match && hook_generation().load(Ordering::Acquire) != expected_generation
-    {
-        return false;
-    }
-    true
+    let same_application_family = foreground_pid != 0
+        && foreground_pid != own_process_id
+        && process_belongs_to_capture_source(foreground_pid, process_id, &mut process_parents);
+    let generation_matches = !require_generation_match
+        || hook_generation().load(Ordering::Acquire) == expected_generation;
+    // The tail decision is shared with unit tests so the production path and
+    // parent_capture_accepts cannot drift.
+    parent_capture_accepts(
+        foreground.0 as isize == source_window,
+        foreground_pid,
+        process_id,
+        provider_process_id,
+        own_process_id,
+        same_application_family,
+        true,
+        generation_matches,
+        require_generation_match,
+    )
 }
 
 /// Pure predicate for unit tests of parent acceptance (no live HWND/API).
@@ -3549,15 +3571,18 @@ impl CaptureEngine {
     ) -> Result<Option<SelectionPayload>, SelectionError> {
         let image_path = source_app.bundle_id.clone();
         let clipboard_profile = clipboard_capture_profile(&image_path);
-        let focused_control_is_password = if clipboard_profile.uses_native_password_probe() {
-            focused_native_control_is_password(source_window)
+        let password_state = if clipboard_profile.uses_native_password_probe() {
+            Some(focused_native_control_is_password(source_window))
         } else {
             focused_element_is_password(&self.automation)
         };
         if process_id == 0
             || process_id == control.textlens_process_id
             || prohibited_clipboard_application(&image_path)
-            || focused_control_is_password
+            || password_state_blocks_clipboard(
+                password_state,
+                known_copy_compatibility_application(&image_path),
+            )
         {
             trace_selection_route("clipboard-blocked", source_window, process_id);
             return Ok(None);
@@ -3904,6 +3929,7 @@ impl CaptureEngine {
             method: SelectionMethod::Clipboard,
             trigger: request.trigger,
             timestamp_ms: timestamp_ms(),
+            sequence: 0,
         }))
     }
 
@@ -3994,6 +4020,7 @@ impl CaptureEngine {
                 method: SelectionMethod::Accessibility,
                 trigger: request.trigger,
                 timestamp_ms: timestamp_ms(),
+                sequence: 0,
             });
         }
         None
@@ -4379,7 +4406,7 @@ impl CaptureEngine {
         else {
             return AccessibilityCapture::NotFound;
         };
-        if focused_element_is_password(&self.automation) {
+        if focused_element_is_password(&self.automation) == Some(true) {
             return AccessibilityCapture::Protected;
         }
         // `AccessibleObjectFromPoint` is the most useful MSAA entry point for
@@ -4718,6 +4745,7 @@ impl CaptureEngine {
             method: SelectionMethod::Accessibility,
             trigger: request.trigger,
             timestamp_ms: timestamp_ms(),
+            sequence: 0,
         };
         // Word and some document providers expose the window/document title
         // through TextPattern.GetSelection even when a real range exists on a
@@ -5001,6 +5029,7 @@ impl CaptureEngine {
                             method: SelectionMethod::Accessibility,
                             trigger: request.trigger,
                             timestamp_ms: timestamp_ms(),
+                            sequence: 0,
                         };
                         if legacy_accessibility_selection_is_plausible(&selection, source_window) {
                             return AccessibilityCapture::Selection(selection);
@@ -5221,6 +5250,7 @@ fn accessibility_selection_payload(
         method: SelectionMethod::Accessibility,
         trigger: request.trigger,
         timestamp_ms: timestamp_ms(),
+        sequence: 0,
     }
 }
 
@@ -6181,12 +6211,19 @@ fn resolve_cached_source_app(
     }
 }
 
-fn focused_element_is_password(automation: &IUIAutomation) -> bool {
-    match unsafe { automation.GetFocusedElement() } {
-        Ok(element) => unsafe { element.CurrentIsPassword() }
-            .ok()
-            .is_some_and(|value| value.as_bool()),
-        Err(_) => false,
+fn focused_element_is_password(automation: &IUIAutomation) -> Option<bool> {
+    let element = unsafe { automation.GetFocusedElement() }.ok()?;
+    unsafe { element.CurrentIsPassword() }
+        .ok()
+        .map(|value| value.as_bool())
+}
+
+/// Unknown password state must not silently enable the synthetic-copy path.
+/// Only profiles known to copy safely may proceed when the probe fails.
+fn password_state_blocks_clipboard(state: Option<bool>, copy_compatibility_allowed: bool) -> bool {
+    match state {
+        Some(is_password) => is_password,
+        None => !copy_compatibility_allowed,
     }
 }
 
@@ -6971,13 +7008,49 @@ fn clipboard_owner_is_acceptable_for_capture(
     process_id: u32,
     process_parents: &mut Option<Option<HashMap<u32, u32>>>,
 ) -> bool {
-    if !clipboard_profile.requires_target_clipboard_owner() {
+    if clipboard_profile.requires_target_clipboard_owner() {
+        return clipboard_profile.accepts_clipboard_owner(
+            clipboard_owner_matches_target_with_lazy_parents(process_id, process_parents),
+        );
+    }
+    // PDF/document profiles may publish delayed formats through an OLE or
+    // shell broker. Keep accepting ownerless/unknown owners, but reject a
+    // positively identified foreign executable (e.g. a clipboard manager
+    // racing the injected Ctrl+C).
+    let target_family =
+        clipboard_owner_matches_target_with_lazy_parents(process_id, process_parents);
+    let owner_pid = clipboard_owner_process_id();
+    let owner_image = owner_pid.and_then(process_image_path);
+    pdf_clipboard_owner_is_acceptable(target_family, owner_pid, owner_image.as_deref())
+}
+
+fn clipboard_owner_process_id() -> Option<u32> {
+    let owner = unsafe { windows::Win32::System::DataExchange::GetClipboardOwner() }.ok()?;
+    if owner.0.is_null() || owner.is_invalid() {
+        return None;
+    }
+    let owner_pid = window_process_id(owner);
+    (owner_pid != 0).then_some(owner_pid)
+}
+
+fn is_system_clipboard_broker_image(image_path: &str) -> bool {
+    matches!(
+        executable_name(image_path).as_str(),
+        "explorer.exe" | "rdpclip.exe" | "dllhost.exe"
+    )
+}
+
+/// PDF profiles accept ownerless/unknown owners and system brokers, but not a
+/// foreign application that happened to write the clipboard during capture.
+fn pdf_clipboard_owner_is_acceptable(
+    target_family: bool,
+    owner_pid: Option<u32>,
+    broker_image: Option<&str>,
+) -> bool {
+    if target_family || owner_pid.is_none() {
         return true;
     }
-    clipboard_profile.accepts_clipboard_owner(clipboard_owner_matches_target_with_lazy_parents(
-        process_id,
-        process_parents,
-    ))
+    broker_image.map_or(true, is_system_clipboard_broker_image)
 }
 
 fn clipboard_recovery_owner_is_acceptable(
@@ -8201,6 +8274,7 @@ fn hook_thread_main(
             keyboard_hook = replacement_keyboard;
             let _ = unsafe { UnhookWindowsHookEx(old_keyboard) };
             let _ = unsafe { UnhookWindowsHookEx(old_mouse) };
+            arm_hook_refresh_window();
             reinstall_due = Instant::now() + HOOK_REINSTALL_INTERVAL;
         }
         let _ = unsafe {
@@ -8262,10 +8336,40 @@ fn enqueue_hook_input(input: RawInput) {
     }
 }
 
-/// A hook refresh briefly has both the old and replacement low-level hooks in
+/// Hook refresh briefly leaves both the old and replacement low-level hooks in
 /// the chain. Windows supplies the same `time` and payload to both callbacks;
-/// suppress that one overlap without putting a mutex or a second queue in the
-/// callback's latency-sensitive path.
+/// scope deduplication to that short window so two genuine wheel events with
+/// identical payloads in the same millisecond are never dropped.
+fn hook_refresh_clock() -> &'static OnceLock<Instant> {
+    static CLOCK: OnceLock<Instant> = OnceLock::new();
+    &CLOCK
+}
+
+fn hook_refresh_window_ms() -> u64 {
+    hook_refresh_clock()
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn hook_refresh_until_ms() -> &'static AtomicU64 {
+    static UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+    &UNTIL_MS
+}
+
+fn hook_refresh_window_active() -> bool {
+    let until = hook_refresh_until_ms().load(Ordering::Acquire);
+    until != 0 && hook_refresh_window_ms() <= until
+}
+
+fn arm_hook_refresh_window() {
+    hook_refresh_until_ms().store(
+        hook_refresh_window_ms().saturating_add(100),
+        Ordering::Release,
+    );
+}
+
 fn is_duplicate_low_level_hook_event(
     kind: u64,
     message: u32,
@@ -8313,16 +8417,17 @@ unsafe extern "system" fn mouse_hook_callback(
                 | WM_MOUSEHWHEEL
         ) {
             let input = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-            let duplicate = is_duplicate_low_level_hook_event(
-                1,
-                message,
-                input.time,
-                input.pt.x as i64 as u64,
-                input.pt.y as i64 as u64,
-                u64::from(input.mouseData)
-                    ^ (u64::from(input.flags) << 32)
-                    ^ input.dwExtraInfo as u64,
-            );
+            let duplicate = hook_refresh_window_active()
+                && is_duplicate_low_level_hook_event(
+                    1,
+                    message,
+                    input.time,
+                    input.pt.x as i64 as u64,
+                    input.pt.y as i64 as u64,
+                    u64::from(input.mouseData)
+                        ^ (u64::from(input.flags) << 32)
+                        ^ input.dwExtraInfo as u64,
+                );
             if !duplicate {
                 // Wheel is "soft" input: dismiss toolbar, but do not advance
                 // the capture generation. Multi-paragraph PDF selections
@@ -8482,6 +8587,7 @@ mod tests {
             method: SelectionMethod::Accessibility,
             trigger,
             timestamp_ms: 1,
+            sequence: 0,
         }
     }
 
@@ -8547,6 +8653,7 @@ mod tests {
             method: SelectionMethod::Accessibility,
             trigger: SelectionTrigger::Drag,
             timestamp_ms: 0,
+            sequence: 0,
         };
         assert!(!accessibility_selection_payload_is_plausible(
             &acrobat_selection,
@@ -9152,6 +9259,37 @@ mod tests {
             42,
             now,
             GENERAL_CLIPBOARD_TEXT_SETTLE_DELAY
+        ));
+    }
+
+    #[test]
+    fn unknown_password_state_blocks_clipboard_unless_profile_is_copy_compatible() {
+        assert!(password_state_blocks_clipboard(Some(true), true));
+        assert!(!password_state_blocks_clipboard(Some(false), false));
+        assert!(password_state_blocks_clipboard(None, false));
+        assert!(!password_state_blocks_clipboard(None, true));
+    }
+
+    #[test]
+    fn pdf_clipboard_owner_accepts_target_and_system_brokers_only() {
+        assert!(pdf_clipboard_owner_is_acceptable(true, Some(42), None));
+        assert!(pdf_clipboard_owner_is_acceptable(false, None, None));
+        // Unknown owner image keeps the historical acceptance.
+        assert!(pdf_clipboard_owner_is_acceptable(false, Some(42), None));
+        assert!(pdf_clipboard_owner_is_acceptable(
+            false,
+            Some(42),
+            Some(r"C:\Windows\explorer.exe")
+        ));
+        assert!(pdf_clipboard_owner_is_acceptable(
+            false,
+            Some(42),
+            Some(r"C:\Windows\System32\dllhost.exe")
+        ));
+        assert!(!pdf_clipboard_owner_is_acceptable(
+            false,
+            Some(42),
+            Some(r"C:\Apps\clipboard-manager.exe")
         ));
     }
 

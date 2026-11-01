@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { StrictMode } from 'react'
 
 import {
@@ -526,6 +526,20 @@ describe('ResultApp window interactions', () => {
     await waitFor(() => expect(api.closeResult).toHaveBeenCalledWith('session-1'))
   })
 
+  it('keeps a temporary translation target when settings change', async () => {
+    const { emitSettings } = await renderResult()
+    const target = screen.getByRole('combobox', { name: '翻译目标语言' })
+    expect(target).toHaveValue('zh-CN')
+
+    fireEvent.change(target, { target: { value: 'fr-FR' } })
+    await waitFor(() => expect(target).not.toBeDisabled())
+    expect(target).toHaveValue('fr-FR')
+
+    act(() => emitSettings(settingsWithFontSize(20)))
+
+    expect(screen.getByRole('combobox', { name: '翻译目标语言' })).toHaveValue('fr-FR')
+  })
+
   it('shows the close button only in manual dismiss mode', async () => {
     const manualSettings = settingsWithFontSize()
     manualSettings.result = { ...manualSettings.result, dismissMode: 'manual' }
@@ -812,6 +826,86 @@ describe('ResultApp window interactions', () => {
       })
     })
     expect(selector).toHaveTextContent('深度模型')
+  })
+
+  it('navigates the model listbox with the keyboard and restores trigger focus', async () => {
+    const settings = settingsWithFontSize()
+    settings.providers.push({
+      id: 'provider-two',
+      name: '备用服务商',
+      enabled: true,
+      baseUrl: 'http://localhost:11434/v1',
+      keyConfigured: true,
+      models: [
+        { id: 'model-fast', name: '快速模型', thinkingLevels: [] },
+        { id: 'model-deep', name: '深度模型', thinkingLevels: [] }
+      ]
+    })
+    const { retryAction } = await renderResult(completedSession, settings)
+    const selector = screen.getByRole('button', { name: '切换模型' })
+    fireEvent.click(selector)
+
+    const listbox = screen.getByRole('listbox', { name: '可用模型' })
+    const current = within(listbox).getByRole('option', { name: '模型一' })
+    const fast = within(listbox).getByRole('option', { name: '快速模型' })
+    const deep = within(listbox).getByRole('option', { name: '深度模型' })
+    await waitFor(() => expect(current).toHaveFocus())
+    expect(current).toHaveAttribute('tabindex', '0')
+    expect(fast).toHaveAttribute('tabindex', '-1')
+
+    fireEvent.keyDown(current, { key: 'ArrowDown' })
+    expect(fast).toHaveFocus()
+    fireEvent.keyDown(fast, { key: 'End' })
+    expect(deep).toHaveFocus()
+    fireEvent.keyDown(deep, { key: 'Enter' })
+
+    await waitFor(() => {
+      expect(retryAction).toHaveBeenLastCalledWith('session-1', {
+        providerId: 'provider-two',
+        modelId: 'model-deep'
+      })
+    })
+    await waitFor(() => expect(selector).toHaveFocus())
+  })
+
+  it('copies the whole ask transcript once follow-up turns exist', async () => {
+    const askSession = resultSnapshot({
+      actionId: 'ask-ai',
+      status: 'completed',
+      content: '',
+      contentScalarCount: 0
+    })
+    const { api } = await renderResult(askSession, settingsWithFontSize())
+    const input = screen.getByRole('textbox', { name: '继续提问' })
+    fireEvent.change(input, { target: { value: '补充解释' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(screen.getByText('补充解释')).toBeInTheDocument())
+
+    const store = await import('./actionEventStore')
+    act(() => {
+      store.hydrateActionEventStore({
+        ...askSession,
+        requestId: 'request-followup',
+        status: 'streaming',
+        content: '补充',
+        contentScalarCount: countUnicodeScalars('补充')
+      })
+    })
+    act(() => {
+      store.hydrateActionEventStore({
+        ...askSession,
+        requestId: 'request-followup',
+        status: 'completed',
+        content: '补充回答',
+        contentScalarCount: countUnicodeScalars('补充回答')
+      })
+    })
+    await waitFor(() => expect(screen.getByText('补充回答')).toBeInTheDocument())
+
+    fireEvent.click(screen.getByRole('button', { name: '复制' }))
+    await waitFor(() => {
+      expect(api.copyText).toHaveBeenCalledWith('你：\n补充解释\n\nAI：\n补充回答')
+    })
   })
 
   it('shows the app toolbar for a real text selection inside result content', async () => {

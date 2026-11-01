@@ -5,7 +5,8 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type JSX
+  type JSX,
+  type KeyboardEvent as ReactKeyboardEvent
 } from 'react'
 import {
   DndContext,
@@ -26,6 +27,7 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import {
+  ArrowLeftRight,
   Check,
   CircleAlert,
   Eye,
@@ -87,7 +89,8 @@ import {
   moveActionToZone,
   removeProviderModelFromSettings,
   removeProviderFromSettings,
-  sortAndNumberActions
+  sortAndNumberActions,
+  type SettingsFieldError
 } from './settingsForm'
 import {
   formatKeyboardEventToTauriShortcut,
@@ -109,12 +112,12 @@ type ModelPickerState = {
 }
 type SettingsSectionId =
   | 'general'
+  | 'permissions'
+  | 'appearance'
   | 'providers'
   | 'actions'
   | 'language'
-  | 'result'
   | 'capture'
-  | 'filter'
 
 const SETTINGS_SECTIONS: ReadonlyArray<{
   id: SettingsSectionId
@@ -123,52 +126,84 @@ const SETTINGS_SECTIONS: ReadonlyArray<{
 }> = [
   {
     id: 'general',
-    label: '通用',
-    blurb: '开关助手、选择划词或快捷键触发，并调整工具条外观。'
+    label: '常规',
+    blurb: '开关助手、选择划词或快捷键触发，并决定结果窗口的关闭方式。'
+  },
+  {
+    id: 'permissions',
+    label: '权限与诊断',
+    blurb: '查看辅助功能授权状态，并检查全局快捷键是否可用。'
+  },
+  {
+    id: 'appearance',
+    label: '外观',
+    blurb: '主题、工具栏显示方式，以及结果窗口的字号与透明度。'
   },
   {
     id: 'providers',
-    label: '服务商',
+    label: 'AI 服务商',
     blurb: '按顺序：填写 API → 测试连接 → 获取模型 → 保存设置。'
   },
   {
     id: 'actions',
-    label: '动作',
+    label: '工具栏动作',
     blurb: '决定工具栏显示哪些功能，可拖拽排序；启用的会出现在划词工具栏。'
   },
   {
     id: 'language',
-    label: '语言',
-    blurb: '设置 AI 默认回复语言，以及翻译的源语言与目标语言。'
-  },
-  {
-    id: 'result',
-    label: '结果',
-    blurb: '结果窗口出现位置、默认大小，以及点击外部时如何关闭。'
+    label: '语言与翻译',
+    blurb: '设置 AI 回复语言，以及默认翻译方向与反向翻译。'
   },
   {
     id: 'capture',
-    label: '划词获取',
-    blurb: '为个别程序选择获取选中文本的方式。'
-  },
-  {
-    id: 'filter',
-    label: '过滤',
-    blurb: '可限制只在部分应用中启用划词，或排除干扰较多的应用。'
+    label: '捕获与过滤',
+    blurb: '为个别程序选择抓取方式，并限制划词助手在哪些应用中生效。'
   }
 ]
 
 const SETTINGS_ACTIVE_SECTION_STORAGE_KEY = 'textlens.settings.active-section'
 
+const LEGACY_SECTION_ALIASES: Readonly<Record<string, SettingsSectionId>> = {
+  result: 'appearance',
+  filter: 'capture'
+}
+
 function restoredSettingsSection(): SettingsSectionId {
   try {
     const value = window.sessionStorage.getItem(SETTINGS_ACTIVE_SECTION_STORAGE_KEY)
-    return SETTINGS_SECTIONS.some((section) => section.id === value)
-      ? value as SettingsSectionId
+    const migrated = value ? LEGACY_SECTION_ALIASES[value] ?? value : null
+    return SETTINGS_SECTIONS.some((section) => section.id === migrated)
+      ? migrated as SettingsSectionId
       : 'general'
   } catch {
     return 'general'
   }
+}
+
+function handleRadioGroupKeyDown(event: ReactKeyboardEvent<HTMLDivElement>): void {
+  const { key } = event
+  if (
+    key !== 'ArrowRight' && key !== 'ArrowDown' &&
+    key !== 'ArrowLeft' && key !== 'ArrowUp' &&
+    key !== 'Home' && key !== 'End'
+  ) return
+  const buttons = Array.from(
+    event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]:not(:disabled)')
+  )
+  if (buttons.length === 0) return
+  event.preventDefault()
+  const activeIndex = buttons.indexOf(document.activeElement as HTMLButtonElement)
+  const nextIndex = key === 'Home'
+    ? 0
+    : key === 'End'
+      ? buttons.length - 1
+      : activeIndex < 0
+        ? 0
+        : (activeIndex + (key === 'ArrowRight' || key === 'ArrowDown' ? 1 : -1) + buttons.length) %
+          buttons.length
+  const next = buttons[nextIndex]
+  next?.focus()
+  next?.click()
 }
 
 const ACTION_KIND_NAMES: Readonly<Record<ActionDefinition['kind'], string>> = {
@@ -302,15 +337,34 @@ export function SettingsApp(): JSX.Element {
   const [keyVisible, setKeyVisible] = useState<Record<string, boolean>>({})
   const [newModelInputs, setNewModelInputs] = useState<Record<string, string>>({})
   const [draggingModelId, setDraggingModelId] = useState<string | null>(null)
+  const [filterText, setFilterText] = useState('')
+  const filterCommittedRef = useRef('')
   const [accessibility, setAccessibility] = useState<AccessibilityStatus | null>(null)
   const [operation, setOperation] = useState<Operation>(null)
   const [banner, setBanner] = useState<Banner>(null)
   const [bannerFading, setBannerFading] = useState(false)
+  const [fieldError, setFieldError] = useState<{
+    field: SettingsFieldError
+    message: string
+  } | null>(null)
   const [dirty, setDirty] = useState(false)
+  useEffect(() => {
+    if (!draft) return
+    const joined = draft.filter.applications.join('\n')
+    if (joined !== filterCommittedRef.current) {
+      filterCommittedRef.current = joined
+      setFilterText(joined)
+    }
+  }, [draft?.filter.applications])
+
   const [editor, setEditor] = useState<ActionDefinition | 'new' | null>(null)
   const [providerPendingDelete, setProviderPendingDelete] = useState<PublicProviderSettings | null>(null)
   const [actionPendingDelete, setActionPendingDelete] = useState<ActionDefinition | null>(null)
   const [modelPicker, setModelPicker] = useState<ModelPickerState | null>(null)
+  const [providerActionPrompt, setProviderActionPrompt] = useState<{
+    kind: 'test' | 'fetch'
+    provider: PublicProviderSettings
+  } | null>(null)
   const [quitConfirmationOpen, setQuitConfirmationOpen] = useState(false)
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(restoredSettingsSection)
@@ -578,6 +632,7 @@ export function SettingsApp(): JSX.Element {
     dirtyRef.current = true
     setDirty(true)
     setBanner(null)
+    setFieldError(null)
   }, [])
 
   // Preview the drafted theme on the settings window itself; cancelling or
@@ -600,8 +655,19 @@ export function SettingsApp(): JSX.Element {
     const validation = buildSettingsUpdate(draft)
     if (!validation.valid) {
       setBanner({ kind: 'error', text: validation.message })
+      if (validation.field) {
+        setFieldError({ field: validation.field, message: validation.message })
+        window.requestAnimationFrame(() => {
+          document
+            .querySelector<HTMLElement>(`[data-field-error="${validation.field}"]`)
+            ?.focus()
+        })
+      } else {
+        setFieldError(null)
+      }
       return null
     }
+    setFieldError(null)
 
     let saved: PublicSettings
     try {
@@ -853,13 +919,18 @@ export function SettingsApp(): JSX.Element {
     }
   }
 
-  const testProvider = async (provider: PublicProviderSettings): Promise<void> => {
+  const runTestProvider = async (
+    provider: PublicProviderSettings,
+    saveFirst: boolean
+  ): Promise<void> => {
     setOperation(`test:${provider.id}`)
     setBanner(null)
-    const saved = await persist()
-    if (!saved) {
-      setOperation(null)
-      return
+    if (saveFirst) {
+      const saved = await persist()
+      if (!saved) {
+        setOperation(null)
+        return
+      }
     }
     try {
       const result = window.textLens.testProviderConnection
@@ -880,11 +951,14 @@ export function SettingsApp(): JSX.Element {
     }
   }
 
-  const openModelPicker = async (provider: PublicProviderSettings): Promise<void> => {
+  const runOpenModelPicker = async (
+    provider: PublicProviderSettings,
+    saveFirst: boolean
+  ): Promise<void> => {
     setOperation(`fetch:${provider.id}`)
     setBanner(null)
-    const saved = await persist()
-    if (!saved) {
+    const saved = saveFirst ? await persist() : null
+    if (saveFirst && !saved) {
       setOperation(null)
       return
     }
@@ -902,7 +976,7 @@ export function SettingsApp(): JSX.Element {
       }
       const remoteModels = normalizedModels(result.models)
       const current = draft?.providers.find((candidate) => candidate.id === provider.id)
-        ?? saved.providers.find((candidate) => candidate.id === provider.id)
+        ?? saved?.providers.find((candidate) => candidate.id === provider.id)
       if (!current) throw new Error('服务商已不存在')
       setModelPicker({
         providerId: provider.id,
@@ -917,6 +991,40 @@ export function SettingsApp(): JSX.Element {
       setOperation(null)
     }
   }
+
+  const requestProviderAction = (
+    kind: 'test' | 'fetch',
+    provider: PublicProviderSettings
+  ): void => {
+    // The backend reads the persisted provider; never persist a dirty draft
+    // silently just because the user asked for a connection test.
+    if (dirtyRef.current || keysDirty) {
+      setProviderActionPrompt({ kind, provider })
+      return
+    }
+    if (kind === 'test') {
+      void runTestProvider(provider, false)
+    } else {
+      void runOpenModelPicker(provider, false)
+    }
+  }
+
+  const confirmProviderAction = (): void => {
+    const pending = providerActionPrompt
+    if (!pending) return
+    setProviderActionPrompt(null)
+    if (pending.kind === 'test') {
+      void runTestProvider(pending.provider, true)
+    } else {
+      void runOpenModelPicker(pending.provider, true)
+    }
+  }
+
+  const testProvider = (provider: PublicProviderSettings): void =>
+    requestProviderAction('test', provider)
+
+  const openModelPicker = (provider: PublicProviderSettings): void =>
+    requestProviderAction('fetch', provider)
 
   const applyModelPicker = (checkedIds: ReadonlySet<string>): void => {
     if (!modelPicker) return
@@ -1110,12 +1218,7 @@ export function SettingsApp(): JSX.Element {
   const busy = operation !== null
   const permission = accessibilityPresentation(accessibility)
   const selectionAvailable = accessibility?.available ?? accessibility?.trusted ?? false
-  // 「划词获取」的策略路由只有 Windows 选择监视器会消费（apps/windows selection），
-  // macOS 的回退策略在原生桥内按应用硬编码。隐藏该分区，避免展示一个不生效的设置。
-  // 普通计算即可：分区只有 7 个，且必须放在 loading 提前 return 之后，不能用 hook。
-  const visibleSections = SETTINGS_SECTIONS.filter(
-    (section) => section.id !== 'capture' || accessibility?.platform === 'windows'
-  )
+  const visibleSections = SETTINGS_SECTIONS
   const activeSectionId = visibleSections.some((section) => section.id === activeSection)
     ? activeSection
     : visibleSections[0]!.id
@@ -1186,10 +1289,16 @@ export function SettingsApp(): JSX.Element {
                   />
                   <div className="setting-row setting-row--stackable">
                     <div><strong>触发方式</strong><p>「划词后」自动弹出工具栏；「快捷键」仅在按下组合键时捕获选区。</p></div>
-                    <div className="segmented-control" role="radiogroup" aria-label="触发方式">
+                    <div
+                      className="segmented-control"
+                      role="radiogroup"
+                      aria-label="触发方式"
+                      onKeyDown={handleRadioGroupKeyDown}
+                    >
                       {(['selected', 'shortcut'] as const).map((mode) => (
                         <button type="button" role="radio" aria-checked={draft.trigger.mode === mode}
                           className={draft.trigger.mode === mode ? 'is-selected' : ''} key={mode}
+                          tabIndex={draft.trigger.mode === mode ? 0 : -1}
                           onClick={() => changeDraft((current) => ({
                             ...current,
                             trigger: { mode },
@@ -1217,6 +1326,7 @@ export function SettingsApp(): JSX.Element {
                           spellCheck={false}
                           readOnly
                           aria-label="捕获当前选区快捷键"
+                          data-field-error="captureShortcut"
                           placeholder="点击后按下组合键"
                           onKeyDown={(event) => {
                             if (event.key === 'Tab') return
@@ -1247,16 +1357,9 @@ export function SettingsApp(): JSX.Element {
                       </div>
                     </div>
                   )}
-                  <div className="setting-row">
-                    <div><strong>工具条显示</strong><p>仅显示图标时仍保留悬浮提示和辅助功能名称。</p></div>
-                    <select className="control compact-control" value={draft.toolbar.displayMode}
-                      onChange={(event) => changeDraft((current) => ({
-                        ...current,
-                        toolbar: { displayMode: event.target.value as PublicSettings['toolbar']['displayMode'] }
-                      }))}>
-                      <option value="icon-label">图标和文字</option><option value="icon-only">仅图标</option>
-                    </select>
-                  </div>
+                  {fieldError?.field === 'captureShortcut' && (
+                    <p className="field-error" role="alert">{fieldError.message}</p>
+                  )}
                   {accessibility?.platform === 'windows' && (
                     <div className="setting-row">
                       <div>
@@ -1280,9 +1383,29 @@ export function SettingsApp(): JSX.Element {
                     </div>
                   )}
                 </div>
+                <div className="settings-card settings-card--rows">
+                  <SettingSwitch title="跟随鼠标位置" description="在点击动作时的鼠标附近打开结果，空间不足时自动翻转。"
+                    checked={draft.result.followCursor} onChange={(followCursor) => changeDraft((current) => ({ ...current, result: { ...current.result, followCursor } }))} />
+                  <SettingSwitch title="记住结果框尺寸" description={draft.result.lastSize ? `当前记忆：${Math.round(draft.result.lastSize.width)} × ${Math.round(draft.result.lastSize.height)}` : '用户调整后，下次沿用相同逻辑尺寸。'}
+                    checked={draft.result.rememberSize} onChange={(rememberSize) => changeDraft((current) => ({ ...current, result: { ...current.result, rememberSize } }))}
+                    extra={draft.result.lastSize ? <button className="button button--quiet" type="button" disabled={busy} onClick={() => void resetResultSize()}>重置尺寸</button> : undefined} />
+                  <SettingSwitch title="默认置顶" description="新打开的结果窗口保持在其他窗口上方；也可在窗口标题栏临时切换。"
+                    checked={draft.result.defaultPinned} onChange={(defaultPinned) => changeDraft((current) => ({ ...current, result: { ...current.result, defaultPinned } }))} />
+                  <div className="setting-row"><div><strong>关闭方式</strong><p>仅未置顶窗口执行；置顶窗口始终忽略自动关闭。</p></div>
+                    <select className="control result-mode-control" value={draft.result.dismissMode}
+                      onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, dismissMode: event.target.value as PublicSettings['result']['dismissMode'] } }))}>
+                      <option value="blur">失去焦点时关闭（推荐）</option><option value="pointer-leave">鼠标移出后关闭</option><option value="manual">手动关闭</option>
+                    </select></div>
+                  {draft.result.dismissMode === 'pointer-leave' && <div className="setting-row"><div><strong>移出延迟</strong><p>短暂移出不会误关窗口。</p></div>
+                    <div className="range-control"><input type="range" min={100} max={2000} step={50} value={draft.result.dismissDelayMs}
+                      onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, dismissDelayMs: Number(event.target.value) } }))} /><span>{draft.result.dismissDelayMs} ms</span></div></div>}
+                </div>
               </section>
+            </>
+          )}
 
-              <section className="settings-section" aria-labelledby="permission-title">
+          {activeSectionId === 'permissions' && (
+              <section className="settings-section settings-section--enter" aria-labelledby="permission-title">
                 <div className="section-heading">
                   <div>
                     <h2 id="permission-title">{permission.heading}</h2>
@@ -1312,7 +1435,6 @@ export function SettingsApp(): JSX.Element {
                   </div>
                 )}
               </section>
-            </>
           )}
 
           {activeSectionId === 'providers' && (
@@ -1381,6 +1503,8 @@ export function SettingsApp(): JSX.Element {
                 </label>
                 <label className="field field--wide"><span className="field__label">API 地址（HTTP / HTTPS）</span>
                   <input className="control" type="url" value={provider.baseUrl} spellCheck={false}
+                    aria-label="API 地址"
+                    data-field-error={`provider:${provider.id}:baseUrl`}
                     placeholder={providerProtocolOption(providerProtocol(provider)).defaultBaseUrl}
                     onChange={(event) => changeProvider(provider.id, (current) => ({ ...current, baseUrl: event.target.value }))} />
                   <span className="field__hint">
@@ -1390,6 +1514,9 @@ export function SettingsApp(): JSX.Element {
                   {usesPlainHttp(provider.baseUrl) && <span className="provider-http-warning" role="alert">
                     <CircleAlert size={15} aria-hidden="true" />当前服务使用 HTTP，API Key 将通过网络明文传输。仅在你信任的网络和服务中使用。
                   </span>}
+                  {fieldError?.field === `provider:${provider.id}:baseUrl` && (
+                    <span className="field-error" role="alert">{fieldError.message}</span>
+                  )}
                 </label>
                 <label className="field"><span className="field__label">API Key</span>
                   <div className="key-control">
@@ -1521,10 +1648,10 @@ export function SettingsApp(): JSX.Element {
         >
           <div className="action-zones">
             <ActionZone title="显示在工具栏" count={`${enabledActions.length} / ${MAX_ENABLED_ACTIONS}`} actions={enabledActions}
-              enabled draggingId={draggingId}
+              enabled draggingId={draggingId} fieldError={fieldError}
               onEdit={setEditor} onDelete={removeAction} onToggle={(action) => moveToZone(action.id, false, disabledActions.length)} />
             <ActionZone title="未显示" count={`${disabledActions.length}`} actions={disabledActions}
-              enabled={false} draggingId={draggingId}
+              enabled={false} draggingId={draggingId} fieldError={fieldError}
               onEdit={setEditor} onDelete={removeAction} onToggle={(action) => moveToZone(action.id, true, enabledActions.length)} />
           </div>
         </DndContext>
@@ -1560,96 +1687,107 @@ export function SettingsApp(): JSX.Element {
         </div>
         <div className="settings-card form-grid settings-card--follow">
           <label className="field">
-            <span className="field__label">默认语言</span>
+            <span className="field__label">翻译成</span>
+            <select
+              className="control"
+              aria-label="翻译目标语言"
+              data-field-error="translation"
+              value={draft.translate.targetLanguage}
+              onChange={(event) => {
+                const targetLanguage = event.target.value as TranslationLanguage
+                changeDraft((current) => ({
+                  ...current,
+                  translate: { ...current.translate, targetLanguage }
+                }))
+              }}
+            >
+              {TRANSLATION_LANGUAGES.map((code) => (
+                <option value={code} key={code} disabled={code === draft.translate.defaultLanguage}>
+                  {TRANSLATION_LANGUAGE_NAMES[code]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            className="button button--quiet translation-swap"
+            type="button"
+            aria-label="交换翻译方向"
+            onClick={() => changeDraft((current) => ({
+              ...current,
+              translate: {
+                defaultLanguage: current.translate.targetLanguage,
+                targetLanguage: current.translate.defaultLanguage
+              }
+            }))}
+          >
+            <ArrowLeftRight size={15} />交换
+          </button>
+          <label className="field">
+            <span className="field__label">反向翻译成</span>
             <select
               className="control"
               aria-label="翻译默认语言"
               value={draft.translate.defaultLanguage}
               onChange={(event) => {
                 const defaultLanguage = event.target.value as TranslationLanguage
-                changeDraft((current) => {
-                  const targetLanguage =
-                    current.translate.targetLanguage === defaultLanguage
-                      ? (defaultLanguage === 'zh-CN' ? 'en-US' : 'zh-CN')
-                      : current.translate.targetLanguage
-                  return {
-                    ...current,
-                    translate: { defaultLanguage, targetLanguage }
-                  }
-                })
+                changeDraft((current) => ({
+                  ...current,
+                  translate: { ...current.translate, defaultLanguage }
+                }))
               }}
             >
               {TRANSLATION_LANGUAGES.map((code) => (
-                <option value={code} key={code}>{TRANSLATION_LANGUAGE_NAMES[code]}</option>
-              ))}
-            </select>
-          </label>
-          <label className="field">
-            <span className="field__label">翻译成</span>
-            <select
-              className="control"
-              aria-label="翻译目标语言"
-              value={draft.translate.targetLanguage}
-              onChange={(event) => {
-                const targetLanguage = event.target.value as TranslationLanguage
-                changeDraft((current) => {
-                  const defaultLanguage =
-                    current.translate.defaultLanguage === targetLanguage
-                      ? (targetLanguage === 'zh-CN' ? 'en-US' : 'zh-CN')
-                      : current.translate.defaultLanguage
-                  return {
-                    ...current,
-                    translate: { defaultLanguage, targetLanguage }
-                  }
-                })
-              }}
-            >
-              {TRANSLATION_LANGUAGES.map((code) => (
-                <option value={code} key={code}>{TRANSLATION_LANGUAGE_NAMES[code]}</option>
+                <option value={code} key={code} disabled={code === draft.translate.targetLanguage}>
+                  {TRANSLATION_LANGUAGE_NAMES[code]}
+                </option>
               ))}
             </select>
           </label>
           <p className="translation-summary field--wide">
-            默认：检测到 {TRANSLATION_LANGUAGE_NAMES[draft.translate.targetLanguage]} 时译为{' '}
-            {TRANSLATION_LANGUAGE_NAMES[draft.translate.defaultLanguage]}，其他语种译为{' '}
-            {TRANSLATION_LANGUAGE_NAMES[draft.translate.targetLanguage]}。结果框可临时切换目标语言。
+            检测到 {TRANSLATION_LANGUAGE_NAMES[draft.translate.targetLanguage]} 时反向译为{' '}
+            {TRANSLATION_LANGUAGE_NAMES[draft.translate.defaultLanguage]}；其他语种译为{' '}
+            {TRANSLATION_LANGUAGE_NAMES[draft.translate.targetLanguage]}。结果框仍可临时切换目标语言。
           </p>
+          {fieldError?.field === 'translation' && (
+            <p className="field-error field--wide" role="alert">{fieldError.message}</p>
+          )}
         </div>
       </section>
           )}
 
-          {activeSectionId === 'result' && (
-      <section className="settings-section settings-section--enter" aria-labelledby="result-title">
-        <div className="section-heading"><div><h2 id="result-title">结果窗口</h2><p>{activeMeta.blurb}</p></div></div>
+          {activeSectionId === 'appearance' && (
+      <section className="settings-section settings-section--enter" aria-labelledby="appearance-title">
+        <div className="section-heading"><div><h2 id="appearance-title">{activeMeta.label}</h2><p>{activeMeta.blurb}</p></div></div>
         <div className="settings-card settings-card--rows">
-          <SettingSwitch title="跟随鼠标位置" description="在点击动作时的鼠标附近打开结果，空间不足时自动翻转。"
-            checked={draft.result.followCursor} onChange={(followCursor) => changeDraft((current) => ({ ...current, result: { ...current.result, followCursor } }))} />
-          <SettingSwitch title="记住结果框尺寸" description={draft.result.lastSize ? `当前记忆：${Math.round(draft.result.lastSize.width)} × ${Math.round(draft.result.lastSize.height)}` : '用户调整后，下次沿用相同逻辑尺寸。'}
-            checked={draft.result.rememberSize} onChange={(rememberSize) => changeDraft((current) => ({ ...current, result: { ...current.result, rememberSize } }))}
-            extra={draft.result.lastSize ? <button className="button button--quiet" type="button" disabled={busy} onClick={() => void resetResultSize()}>重置尺寸</button> : undefined} />
-          <SettingSwitch title="默认置顶" description="新打开的结果窗口保持在其他窗口上方；也可在窗口标题栏临时切换。"
-            checked={draft.result.defaultPinned} onChange={(defaultPinned) => changeDraft((current) => ({ ...current, result: { ...current.result, defaultPinned } }))} />
+          <div className="setting-row">
+            <div><strong>工具条显示</strong><p>仅显示图标时仍保留悬浮提示和辅助功能名称。</p></div>
+            <select className="control compact-control" value={draft.toolbar.displayMode}
+              onChange={(event) => changeDraft((current) => ({
+                ...current,
+                toolbar: { displayMode: event.target.value as PublicSettings['toolbar']['displayMode'] }
+              }))}>
+              <option value="icon-label">图标和文字</option><option value="icon-only">仅图标</option>
+            </select>
+          </div>
           <div className="setting-row"><div><strong>结果文字大小</strong><p>调整翻译、总结、解释等结果正文的字号。</p></div>
             <div className="range-control"><input type="range" aria-label="结果文字大小"
               min={RESULT_FONT_SIZE_MIN} max={RESULT_FONT_SIZE_MAX} step={1} value={draft.result.fontSize}
               onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, fontSize: Number(event.target.value) } }))} />
               <span>{draft.result.fontSize} px</span></div></div>
-          <div className="setting-row"><div><strong>关闭方式</strong><p>仅未置顶窗口执行；置顶窗口始终忽略自动关闭。</p></div>
-            <select className="control result-mode-control" value={draft.result.dismissMode}
-              onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, dismissMode: event.target.value as PublicSettings['result']['dismissMode'] } }))}>
-              <option value="blur">失去焦点时关闭（推荐）</option><option value="pointer-leave">鼠标移出后关闭</option><option value="manual">手动关闭</option>
-            </select></div>
-          {draft.result.dismissMode === 'pointer-leave' && <div className="setting-row"><div><strong>移出延迟</strong><p>短暂移出不会误关窗口。</p></div>
-            <div className="range-control"><input type="range" min={100} max={2000} step={50} value={draft.result.dismissDelayMs}
-              onChange={(event) => changeDraft((current) => ({ ...current, result: { ...current.result, dismissDelayMs: Number(event.target.value) } }))} /><span>{draft.result.dismissDelayMs} ms</span></div></div>}
           <div className="setting-row setting-row--stackable">
             <div><strong>界面主题</strong><p>工具栏、结果框与设置窗口同时换装；预览按当前系统明暗外观渲染。</p></div>
-            <div className="theme-options" role="radiogroup" aria-label="界面主题">
+            <div
+              className="theme-options"
+              role="radiogroup"
+              aria-label="界面主题"
+              onKeyDown={handleRadioGroupKeyDown}
+            >
               {THEME_OPTIONS.map((option) => {
                 const selected = draft.appearance.theme === option.id
                 return (
                   <button key={option.id} type="button" role="radio" aria-checked={selected}
                     className={`theme-option${selected ? ' theme-option--selected' : ''}`} data-theme={option.id}
+                    tabIndex={selected ? 0 : -1}
                     onClick={() => changeDraft((current) => ({ ...current, appearance: { theme: option.id } }))}>
                     <span className="theme-preview" aria-hidden="true">
                       <span className="theme-preview__toolbar">
@@ -1683,7 +1821,8 @@ export function SettingsApp(): JSX.Element {
 
           {activeSectionId === 'capture' && (
       <section className="settings-section settings-section--enter" aria-labelledby="capture-title">
-        <div className="section-heading"><div><h2 id="capture-title">划词获取</h2><p>{activeMeta.blurb}</p></div></div>
+        <div className="section-heading"><div><h2 id="capture-title">{activeMeta.label}</h2><p>{activeMeta.blurb}</p></div></div>
+        {accessibility?.platform === 'windows' && (
         <div className="settings-card settings-card--rows">
           <div className="setting-row setting-row--stackable">
             <div><strong>默认方式</strong><p>优先使用 Selection Hook；已知 PDF 和画布程序仅在安全校验通过时使用受控复制回退。</p></div>
@@ -1775,16 +1914,11 @@ export function SettingsApp(): JSX.Element {
             </div>
           </div>
         </div>
-      </section>
-          )}
-
-          {activeSectionId === 'filter' && (
-      <section className="settings-section settings-section--enter" aria-labelledby="filter-title">
-        <div className="section-heading"><div><h2 id="filter-title">应用过滤</h2><p>{activeMeta.blurb}</p></div></div>
+        )}
         <div className="settings-card settings-card--rows">
           <div className="setting-row setting-row--stackable">
             <div><strong>过滤模式</strong><p>选择全部应用、仅列表应用或排除列表应用。</p></div>
-            <select className="control compact-control" value={draft.filter.mode}
+            <select className="control compact-control" aria-label="过滤模式" value={draft.filter.mode}
               onChange={(event) => changeDraft((current) => ({
                 ...current,
                 filter: { ...current.filter, mode: event.target.value as PublicSettings['filter']['mode'] }
@@ -1795,11 +1929,44 @@ export function SettingsApp(): JSX.Element {
           {draft.filter.mode !== 'default' && (
             <label className="setting-row setting-row--column">
               <div><strong>应用列表</strong><p>每行填写一个应用名称、Bundle ID 或可执行文件名。</p></div>
-              <textarea className="control filter-list-input" value={draft.filter.applications.join('\n')}
-                onChange={(event) => changeDraft((current) => ({
-                  ...current,
-                  filter: { ...current.filter, applications: event.target.value.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean) }
-                }))} />
+              {draft.filter.applications.length > 0 && (
+                <div className="filter-tags" aria-label="过滤应用标签">
+                  {draft.filter.applications.map((application, index) => (
+                    <span className="filter-tag" key={`${application}-${index}`}>
+                      {application}
+                      <button
+                        type="button"
+                        aria-label={`移除 ${application}`}
+                        onClick={() => changeDraft((current) => ({
+                          ...current,
+                          filter: {
+                            ...current.filter,
+                            applications: current.filter.applications.filter(
+                              (candidate) => candidate !== application
+                            )
+                          }
+                        }))}
+                      >
+                        <X size={12} aria-hidden="true" />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              <textarea className="control filter-list-input" aria-label="应用过滤列表" value={filterText}
+                onChange={(event) => {
+                  const nextText = event.target.value
+                  const applications = nextText
+                    .split(/\r?\n/u)
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                  filterCommittedRef.current = applications.join('\n')
+                  setFilterText(nextText)
+                  changeDraft((current) => ({
+                    ...current,
+                    filter: { ...current.filter, applications }
+                  }))
+                }} />
             </label>
           )}
         </div>
@@ -1845,6 +2012,16 @@ export function SettingsApp(): JSX.Element {
           provider={providerPendingDelete}
           onCancel={() => setProviderPendingDelete(null)}
           onConfirm={() => deleteProvider(providerPendingDelete)}
+        />
+      )}
+      {providerActionPrompt && (
+        <DeleteConfirmationDialog
+          title={providerActionPrompt.kind === 'test' ? '测试连接前先保存？' : '获取模型前先保存？'}
+          description="当前有未保存的修改。保存后继续；取消不会更改本地设置。"
+          confirmLabel="保存并继续"
+          closeLabel="关闭保存确认"
+          onCancel={() => setProviderActionPrompt(null)}
+          onConfirm={confirmProviderAction}
         />
       )}
       {actionPendingDelete && (
@@ -2030,12 +2207,13 @@ function SettingSwitch({ title, description, checked, onChange, extra }: {
       onChange={(event) => onChange(event.target.checked)} /><span aria-hidden="true" /><span className="sr-only">{title}</span></label></div></div>
 }
 
-function ActionZone({ title, count, actions, enabled, draggingId, onEdit, onDelete, onToggle }: {
+function ActionZone({ title, count, actions, enabled, draggingId, fieldError, onEdit, onDelete, onToggle }: {
   title: string
   count: string
   actions: readonly ActionDefinition[]
   enabled: boolean
   draggingId: string | null
+  fieldError: { field: SettingsFieldError; message: string } | null
   onEdit: (action: ActionDefinition) => void
   onDelete: (action: ActionDefinition) => void
   onToggle: (action: ActionDefinition) => void
@@ -2055,6 +2233,7 @@ function ActionZone({ title, count, actions, enabled, draggingId, onEdit, onDele
           action={action}
           enabled={enabled}
           dragging={draggingId === action.id}
+          error={fieldError?.field === `action:${action.id}` ? fieldError.message : undefined}
           onEdit={onEdit}
           onDelete={onDelete}
           onToggle={onToggle}
@@ -2366,10 +2545,11 @@ function ModelPickerDialog({
   )
 }
 
-function SortableActionRow({ action, enabled, dragging, onEdit, onDelete, onToggle }: {
+function SortableActionRow({ action, enabled, dragging, error, onEdit, onDelete, onToggle }: {
   action: ActionDefinition
   enabled: boolean
   dragging: boolean
+  error?: string
   onEdit: (action: ActionDefinition) => void
   onDelete: (action: ActionDefinition) => void
   onToggle: (action: ActionDefinition) => void
@@ -2421,9 +2601,10 @@ function SortableActionRow({ action, enabled, dragging, onEdit, onDelete, onTogg
               提示词：{action.prompt}
             </span>
           )}
+          {error && <span className="field-error" role="alert">{error}</span>}
         </div>
         <div className="action-row__controls">
-          <button className="icon-button" type="button" title="编辑" aria-label={`编辑${action.name}`} onClick={() => onEdit(action)}><Pencil size={15} /></button>
+          <button className="icon-button" type="button" title="编辑" aria-label={`编辑${action.name}`} data-field-error={`action:${action.id}`} onClick={() => onEdit(action)}><Pencil size={15} /></button>
           <button className="icon-button action-delete" type="button" title="移除" aria-label={`移除${action.name}`} onClick={() => onDelete(action)}><Trash2 size={15} /></button>
           <label className="switch switch--small"><input type="checkbox" checked={enabled} onChange={() => onToggle(action)} />
             <span aria-hidden="true" /><span className="sr-only">{enabled ? '停用' : '启用'}{action.name}</span></label>

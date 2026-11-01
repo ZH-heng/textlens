@@ -248,6 +248,11 @@ const RESELECT_MIN_REACH_PX: f64 = 12.0;
 /// Two reads of the same range differ by sub-pixel rounding, not by intent.
 const SELECTION_BOUNDS_MATCH_TOLERANCE_PX: f64 = 2.0;
 
+/// How close a re-selection drag must land to the range it is claiming to
+/// re-create. Tight on purpose: the result window sits just below the text, so
+/// a wider radius would admit the click that closes it and re-open the toolbar.
+const RESELECT_ANCHOR_RADIUS_PX: f64 = 16.0;
+
 /// The selection whose toolbar we last presented. A host app keeps reporting
 /// the same selected text after an action finishes, so every later click that
 /// drifts a few pixels re-captures it and the toolbar jumps back to the cursor.
@@ -258,6 +263,8 @@ struct PresentedSelection {
     source: String,
     text: String,
     bounds: Option<SelectionBounds>,
+    /// Used as the anchor when the provider exposes no range geometry.
+    mouse: SelectionMouse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,10 +302,55 @@ fn selection_bounds_match(
 
 /// Distance actually travelled by the drag. A capture that reports no endpoints
 /// is treated as no travel at all, which is the honest reading of a click.
+fn selection_gesture_points(mouse: &SelectionMouse) -> [SelectionPoint; 2] {
+    [
+        mouse.start.unwrap_or(mouse.current),
+        mouse.end.unwrap_or(mouse.current),
+    ]
+}
+
 fn selection_gesture_reach(mouse: &SelectionMouse) -> f64 {
-    let start = mouse.start.unwrap_or(mouse.current);
-    let end = mouse.end.unwrap_or(mouse.current);
-    ((end.x - start.x).powi(2) + (end.y - start.y).powi(2)).sqrt()
+    let [start, end] = selection_gesture_points(mouse);
+    (end.x - start.x).hypot(end.y - start.y)
+}
+
+fn bounds_contains_point(point: &SelectionPoint, bounds: SelectionBounds, inflation: f64) -> bool {
+    point.x >= bounds.x - inflation
+        && point.x <= bounds.x + bounds.width + inflation
+        && point.y >= bounds.y - inflation
+        && point.y <= bounds.y + bounds.height + inflation
+}
+
+/// Whether this capture is a drag *over the range that was already presented*.
+/// Both conditions must hold: the mouse actually travelled, and it travelled
+/// near that range. Travel alone is not enough — a click away from the text
+/// picks up more drift than the threshold and used to throw the toolbar at the
+/// cursor after a result window closed.
+fn gesture_reselects_presented_range(
+    presented: &PresentedSelection,
+    selection: &SelectionPayload,
+) -> bool {
+    if selection.trigger != SelectionTrigger::Drag {
+        return false;
+    }
+    if selection_gesture_reach(&selection.mouse) < RESELECT_MIN_REACH_PX {
+        return false;
+    }
+    let radius = RESELECT_ANCHOR_RADIUS_PX;
+    let current_points = selection_gesture_points(&selection.mouse);
+    match presented.bounds {
+        Some(bounds) => current_points
+            .iter()
+            .any(|point| bounds_contains_point(point, bounds, radius)),
+        None => {
+            let presented_points = selection_gesture_points(&presented.mouse);
+            current_points.iter().any(|point| {
+                presented_points
+                    .iter()
+                    .any(|previous| (point.x - previous.x).hypot(point.y - previous.y) <= radius)
+            })
+        }
+    }
 }
 
 fn judge_selection_presentation(
@@ -317,14 +369,13 @@ fn judge_selection_presentation(
     }
     match selection_bounds_match(presented.bounds, selection.bounds) {
         SelectionBoundsMatch::Different => SelectionPresentation::Present,
-        SelectionBoundsMatch::Same | SelectionBoundsMatch::Unknown => match selection.trigger {
-            SelectionTrigger::Drag
-                if selection_gesture_reach(&selection.mouse) >= RESELECT_MIN_REACH_PX =>
-            {
+        SelectionBoundsMatch::Same | SelectionBoundsMatch::Unknown => {
+            if gesture_reselects_presented_range(presented, selection) {
                 SelectionPresentation::Present
+            } else {
+                SelectionPresentation::AlreadyPresented
             }
-            _ => SelectionPresentation::AlreadyPresented,
-        },
+        }
     }
 }
 
@@ -649,6 +700,7 @@ impl RuntimeState {
             source: selection.source_app.bundle_id.clone(),
             text: selection.text.clone(),
             bounds: selection.bounds,
+            mouse: selection.mouse,
         });
     }
 
@@ -4392,15 +4444,35 @@ mod tests {
         })
     }
 
+    /// A presented selection over the range (0,0,100,20), dragged (10,20) to
+    /// (120,20).
     fn fixture_presented(
         source: &str,
         text: &str,
         bounds: Option<SelectionBounds>,
     ) -> PresentedSelection {
+        fixture_presented_gesture(source, text, bounds, (10.0, 20.0), (120.0, 20.0))
+    }
+
+    fn fixture_presented_gesture(
+        source: &str,
+        text: &str,
+        bounds: Option<SelectionBounds>,
+        start: (f64, f64),
+        end: (f64, f64),
+    ) -> PresentedSelection {
         PresentedSelection {
             source: source.to_owned(),
             text: text.to_owned(),
             bounds,
+            mouse: SelectionMouse {
+                start: Some(SelectionPoint {
+                    x: start.0,
+                    y: start.1,
+                }),
+                end: Some(SelectionPoint { x: end.0, y: end.1 }),
+                current: SelectionPoint { x: end.0, y: end.1 },
+            },
         }
     }
 
@@ -4486,6 +4558,68 @@ mod tests {
         assert_eq!(
             judge_selection_presentation(Some(&presented), &reselect),
             SelectionPresentation::Present
+        );
+    }
+
+    #[test]
+    fn a_long_drag_far_from_the_selection_is_not_a_reselect() {
+        // The reported flow: translate closes on an outside click, the text is
+        // still selected, and the next click picks up 50px of drift away from
+        // it. Travel alone must not throw the toolbar back at the cursor.
+        let presented = fixture_presented(
+            "com.example.editor",
+            "hello",
+            fixture_bounds(0.0, 0.0, 100.0, 20.0),
+        );
+        let far_drag = fixture_capture(
+            "com.example.editor",
+            "hello",
+            fixture_bounds(0.0, 0.0, 100.0, 20.0),
+            SelectionTrigger::Drag,
+            (600.0, 500.0),
+            (650.0, 505.0),
+        );
+        assert!(selection_gesture_reach(&far_drag.mouse) >= RESELECT_MIN_REACH_PX);
+        assert_eq!(
+            judge_selection_presentation(Some(&presented), &far_drag),
+            SelectionPresentation::AlreadyPresented
+        );
+    }
+
+    #[test]
+    fn without_range_geometry_the_previous_gesture_is_the_anchor() {
+        // Canvas apps captured through the clipboard report no bounds, so the
+        // presented drag points carry the location evidence instead.
+        let presented = fixture_presented_gesture(
+            "com.example.canvas",
+            "hello",
+            None,
+            (10.0, 20.0),
+            (120.0, 20.0),
+        );
+        let over_the_text = fixture_capture(
+            "com.example.canvas",
+            "hello",
+            None,
+            SelectionTrigger::Drag,
+            (8.0, 18.0),
+            (122.0, 22.0),
+        );
+        assert_eq!(
+            judge_selection_presentation(Some(&presented), &over_the_text),
+            SelectionPresentation::Present
+        );
+        let across_the_page = fixture_capture(
+            "com.example.canvas",
+            "hello",
+            None,
+            SelectionTrigger::Drag,
+            (400.0, 400.0),
+            (450.0, 400.0),
+        );
+        assert_eq!(
+            judge_selection_presentation(Some(&presented), &across_the_page),
+            SelectionPresentation::AlreadyPresented
         );
     }
 
@@ -4602,6 +4736,7 @@ mod tests {
     fn gesture_reach_divides_a_click_from_a_reselect_without_bounds() {
         // Pinned because it is the number users feel: below it a drag is a click.
         assert_eq!(RESELECT_MIN_REACH_PX, 12.0);
+        assert_eq!(RESELECT_ANCHOR_RADIUS_PX, 16.0);
         let reach = |start: (f64, f64), end: (f64, f64)| {
             selection_gesture_reach(&SelectionMouse {
                 start: Some(SelectionPoint {

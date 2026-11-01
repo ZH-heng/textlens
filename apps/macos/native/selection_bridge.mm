@@ -265,16 +265,11 @@ static void TraceSelectionTiming(const char *stage, uint64_t durationMs) {
     }
 }
 
-// One line per clipboard-fallback gate decision; enables field diagnosis of
-// "why did/didn't a synthetic copy fire" without changing default behavior.
-// Mirrored to ~/Library/Logs/TextLens/selection-trace.log because a
-// Finder-launched app's stderr is not visible. Text appears only as length and
-// hash unless TEXTLENS_TRACE_CONTENT opts into a masked prefix.
-static void TraceClipboardGate(const char *decision) {
+static void TraceSelectionLine(const char *channel, const char *decision) {
     if (!SelectionTimingEnabled()) {
         return;
     }
-    std::fprintf(stderr, "[selection-fallback] %s\n", decision);
+    std::fprintf(stderr, "[%s] %s\n", channel, decision);
     static std::mutex fileMutex;
     std::lock_guard<std::mutex> lock(fileMutex);
     const char *home = std::getenv("HOME");
@@ -293,6 +288,21 @@ static void TraceClipboardGate(const char *decision) {
         static_cast<unsigned long long>(MonotonicMilliseconds()),
         decision);
     std::fclose(file);
+}
+
+// One line per clipboard-fallback gate decision; enables field diagnosis of
+// "why did/didn't a synthetic copy fire" without changing default behavior.
+// Mirrored to ~/Library/Logs/TextLens/selection-trace.log because a
+// Finder-launched app's stderr is not visible. Text appears only as length and
+// hash unless TEXTLENS_TRACE_CONTENT opts into a masked prefix.
+static void TraceClipboardGate(const char *decision) {
+    TraceSelectionLine("selection-fallback", decision);
+}
+
+// The host-highlight collapse is best effort and used to fail silently, which
+// made "I clicked an action and the text stayed selected" undiagnosable.
+static void TraceHostClear(const char *decision) {
+    TraceSelectionLine("selection-host-clear", decision);
 }
 
 // Total order for selection/dismiss arbitration. Wall-clock timestamps can
@@ -2951,23 +2961,51 @@ static uint8_t ClearMatchingTextOnMainThread(
     const std::string &requiredBundleId,
     const std::string &expectedText) {
     @autoreleasepool {
-        if (expectedText.empty() || !AXIsProcessTrusted()) {
+        if (expectedText.empty()) {
+            return 0;
+        }
+        if (!AXIsProcessTrusted()) {
+            TraceHostClear("skip: not-trusted");
             return 0;
         }
 
-        NSRunningApplication *application = FrontmostApplication();
+        // The selection belongs to the app that produced it, not to whatever is
+        // frontmost when the deferred clear fires: after a toolbar action the
+        // result window is usually frontmost, and keying off the frontmost app
+        // made every result-opening action fail to collapse the highlight.
+        NSRunningApplication *application = nil;
+        if (!requiredBundleId.empty()) {
+            for (NSRunningApplication *candidate
+                 in [NSWorkspace sharedWorkspace].runningApplications) {
+                NSString *candidateBundle = candidate.bundleIdentifier;
+                if (candidateBundle != nil &&
+                    StringFromNSString(candidateBundle) == requiredBundleId) {
+                    application = candidate;
+                    break;
+                }
+            }
+            if (application == nil) {
+                TraceHostClear("skip: app-not-found");
+                return 0;
+            }
+        } else {
+            application = FrontmostApplication();
+        }
         if (application == nil || application.processIdentifier == getpid()) {
+            TraceHostClear("skip: no-target-or-own-process");
             return 0;
         }
 
         std::string appBundleId = StringFromNSString(application.bundleIdentifier);
         if (!requiredBundleId.empty() && appBundleId != requiredBundleId) {
+            TraceHostClear("skip: bundle-mismatch");
             return 0;
         }
 
         AXUIElementRef applicationElement =
             AXUIElementCreateApplication(application.processIdentifier);
         if (applicationElement == nullptr) {
+            TraceHostClear("skip: no-application-element");
             return 0;
         }
         AXUIElementSetMessagingTimeout(applicationElement, kAXMessagingTimeoutSeconds);
@@ -2975,6 +3013,7 @@ static uint8_t ClearMatchingTextOnMainThread(
         AXUIElementRef focused = CopyFocusedElement(applicationElement);
         CFRelease(applicationElement);
         if (focused == nullptr) {
+            TraceHostClear("skip: no-focused-element");
             return 0;
         }
 
@@ -2985,8 +3024,21 @@ static uint8_t ClearMatchingTextOnMainThread(
                 static_cast<uint64_t>(kAXMessagingTimeoutSeconds * 1'000.0f),
         };
         std::string current;
-        if (!ReadSelectedText(focused, current, context) || current != expectedText) {
+        if (!ReadSelectedText(focused, current, context)) {
             CFRelease(focused);
+            TraceHostClear("skip: selected-text-unreadable");
+            return 0;
+        }
+        if (current != expectedText) {
+            CFRelease(focused);
+            char line[96];
+            std::snprintf(
+                line,
+                sizeof(line),
+                "skip: text-mismatch (host=%zu captured=%zu)",
+                current.size(),
+                expectedText.size());
+            TraceHostClear(line);
             return 0;
         }
 
@@ -2997,6 +3049,7 @@ static uint8_t ClearMatchingTextOnMainThread(
             reinterpret_cast<CFTypeRef *>(&selectedRangeValue));
         if (error != kAXErrorSuccess || selectedRangeValue == nullptr) {
             CFRelease(focused);
+            TraceHostClear("skip: no-selected-range");
             return 0;
         }
 
@@ -3008,6 +3061,7 @@ static uint8_t ClearMatchingTextOnMainThread(
         CFRelease(selectedRangeValue);
         if (!hasRange) {
             CFRelease(focused);
+            TraceHostClear("skip: empty-or-invalid-range");
             return 0;
         }
 
@@ -3016,6 +3070,7 @@ static uint8_t ClearMatchingTextOnMainThread(
         AXValueRef collapsedValue = AXValueCreate(kAXValueTypeCFRange, &collapsed);
         if (collapsedValue == nullptr) {
             CFRelease(focused);
+            TraceHostClear("skip: cannot-build-collapsed-range");
             return 0;
         }
 
@@ -3025,7 +3080,12 @@ static uint8_t ClearMatchingTextOnMainThread(
             collapsedValue);
         CFRelease(collapsedValue);
         CFRelease(focused);
-        return error == kAXErrorSuccess ? 1 : 0;
+        if (error != kAXErrorSuccess) {
+            TraceHostClear("skip: write-rejected");
+            return 0;
+        }
+        TraceHostClear("cleared");
+        return 1;
     }
 }
 

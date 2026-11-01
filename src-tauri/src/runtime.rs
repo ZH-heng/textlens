@@ -710,6 +710,21 @@ impl RuntimeState {
         self.pending_host_clear_token.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Collapse the host highlight for a selection a toolbar action has taken
+    /// over. Result-window selections live inside TextLens's own webview and have
+    /// no host highlight to clear.
+    fn schedule_selection_host_clear(&self, app: &AppHandle, selection: &CurrentSelection) {
+        if selection.source_result_session_id.is_some() {
+            return;
+        }
+        if let Some(clear) = host_selection_clear_args(
+            &selection.payload.text,
+            Some(selection.payload.source_app.bundle_id.as_str()),
+        ) {
+            self.schedule_host_selection_clear(app.clone(), clear);
+        }
+    }
+
     /// Schedule a best-effort host highlight collapse after
     /// [`HOST_SELECTION_CLEAR_DELAY_MS`]. Replaces any previous pending clear.
     /// Cancelled when a new selection is accepted for toolbar presentation.
@@ -2834,9 +2849,6 @@ pub async fn run_action(
     };
 
     let selection_token = selection.id.clone();
-    let selection_text = selection.payload.text.clone();
-    let selection_source = selection.payload.source_app.bundle_id.clone();
-    let selection_is_from_result = selection.source_result_session_id.is_some();
     if !state
         .consuming_selection_ids
         .lock()
@@ -2856,6 +2868,7 @@ pub async fn run_action(
                 // re-present this selection: its identity is already recorded.
                 // Quietly return key focus to the source app (no ActivateAllWindows
                 // flash). Next outside click then deselects + dismisses in one step.
+                state.schedule_selection_host_clear(&app, &selection);
                 let _ =
                     restore_source_app_activation(&app, &selection.payload.source_app.bundle_id);
                 RunActionResult::accepted(None, None)
@@ -2873,6 +2886,7 @@ pub async fn run_action(
             match resolve_search_target(&selection.payload.text, template) {
                 Ok(target) => match open_system_url(&target) {
                     Ok(()) => {
+                        state.schedule_selection_host_clear(&app, &selection);
                         state.clear_and_hide_current_selection_if(&app, &selection_token);
                         RunActionResult::accepted(None, None)
                     }
@@ -2883,6 +2897,7 @@ pub async fn run_action(
         }
         _ if action.kind.opens_result_without_generation() => {
             let cursor = action_result_cursor(&app, cursor, &selection.payload);
+            state.schedule_selection_host_clear(&app, &selection);
             match state.create_ask_result_session(&app, &action.id, &action.name, selection, cursor)
             {
                 Ok((session_id, request_id, reveal_receiver)) => {
@@ -2910,6 +2925,7 @@ pub async fn run_action(
         }
         _ if action.kind.is_ai() => {
             let cursor = action_result_cursor(&app, cursor, &selection.payload);
+            state.schedule_selection_host_clear(&app, &selection);
             match state.create_result_session(&app, &action.id, &action.name, selection, cursor) {
                 Ok((session_id, request_id, reveal_receiver)) => {
                     // Window creation has its own bounded error path. Start
@@ -2941,18 +2957,6 @@ pub async fn run_action(
         }
         _ => RunActionResult::rejected("暂不支持该动作"),
     };
-    // A toolbar action takes the selection over: collapse the host highlight so
-    // the text does not stay selected after the user picked an option. A result
-    // selection lives inside TextLens's own webview and has no host highlight to
-    // clear. Deferred rather than synchronous: an AX/UIA write on the same
-    // gesture races the next drag and can drop that capture.
-    if result.accepted && !selection_is_from_result {
-        if let Some(clear) =
-            host_selection_clear_args(&selection_text, Some(selection_source.as_str()))
-        {
-            state.schedule_host_selection_clear(app.clone(), clear);
-        }
-    }
     Ok(result)
 }
 

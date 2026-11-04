@@ -94,6 +94,18 @@ pub enum SelectionTrigger {
     Manual,
 }
 
+/// Evidence produced by the Windows helper after checking the actual text
+/// range. Geometry is optional; an object name or clipboard string is never
+/// sufficient evidence for an automatic double-click selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowsSelectionEvidence {
+    UiaRangeAtPoint,
+    UiaRangeChanged,
+    NativeRangeChanged,
+    WordRangeChanged,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelectionMouse {
@@ -123,6 +135,69 @@ pub struct SelectionPayload {
     /// millisecond timestamp.
     #[serde(default)]
     pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_selection_evidence: Option<WindowsSelectionEvidence>,
+}
+
+impl SelectionPayload {
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn has_verified_windows_double_click(&self) -> bool {
+        self.trigger == SelectionTrigger::DoubleClick
+            && self.method == SelectionMethod::Accessibility
+            && match self.windows_selection_evidence {
+                Some(WindowsSelectionEvidence::UiaRangeAtPoint) => {
+                    self.bounds.is_some_and(|bounds| {
+                        windows_double_click_matches_text_range(
+                            &self.text,
+                            &[bounds],
+                            self.mouse.current,
+                        )
+                    })
+                }
+                Some(_) => true,
+                None => false,
+            }
+            && selection_has_two_visible_characters(&self.text)
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn selection_has_two_visible_characters(text: &str) -> bool {
+    text.chars()
+        .filter(|character| !character.is_whitespace() && !character.is_control())
+        .take(2)
+        .count()
+        == 2
+}
+
+/// Correlates a baseline with the first press already verified by the input
+/// worker's system double-click rules. Release-point drift must not impose a
+/// second, different double-click rectangle on that verified gesture.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy)]
+struct WindowsSelectionObservationContext {
+    source_root: isize,
+    process_id: u32,
+    generation: u64,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl WindowsSelectionObservationContext {
+    fn matches_double_click(
+        self,
+        current: Self,
+        expected_first_click: Option<u64>,
+        elapsed: std::time::Duration,
+        lifetime: std::time::Duration,
+    ) -> bool {
+        self.source_root != 0
+            && self.process_id != 0
+            && self.source_root == current.source_root
+            && self.process_id == current.process_id
+            && expected_first_click == Some(self.generation)
+            && current.generation > self.generation
+            && elapsed <= lifetime
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -252,6 +327,7 @@ impl From<WireEvent> for SelectionEvent {
                 trigger,
                 timestamp_ms,
                 sequence,
+                windows_selection_evidence: None,
             }),
             WireEvent::Dismiss {
                 reason,
@@ -658,6 +734,31 @@ fn direction_from_points(
 }
 
 #[cfg(any(target_os = "windows", test))]
+const WINDOWS_CLICK_DRIFT_DISTANCE_SQUARED: f64 = 64.0;
+
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_DRAG_DISTANCE_SQUARED: f64 = 16.0;
+
+/// Double-click detection uses the original hook timestamps (which wrap at
+/// 2^32 ms), the system's rectangle and the same native control for both
+/// presses. Worker scheduling delays must not change the classification.
+#[cfg(any(target_os = "windows", test))]
+fn windows_click_pair_matches(
+    previous: (u32, SelectionPoint, isize),
+    current: (u32, SelectionPoint, isize),
+    max_interval_ms: u32,
+    double_click_size: (i32, i32),
+) -> bool {
+    let (previous_time, previous_point, previous_window) = previous;
+    let (current_time, current_point, current_window) = current;
+    previous_window != 0
+        && previous_window == current_window
+        && current_time.wrapping_sub(previous_time) <= max_interval_ms
+        && (current_point.x - previous_point.x).abs() * 2.0 <= f64::from(double_click_size.0.max(1))
+        && (current_point.y - previous_point.y).abs() * 2.0 <= f64::from(double_click_size.1.max(1))
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn classify_windows_mouse_selection(
     start: SelectionPoint,
     end: SelectionPoint,
@@ -667,7 +768,12 @@ fn classify_windows_mouse_selection(
 ) -> Option<SelectionTrigger> {
     let dx = end.x - start.x;
     let dy = end.y - start.y;
-    if drag_duration_valid && dx * dx + dy * dy >= 16.0 {
+    // A click pair can drift far enough to cross the drag threshold on the
+    // second press. Keep it on the stricter double-click capture path.
+    if is_double_click && dx * dx + dy * dy <= WINDOWS_CLICK_DRIFT_DISTANCE_SQUARED {
+        return Some(SelectionTrigger::DoubleClick);
+    }
+    if drag_duration_valid && dx * dx + dy * dy >= WINDOWS_DRAG_DISTANCE_SQUARED {
         return Some(SelectionTrigger::Drag);
     }
     if is_double_click {
@@ -688,6 +794,35 @@ fn selection_bounds_are_reasonable(rectangle: SelectionBounds) -> bool {
         && rectangle.height < 200_000.0
         && rectangle.x.abs() < 500_000.0
         && rectangle.y.abs() < 500_000.0
+}
+
+/// A double-click is evidence of a text selection only when the same UIA
+/// range contains at least two visible characters and a rectangle at the
+/// mouse-up point. Test individual rectangles, not their enclosing union.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn windows_double_click_matches_text_range(
+    text: &str,
+    rectangles: &[SelectionBounds],
+    point: SelectionPoint,
+) -> bool {
+    if text
+        .chars()
+        .filter(|character| !character.is_whitespace() && !character.is_control())
+        .take(2)
+        .count()
+        < 2
+        || !point.x.is_finite()
+        || !point.y.is_finite()
+    {
+        return false;
+    }
+    rectangles.iter().copied().any(|bounds| {
+        selection_bounds_are_reasonable(bounds)
+            && point.x >= bounds.x
+            && point.x <= bounds.x + bounds.width
+            && point.y >= bounds.y
+            && point.y <= bounds.y + bounds.height
+    })
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -1012,6 +1147,16 @@ mod tests {
             Some(SelectionTrigger::DoubleClick)
         );
         assert_eq!(
+            classify_windows_mouse_selection(
+                start,
+                SelectionPoint { x: 15.0, y: 10.0 },
+                false,
+                true,
+                true,
+            ),
+            Some(SelectionTrigger::DoubleClick)
+        );
+        assert_eq!(
             classify_windows_mouse_selection(start, far, true, true, true),
             Some(SelectionTrigger::Drag)
         );
@@ -1020,9 +1165,116 @@ mod tests {
             None
         );
         assert_eq!(
+            classify_windows_mouse_selection(
+                start,
+                SelectionPoint { x: 15.0, y: 10.0 },
+                false,
+                false,
+                true,
+            ),
+            Some(SelectionTrigger::Drag)
+        );
+        assert_eq!(
             classify_windows_mouse_selection(start, far, true, false, false),
             Some(SelectionTrigger::ShiftClick)
         );
+    }
+
+    #[test]
+    fn windows_double_click_uses_system_bounds_event_time_and_same_control() {
+        let previous = (u32::MAX - 100, SelectionPoint { x: -100.0, y: 20.0 }, 10);
+        let same = (150, SelectionPoint { x: -98.0, y: 22.0 }, 10);
+        assert!(windows_click_pair_matches(previous, same, 500, (4, 4)));
+        assert!(!windows_click_pair_matches(
+            previous,
+            (same.0, same.1, 11),
+            500,
+            (4, 4)
+        ));
+        let shifted = (same.0, SelectionPoint { x: -97.0, y: 20.0 }, 10);
+        assert!(!windows_click_pair_matches(previous, shifted, 500, (4, 4)));
+        assert!(!windows_click_pair_matches(
+            previous,
+            (500, same.1, 10),
+            500,
+            (4, 4)
+        ));
+        assert!(windows_click_pair_matches(previous, shifted, 500, (8, 4)));
+        assert!(!windows_click_pair_matches(
+            (1, previous.1, 0),
+            (2, same.1, 0),
+            500,
+            (4, 4)
+        ));
+    }
+
+    #[test]
+    fn windows_double_click_requires_visible_text_at_an_individual_range_rectangle() {
+        let rectangles = [
+            SelectionBounds {
+                x: -100.0,
+                y: 100.0,
+                width: 40.0,
+                height: 20.0,
+            },
+            SelectionBounds {
+                x: -100.0,
+                y: 140.0,
+                width: 80.0,
+                height: 20.0,
+            },
+        ];
+        let point = SelectionPoint { x: -80.0, y: 110.0 };
+        for text in ["中文", "word", " a b "] {
+            assert!(windows_double_click_matches_text_range(
+                text,
+                &rectangles,
+                point
+            ));
+        }
+        for text in ["", " \n\t", "字", " a ", "a \n"] {
+            assert!(!windows_double_click_matches_text_range(
+                text,
+                &rectangles,
+                point
+            ));
+        }
+        assert!(!windows_double_click_matches_text_range("文字", &[], point));
+        // The union of the two lines contains this point, but neither line does.
+        assert!(!windows_double_click_matches_text_range(
+            "文字",
+            &rectangles,
+            SelectionPoint { x: -80.0, y: 130.0 },
+        ));
+        assert!(!windows_double_click_matches_text_range(
+            "文字",
+            &rectangles,
+            SelectionPoint { x: 10.0, y: 110.0 },
+        ));
+        assert!(!windows_double_click_matches_text_range(
+            "文字",
+            &[SelectionBounds {
+                width: f64::NAN,
+                ..rectangles[0]
+            }],
+            point,
+        ));
+        assert!(!windows_double_click_matches_text_range(
+            "文字",
+            &rectangles,
+            SelectionPoint {
+                x: f64::NAN,
+                y: 110.0
+            },
+        ));
+        assert!(!windows_double_click_matches_text_range(
+            "文字",
+            &rectangles,
+            SelectionPoint {
+                x: -101.0,
+                y: 110.0
+            },
+        ));
     }
 
     #[test]
@@ -1160,6 +1412,106 @@ mod tests {
         assert_eq!(windows_text_budget(1_000_001, false), None);
     }
 
+    #[test]
+    fn windows_no_geometry_evidence_requires_explicit_accessibility_text() {
+        let mut selection =
+            windows_test_selection("中文", None, SelectionPoint { x: -80.0, y: 110.0 });
+        selection.trigger = SelectionTrigger::DoubleClick;
+        assert!(!selection.has_verified_windows_double_click());
+        for evidence in [
+            WindowsSelectionEvidence::UiaRangeChanged,
+            WindowsSelectionEvidence::NativeRangeChanged,
+            WindowsSelectionEvidence::WordRangeChanged,
+        ] {
+            selection.windows_selection_evidence = Some(evidence);
+            assert!(selection.has_verified_windows_double_click());
+            for text in ["字", " a \n", " \t\n"] {
+                selection.text = text.to_owned();
+                assert!(!selection.has_verified_windows_double_click());
+            }
+            selection.text = "中文".to_owned();
+            selection.method = SelectionMethod::Clipboard;
+            assert!(!selection.has_verified_windows_double_click());
+            selection.method = SelectionMethod::Accessibility;
+        }
+        selection.windows_selection_evidence = Some(WindowsSelectionEvidence::UiaRangeAtPoint);
+        assert!(!selection.has_verified_windows_double_click());
+    }
+
+    #[test]
+    fn windows_observation_must_match_the_exact_first_click_and_source() {
+        use std::time::Duration;
+        let first = WindowsSelectionObservationContext {
+            source_root: 42,
+            process_id: 100,
+            generation: 7,
+        };
+        let second = WindowsSelectionObservationContext {
+            generation: 9,
+            ..first
+        };
+        let age = Duration::from_millis(100);
+        let lifetime = Duration::from_millis(600);
+        assert!(first.matches_double_click(second, Some(7), age, lifetime));
+        // A correlated foreground event may advance the current capture
+        // epoch, but must not replace the immutable first-click identity.
+        assert!(first.matches_double_click(
+            WindowsSelectionObservationContext {
+                generation: 10,
+                ..second
+            },
+            Some(7),
+            age,
+            lifetime,
+        ));
+        for expected in [None, Some(6), Some(8)] {
+            assert!(!first.matches_double_click(second, expected, age, lifetime));
+        }
+        for current in [
+            first,
+            WindowsSelectionObservationContext {
+                generation: 6,
+                ..second
+            },
+            WindowsSelectionObservationContext {
+                source_root: 43,
+                ..second
+            },
+            WindowsSelectionObservationContext {
+                process_id: 101,
+                ..second
+            },
+        ] {
+            assert!(!first.matches_double_click(current, Some(7), age, lifetime));
+        }
+        assert!(!first.matches_double_click(
+            second,
+            Some(7),
+            lifetime + Duration::from_millis(1),
+            lifetime,
+        ));
+        for invalid in [
+            WindowsSelectionObservationContext {
+                source_root: 0,
+                ..first
+            },
+            WindowsSelectionObservationContext {
+                process_id: 0,
+                ..first
+            },
+        ] {
+            assert!(!invalid.matches_double_click(
+                WindowsSelectionObservationContext {
+                    generation: 9,
+                    ..invalid
+                },
+                Some(7),
+                age,
+                lifetime,
+            ));
+        }
+    }
+
     fn windows_test_selection(
         text: &str,
         bounds: Option<SelectionBounds>,
@@ -1187,6 +1539,7 @@ mod tests {
             trigger: SelectionTrigger::Drag,
             timestamp_ms: 1,
             sequence: 0,
+            windows_selection_evidence: None,
         }
     }
 }

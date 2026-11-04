@@ -1,6 +1,8 @@
+import { execFileSync } from 'node:child_process'
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   rmSync,
@@ -32,14 +34,17 @@ const outputDirectory = join(exportRoot, bundleName)
 
 const includeEntries = [
   '.env.example',
+  '.github',
   '.gitignore',
   'LICENSE.selection-hook',
   'README.md',
   'README.en.md',
   'THIRD_PARTY_NOTICES.md',
   'DEVELOPMENT_HANDBOOK.md',
+  'REFACTOR_PLAN.md',
   'apps',
   'assets',
+  'deny.toml',
   'package.json',
   'pnpm-lock.yaml',
   'pnpm-workspace.yaml',
@@ -63,8 +68,13 @@ function shouldCopy(sourcePath) {
   if (!relativePath || relativePath === '') return true
 
   const name = basename(sourcePath)
+  const lowerName = name.toLowerCase()
   if (
-    name === '.DS_Store'
+    lstatSync(sourcePath).isSymbolicLink()
+    || (lowerName.startsWith('.env') && lowerName !== '.env.example')
+    || /\.(?:p12|pfx|pem|key|cer|crt|provisionprofile|mobileprovision|jks|keystore)$/u.test(lowerName)
+    || /^(?:id_rsa|id_dsa|id_ecdsa|id_ed25519)$/u.test(lowerName)
+    || name === '.DS_Store'
     || name === '.git'
     || name === '.pnpm-store'
     || name === '.tmp-textlens-start-diagnostic'
@@ -123,7 +133,9 @@ for (const entry of includeEntries) {
 for (const [entry, kind] of [
   ['apps', 'directory'],
   ['assets', 'directory'],
+  ['.github', 'directory'],
   ['DEVELOPMENT_HANDBOOK.md', 'file'],
+  ['deny.toml', 'file'],
   ['src', 'directory'],
   ['src-tauri', 'directory'],
   ['package.json', 'file'],
@@ -145,6 +157,18 @@ for (const excluded of [
   if (existsSync(join(outputDirectory, excluded))) {
     throw new Error(`Export validation failed: excluded path copied into bundle: ${excluded}`)
   }
+}
+
+// Scan the finished source tree itself, including untracked files copied by
+// the exporter. Remove a failed output so it is not accidentally shared.
+try {
+  execFileSync(process.execPath, [join(outputDirectory, 'scripts', 'check-secrets.mjs')], {
+    cwd: outputDirectory,
+    stdio: 'inherit'
+  })
+} catch (error) {
+  rmSync(outputDirectory, { recursive: true, force: true })
+  throw new Error('Export validation failed: secret scan did not pass', { cause: error })
 }
 
 console.log(`Portable development source created at: ${outputDirectory}`)

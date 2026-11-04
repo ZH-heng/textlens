@@ -36,7 +36,7 @@ use crate::{
         WindowSize as SettingsWindowSize,
     },
     selection::{
-        SelectionBounds, SelectionDirection, SelectionEvent, SelectionEventReceiver,
+        DismissEvent, SelectionBounds, SelectionDirection, SelectionEvent, SelectionEventReceiver,
         SelectionMethod, SelectionMonitor, SelectionMouse, SelectionPayload, SelectionPoint,
         SelectionTrigger, SourceApplication,
     },
@@ -214,31 +214,12 @@ pub struct RendererSelectionPayload {
 
 /// Payload emitted when the native runtime dismisses the selection toolbar.
 ///
-/// Always force-hides the toolbar; the renderer uses this to clear local
-/// selection / copy-success state that would otherwise outlive the window.
+/// Carries the selection owner so delayed delivery cannot clear a newer one.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolbarDismissedPayload {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    selection_id: Option<String>,
+    selection_id: String,
     reason: String,
-}
-
-/// Pure dismiss hide decision so unit tests can assert force-hide without an AppHandle.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DismissHidePlan {
-    cleared_selection_id: Option<String>,
-    force_hide: bool,
-}
-
-fn dismiss_hide_plan(cleared_id: Option<String>, scoped_hide_succeeded: bool) -> DismissHidePlan {
-    DismissHidePlan {
-        cleared_selection_id: cleared_id,
-        // A successful selection-scoped hide already performed the native
-        // mutation. A second unconditional hide used to add another synchronous
-        // UI-thread hop to every consecutive drag.
-        force_hide: !scoped_hide_succeeded,
-    }
 }
 
 /// How far apart a drag's endpoints must be to read as "the user selected this
@@ -353,6 +334,11 @@ fn gesture_reselects_presented_range(
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn verified_windows_double_click(selection: &SelectionPayload) -> bool {
+    selection.has_verified_windows_double_click()
+}
+
 fn judge_selection_presentation(
     presented: Option<&PresentedSelection>,
     selection: &SelectionPayload,
@@ -365,6 +351,12 @@ fn judge_selection_presentation(
     }
     if selection.trigger == SelectionTrigger::Manual {
         // The user invoked the shortcut; they asked for this selection again.
+        return SelectionPresentation::Present;
+    }
+    #[cfg(target_os = "windows")]
+    if verified_windows_double_click(selection) {
+        // The Windows capture path verified the new range with geometry or
+        // fresh range evidence; selecting the same word again is valid.
         return SelectionPresentation::Present;
     }
     match selection_bounds_match(presented.bounds, selection.bounds) {
@@ -457,6 +449,68 @@ struct CurrentSelection {
     id: String,
     payload: SelectionPayload,
     source_result_session_id: Option<String>,
+    /// Generation of the host-clear lease granted when this selection was
+    /// accepted. A later gesture invalidates the lease even if it selects the
+    /// same text in the same application.
+    host_clear_generation: u64,
+}
+
+fn host_clear_permitted_for_selection(
+    selection: &CurrentSelection,
+    current_generation: u64,
+    is_windows: bool,
+) -> bool {
+    !is_windows
+        && selection.source_result_session_id.is_none()
+        && should_fire_pending_host_clear(selection.host_clear_generation, current_generation)
+}
+
+/// Remove a selection only if it belongs to the closing result. Identical
+/// text in a new selection is not evidence of common ownership.
+fn take_selection_for_closed_result(
+    current: &mut Option<CurrentSelection>,
+    original_selection_id: Option<&str>,
+    session_id: &str,
+) -> Option<String> {
+    if current.as_ref().is_some_and(|selection| {
+        original_selection_id == Some(selection.id.as_str())
+            || selection_source_matches_result(
+                selection.source_result_session_id.as_deref(),
+                session_id,
+            )
+    }) {
+        current.take().map(|selection| selection.id)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SelectionDismissal {
+    Stale,
+    NoSelection,
+    Selection(String),
+}
+
+fn take_selection_for_dismiss(
+    current: &mut Option<CurrentSelection>,
+    dismiss: &DismissEvent,
+) -> SelectionDismissal {
+    if current.as_ref().is_some_and(|selection| {
+        dismiss_precedes_selection(
+            selection.payload.sequence,
+            selection.payload.timestamp_ms,
+            dismiss.sequence,
+            dismiss.timestamp_ms,
+        )
+    }) {
+        return SelectionDismissal::Stale;
+    }
+    current
+        .take()
+        .map_or(SelectionDismissal::NoSelection, |selection| {
+            SelectionDismissal::Selection(selection.id)
+        })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -704,36 +758,45 @@ impl RuntimeState {
         });
     }
 
-    /// Bump the deferred-clear generation so any in-flight host clear is a no-op.
-    fn cancel_pending_host_selection_clear(&self) {
-        // fetch_add(1) matches `next_host_clear_token` including wrap at u64::MAX.
-        self.pending_host_clear_token.fetch_add(1, Ordering::AcqRel);
+    /// Revoke older clear leases and return the generation for a new selection.
+    fn cancel_pending_host_selection_clear(&self) -> u64 {
+        next_host_clear_token(self.pending_host_clear_token.fetch_add(1, Ordering::AcqRel))
     }
 
     /// Collapse the host highlight for a selection a toolbar action has taken
     /// over. Result-window selections live inside TextLens's own webview and have
     /// no host highlight to clear.
     fn schedule_selection_host_clear(&self, app: &AppHandle, selection: &CurrentSelection) {
-        if selection.source_result_session_id.is_some() {
+        // A Windows UIA provider can block after the last cancellation check
+        // and later collapse a new, identical selection. Until the host range
+        // can be identified and cleared through an isolated, cancellable
+        // provider, leave the host highlight alone.
+        if !host_clear_permitted_for_selection(
+            selection,
+            self.pending_host_clear_token.load(Ordering::Acquire),
+            cfg!(target_os = "windows"),
+        ) {
             return;
         }
         if let Some(clear) = host_selection_clear_args(
             &selection.payload.text,
             Some(selection.payload.source_app.bundle_id.as_str()),
         ) {
-            self.schedule_host_selection_clear(app.clone(), clear);
+            self.schedule_host_selection_clear(app.clone(), clear, selection.host_clear_generation);
         }
     }
 
     /// Schedule a best-effort host highlight collapse after
-    /// [`HOST_SELECTION_CLEAR_DELAY_MS`]. Replaces any previous pending clear.
-    /// Cancelled when a new selection is accepted for toolbar presentation.
-    /// When the clear fires, matching same-text suppress is released so an
-    /// intentional re-drag of the same phrase can show the toolbar (~200ms after
-    /// result close instead of waiting the full 2s echo window).
-    fn schedule_host_selection_clear(&self, app: AppHandle, clear: HostSelectionClear) {
-        let previous = self.pending_host_clear_token.fetch_add(1, Ordering::AcqRel);
-        let token = next_host_clear_token(previous);
+    /// [`HOST_SELECTION_CLEAR_DELAY_MS`], only while the selection's original
+    /// lease remains current. In particular, closing an old result must not
+    /// mint a new lease that supersedes a more recent selection.
+    fn schedule_host_selection_clear(&self, app: AppHandle, clear: HostSelectionClear, token: u64) {
+        if !should_fire_pending_host_clear(
+            token,
+            self.pending_host_clear_token.load(Ordering::Acquire),
+        ) {
+            return;
+        }
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_millis(HOST_SELECTION_CLEAR_DELAY_MS)).await;
             let state = app.state::<RuntimeState>();
@@ -756,11 +819,16 @@ impl RuntimeState {
             let spawned = thread::Builder::new()
                 .name("textlens-host-selection-clear".to_owned())
                 .spawn(move || {
-                    let _ = SelectionMonitor::clear_matching_text(
-                        clear_bundle_id.as_deref(),
-                        &clear_text,
-                    );
                     let state = clear_app.state::<RuntimeState>();
+                    if should_fire_pending_host_clear(
+                        token,
+                        state.pending_host_clear_token.load(Ordering::Acquire),
+                    ) {
+                        let _ = SelectionMonitor::clear_matching_text(
+                            clear_bundle_id.as_deref(),
+                            &clear_text,
+                        );
+                    }
                     state.host_clear_in_flight.store(false, Ordering::Release);
                 });
             if spawned.is_err() {
@@ -803,17 +871,18 @@ impl RuntimeState {
                 }
                 let selection_id = {
                     let mut current = self.current_selection.lock();
-                    if current.as_ref().is_some_and(|selection| {
-                        dismiss_precedes_selection(
-                            selection.payload.sequence,
-                            selection.payload.timestamp_ms,
-                            dismiss.sequence,
-                            dismiss.timestamp_ms,
-                        )
-                    }) {
+                    let dismissal = take_selection_for_dismiss(&mut current, &dismiss);
+                    if dismissal == SelectionDismissal::Stale {
                         return;
                     }
-                    current.take().map(|selection| selection.id)
+                    // A fresh external gesture can start a new host selection
+                    // before its eventual mouse-up capture reaches us.
+                    self.cancel_pending_host_selection_clear();
+                    match dismissal {
+                        SelectionDismissal::Selection(id) => Some(id),
+                        SelectionDismissal::NoSelection => None,
+                        SelectionDismissal::Stale => unreachable!("stale dismiss returned above"),
+                    }
                 };
 
                 // Hiding the toolbar is enough to stop a repeat presentation: the
@@ -823,24 +892,17 @@ impl RuntimeState {
                 // Hide off the selection event thread. The native callback still
                 // checks the expected id, so a newer selection cannot be hidden
                 // by this older dismiss request.
-                let scoped_hide_requested = selection_id.is_some();
-                if let Some(ref id) = selection_id {
-                    self.windows.hide_toolbar_if_selection_async(app, id);
-                } else {
-                    self.windows.hide_toolbar_async(app);
+                if let Some(id) = selection_id {
+                    self.windows.hide_toolbar_if_selection_async(app, &id);
+                    let _ = app.emit_to(
+                        TOOLBAR_LABEL,
+                        TOOLBAR_DISMISSED_EVENT,
+                        ToolbarDismissedPayload {
+                            selection_id: id,
+                            reason: dismiss.reason.clone(),
+                        },
+                    );
                 }
-                let plan = dismiss_hide_plan(selection_id.clone(), scoped_hide_requested);
-
-                // 3) Notify the toolbar renderer even when no selection was held, so
-                // copy-success / React selection state cannot outlive the native window.
-                let _ = app.emit_to(
-                    TOOLBAR_LABEL,
-                    TOOLBAR_DISMISSED_EVENT,
-                    ToolbarDismissedPayload {
-                        selection_id: plan.cleared_selection_id,
-                        reason: dismiss.reason.clone(),
-                    },
-                );
             }
         }
     }
@@ -944,7 +1006,7 @@ impl RuntimeState {
         // the repeat check above, and do not collapse the host highlight that the
         // user is actively dragging / has just captured.
         self.record_presented_selection(&selection);
-        self.cancel_pending_host_selection_clear();
+        let host_clear_generation = self.cancel_pending_host_selection_clear();
         let runtime_started = Instant::now();
 
         let (anchor, placement) = selection_toolbar_anchor(&selection);
@@ -952,6 +1014,7 @@ impl RuntimeState {
             id: Uuid::new_v4().to_string(),
             payload: selection,
             source_result_session_id: None,
+            host_clear_generation,
         };
         let toolbar_selection_id = current.id.clone();
         let public = RendererSelectionPayload::new(&current.id, &current.payload);
@@ -1025,8 +1088,6 @@ impl RuntimeState {
             // Closing result windows can wait on the Windows UI thread. Give
             // the renderer one frame to issue its measured visible commit,
             // then close old unpinned results off the selection event path.
-            // Invalidate any older deferred host-clear task before scheduling.
-            self.cancel_pending_host_selection_clear();
             self.schedule_close_unpinned_results(app);
         }
     }
@@ -1691,19 +1752,10 @@ impl RuntimeState {
         );
         self.result_reveals.lock().remove(session_id);
         self.actions.clear_session(session_id);
-        // Closing a translate/explain/etc. window often coincides with an
-        // outside click. The presented-selection identity keeps that click from
-        // re-presenting the original text.
-        // Host highlight clear is deferred: a synchronous AX/UIA write on the
-        // same gesture races the next drag and can drop the capture.
         if let Some(meta) = self.result_sessions.lock().remove(session_id) {
-            let text = meta.selection.payload.text.clone();
-            if let Some(args) = host_selection_clear_args(
-                &text,
-                Some(meta.selection.payload.source_app.bundle_id.as_str()),
-            ) {
-                self.schedule_host_selection_clear(app.clone(), args);
-            }
+            // Preserve the original selection's lease. This must not create a
+            // fresh generation after a newer selection has been accepted.
+            self.schedule_selection_host_clear(app, &meta.selection);
         }
     }
 
@@ -1798,31 +1850,21 @@ impl RuntimeState {
             }
             WindowEvent::Destroyed => {
                 self.persist_result_size_now(app, label);
-                // Snapshot original selection text before session cleanup so we
-                // can drop a same-text live selection that a concurrent
-                // mouse-up may have just re-captured.
-                // Same-text suppress is armed once in `cleanup_result_session`
-                // (not here) so Destroyed + cleanup do not extend the 2s window.
-                let result_text = self
+                let result_selection_id = self
                     .result_sessions
                     .lock()
                     .get(&session_id)
-                    .map(|meta| meta.selection.payload.text.clone());
-                if let Some(ref text) = result_text {
-                    let mut current = self.current_selection.lock();
-                    if current
-                        .as_ref()
-                        .is_some_and(|selection| selection.payload.text == *text)
-                    {
-                        *current = None;
-                    }
-                }
-                if let Some(selection_id) = self.clear_current_selection_from_result(&session_id) {
+                    .map(|meta| meta.selection.id.clone());
+                // Only the result's original selection or a selection made
+                // inside that result belongs to it. Text equality cannot
+                // identify a selection: a new gesture may select the same word.
+                let selection_id = take_selection_for_closed_result(
+                    &mut self.current_selection.lock(),
+                    result_selection_id.as_deref(),
+                    &session_id,
+                );
+                if let Some(selection_id) = selection_id.or(result_selection_id) {
                     self.hide_toolbar_for_selection(app, &selection_id);
-                }
-                // If nothing else owns a live selection, force-hide any leftover toolbar.
-                if self.current_selection.lock().is_none() {
-                    self.windows.hide_toolbar(app);
                 }
                 self.windows.remove_result(label);
                 self.cleanup_result_session(app, &session_id);
@@ -3221,11 +3263,13 @@ pub fn show_result_selection(
             .as_millis()
             .min(u128::from(u64::MAX)) as u64,
         sequence: 0,
+        windows_selection_evidence: None,
     };
     let current = CurrentSelection {
         id: Uuid::new_v4().to_string(),
         payload: selection,
         source_result_session_id: Some(session_id.clone()),
+        host_clear_generation: state.cancel_pending_host_selection_clear(),
     };
     let public = RendererSelectionPayload::new(&current.id, &current.payload);
     let toolbar_anchor = WindowPoint {
@@ -3317,13 +3361,11 @@ pub fn hide_result_selection(
         return Ok(());
     };
     let _ = state.windows.hide_toolbar_if_selection(&app, &selection_id);
-    // Force-hide matches the native dismiss path when scoped hide is a no-op.
-    state.windows.hide_toolbar(&app);
     let _ = app.emit_to(
         TOOLBAR_LABEL,
         TOOLBAR_DISMISSED_EVENT,
         ToolbarDismissedPayload {
-            selection_id: Some(selection_id),
+            selection_id,
             reason: "resultClick".to_owned(),
         },
     );
@@ -3844,8 +3886,10 @@ mod tests {
                     trigger: SelectionTrigger::Manual,
                     timestamp_ms: 0,
                     sequence: 0,
+                    windows_selection_evidence: None,
                 },
                 source_result_session_id: Some("s".to_owned()),
+                host_clear_generation: 5,
             },
             action_id: "translate".to_owned(),
             pinned: false,
@@ -4435,23 +4479,31 @@ mod tests {
     }
 
     #[test]
-    fn dismiss_should_force_hide_when_selection_scoped_hide_returns_false() {
-        let plan = dismiss_hide_plan(Some("selection-1".to_owned()), false);
-        assert_eq!(plan.cleared_selection_id.as_deref(), Some("selection-1"));
-        assert!(plan.force_hide);
-    }
-
-    #[test]
-    fn dismiss_without_selection_still_force_hides() {
-        let plan = dismiss_hide_plan(None, false);
-        assert!(plan.cleared_selection_id.is_none());
-        assert!(plan.force_hide);
-    }
-
-    #[test]
-    fn dismiss_does_not_repeat_a_successful_scoped_hide() {
-        let plan = dismiss_hide_plan(Some("selection-1".to_owned()), true);
-        assert!(!plan.force_hide);
+    fn dismiss_requires_a_selection_owner_and_ignores_stale_events() {
+        let mut selection = result_meta().selection;
+        selection.payload.timestamp_ms = 100;
+        let mut current = Some(selection.clone());
+        let mut dismiss = DismissEvent {
+            reason: "mouseDown".to_owned(),
+            mouse: SelectionPoint { x: 0.0, y: 0.0 },
+            target_pid: 1,
+            timestamp_ms: 99,
+            sequence: 0,
+        };
+        assert_eq!(
+            take_selection_for_dismiss(&mut current, &dismiss),
+            SelectionDismissal::Stale
+        );
+        assert_eq!(current.as_ref().map(|value| &value.id), Some(&selection.id));
+        dismiss.timestamp_ms = 101;
+        assert_eq!(
+            take_selection_for_dismiss(&mut current, &dismiss),
+            SelectionDismissal::Selection(selection.id)
+        );
+        assert_eq!(
+            take_selection_for_dismiss(&mut current, &dismiss),
+            SelectionDismissal::NoSelection
+        );
     }
 
     fn fixture_bounds(x: f64, y: f64, width: f64, height: f64) -> Option<SelectionBounds> {
@@ -4528,6 +4580,7 @@ mod tests {
             trigger,
             timestamp_ms: 1,
             sequence: 1,
+            windows_selection_evidence: None,
         }
     }
 
@@ -4723,6 +4776,34 @@ mod tests {
     }
 
     #[test]
+    fn windows_repeat_double_click_requires_verified_selection_evidence() {
+        use crate::selection::WindowsSelectionEvidence;
+        let mut capture = fixture_capture(
+            "com.example.editor",
+            "hello",
+            fixture_bounds(0.0, 0.0, 100.0, 20.0),
+            SelectionTrigger::DoubleClick,
+            (10.0, 10.0),
+            (10.0, 10.0),
+        );
+        capture.method = SelectionMethod::Accessibility;
+        assert!(!verified_windows_double_click(&capture));
+        capture.windows_selection_evidence = Some(WindowsSelectionEvidence::UiaRangeAtPoint);
+        assert!(verified_windows_double_click(&capture));
+        capture.bounds = None;
+        capture.windows_selection_evidence = Some(WindowsSelectionEvidence::UiaRangeChanged);
+        assert!(verified_windows_double_click(&capture));
+        capture.method = SelectionMethod::Clipboard;
+        assert!(!verified_windows_double_click(&capture));
+        capture.method = SelectionMethod::Accessibility;
+        capture.text = "字".to_owned();
+        assert!(!verified_windows_double_click(&capture));
+        capture.text = "你好".to_owned();
+        capture.trigger = SelectionTrigger::Drag;
+        assert!(!verified_windows_double_click(&capture));
+    }
+
+    #[test]
     fn a_different_app_or_text_always_presents() {
         let presented = fixture_presented("com.example.editor", "hello", None);
         let other_text = fixture_capture(
@@ -4798,6 +4879,53 @@ mod tests {
         // Wrapping is supported so generation never panics at u64::MAX.
         assert_eq!(next_host_clear_token(u64::MAX), 0);
         assert!(!should_fire_pending_host_clear(u64::MAX, 0));
+    }
+
+    #[test]
+    fn old_results_cannot_issue_a_new_host_clear_lease() {
+        let mut selection = result_meta().selection;
+        selection.source_result_session_id = None;
+        assert!(host_clear_permitted_for_selection(&selection, 5, false));
+        // A newer user gesture invalidates the original lease. Closing its
+        // result later must not reinstate it, even for identical text.
+        assert!(!host_clear_permitted_for_selection(&selection, 6, false));
+        assert!(!host_clear_permitted_for_selection(&selection, 5, true));
+        selection.source_result_session_id = Some("result".to_owned());
+        assert!(!host_clear_permitted_for_selection(&selection, 5, false));
+    }
+
+    #[test]
+    fn closing_a_result_preserves_a_new_selection_with_identical_text() {
+        let original = result_meta().selection;
+        let mut fresh = original.clone();
+        fresh.id = "selection-2".to_owned();
+        fresh.source_result_session_id = None;
+        fresh.host_clear_generation += 1;
+        let mut current = Some(fresh.clone());
+        assert_eq!(
+            take_selection_for_closed_result(&mut current, Some(&original.id), "s"),
+            None
+        );
+        assert_eq!(
+            current.as_ref().map(|selection| &selection.id),
+            Some(&fresh.id)
+        );
+
+        let mut current = Some(original.clone());
+        assert_eq!(
+            take_selection_for_closed_result(&mut current, Some(&original.id), "s"),
+            Some(original.id.clone())
+        );
+        assert!(current.is_none());
+
+        let mut inside_result = fresh;
+        inside_result.source_result_session_id = Some("s".to_owned());
+        let mut current = Some(inside_result.clone());
+        assert_eq!(
+            take_selection_for_closed_result(&mut current, Some(&original.id), "s"),
+            Some(inside_result.id)
+        );
+        assert!(current.is_none());
     }
 
     #[test]

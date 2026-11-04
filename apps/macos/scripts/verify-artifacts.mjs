@@ -8,7 +8,7 @@ const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 const tauriConfig = JSON.parse(readFileSync(join(root, 'src-tauri/tauri.conf.json'), 'utf8'))
 const productName = tauriConfig.productName ?? packageJson.productName ?? 'TextLens'
 // TEXTLENS_INSTALLER_VERSION 由 apply-installer-version.mjs 的工作流设置，
-// 用于核对多段安装版本号（如 0.4.1.1）；package.json 始终核对 Tauri 基础版本。
+// 用于核对多段安装版本号（如 0.4.2.1）；package.json 始终核对 Tauri 基础版本。
 const baseVersion = tauriConfig.version ?? packageJson.version
 const expectedVersion = process.env.TEXTLENS_INSTALLER_VERSION?.trim() || baseVersion
 const expectedIdentifier = tauriConfig.identifier

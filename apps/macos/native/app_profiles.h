@@ -98,6 +98,12 @@ inline const AppProfileRule kAppProfileRules[] = {
     {MatchKind::BundlePrefix, "com.bitwarden.desktop", {false, false, ClipboardPolicy::Denied}},
     {MatchKind::BundlePrefix, "com.apple.finder", {false, false, ClipboardPolicy::Denied}},
 
+    // PixPin owns a transient screenshot-selection overlay. A synthetic
+    // Cmd+C after its mouse-up can cancel that overlay instead of producing
+    // text, so never use the clipboard fallback there.
+    {MatchKind::BundleExact, "com.depthpicture.pixpin", {false, false, ClipboardPolicy::Denied}},
+    {MatchKind::NameEquals, "pixpin", {false, false, ClipboardPolicy::Denied}},
+
     // Smart-Cmd+C terminals.
     {MatchKind::BundlePrefix, "com.apple.terminal", {false, false, ClipboardPolicy::KeyboardOnly}},
     {MatchKind::BundlePrefix, "com.googlecode.iterm2", {false, false, ClipboardPolicy::KeyboardOnly}},

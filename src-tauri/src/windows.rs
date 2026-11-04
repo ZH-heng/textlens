@@ -831,17 +831,6 @@ impl WindowCoordinator {
             });
     }
 
-    /// Fallback hide for a dismiss event that has no logical selection owner.
-    /// This is also kept off the selection event thread for the same reason as
-    /// the selection-scoped variant above.
-    pub fn hide_toolbar_async(&self, app: &AppHandle) {
-        let coordinator = self.clone();
-        let app = app.clone();
-        let _ = std::thread::Builder::new()
-            .name("textlens-toolbar-hide".to_owned())
-            .spawn(move || coordinator.hide_toolbar(&app));
-    }
-
     pub fn hide_toolbar_if_selection(&self, app: &AppHandle, selection_id: &str) -> bool {
         let Some(window) = app.get_webview_window(TOOLBAR_LABEL) else {
             return false;

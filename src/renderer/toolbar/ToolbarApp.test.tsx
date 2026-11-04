@@ -157,6 +157,139 @@ describe('ToolbarApp', () => {
     expect(unsubscribeDismiss).toHaveBeenCalledOnce()
   })
 
+  it('ignores stale and ownerless dismiss events without changing the newer selection or copy state', async () => {
+    let selectionListener: ((payload: SelectionPayload) => void) | undefined
+    let dismissListener: ((payload: { selectionId?: string; reason: string }) => void) | undefined
+    const runAction = vi.fn().mockResolvedValue({ accepted: true })
+    const api = {
+      getSettings: vi.fn().mockResolvedValue(DEFAULT_PUBLIC_SETTINGS),
+      getCurrentSelection: vi.fn().mockResolvedValue(selection),
+      runAction,
+      hideToolbar: vi.fn().mockResolvedValue(undefined),
+      reportToolbarSize: vi.fn().mockResolvedValue(undefined),
+      presentToolbar: vi.fn().mockResolvedValue(true),
+      onSelection: vi.fn((listener: (payload: SelectionPayload) => void) => {
+        selectionListener = listener
+        return () => undefined
+      }),
+      onSettingsChanged: vi.fn().mockReturnValue(() => undefined),
+      onToolbarDismissed: vi.fn((listener: (payload: { selectionId?: string; reason: string }) => void) => {
+        dismissListener = listener
+        return () => undefined
+      })
+    } as unknown as WindowTextLensApi
+    Object.defineProperty(window, 'textLens', { configurable: true, value: api })
+    render(<ToolbarApp />)
+    const copy = await screen.findByRole('button', { name: '复制' })
+    await waitFor(() => expect(api.getCurrentSelection).toHaveBeenCalled())
+
+    // These callbacks can arrive before React commits the new selection.
+    act(() => {
+      selectionListener?.({ ...selection, selectionId: 'selection-2', text: '新选区' })
+      dismissListener?.({ selectionId: 'selection-1', reason: 'mouseDown' })
+      dismissListener?.({ reason: 'mouseDown' })
+    })
+    fireEvent.click(copy)
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith('copy', undefined, 'selection-2'))
+    await waitFor(() => expect(copy.querySelector('.toolbar-copy-success')).not.toBeNull())
+    copy.focus()
+    fireEvent.pointerMove(copy)
+    expect(copy).toHaveFocus()
+    expect(copy).toHaveAttribute('data-hovered', 'true')
+
+    act(() => {
+      dismissListener?.({ selectionId: 'selection-1', reason: 'mouseDown' })
+      dismissListener?.({ reason: 'mouseDown' })
+    })
+    expect(copy.querySelector('.toolbar-copy-success')).not.toBeNull()
+    expect(copy).toHaveFocus()
+    expect(copy).toHaveAttribute('data-hovered', 'true')
+    expect(screen.getByRole('toolbar')).toHaveAccessibleName('处理来自 TextEdit 的选中文本')
+
+    act(() => dismissListener?.({ selectionId: 'selection-2', reason: 'mouseDown' }))
+    expect(copy.querySelector('.toolbar-copy-success')).toBeNull()
+    expect(screen.getByRole('toolbar')).toHaveAccessibleName('划词动作')
+  })
+
+  it('preserves a newer busy action and message on stale dismiss, and cancels the matching action', async () => {
+    let selectionListener: ((payload: SelectionPayload) => void) | undefined
+    let dismissListener: ((payload: { selectionId?: string; reason: string }) => void) | undefined
+    const pending = deferred<{ accepted: true }>()
+    const runAction = vi.fn()
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValueOnce({ accepted: false, message: '复制失败' })
+    const api = {
+      getSettings: vi.fn().mockResolvedValue(DEFAULT_PUBLIC_SETTINGS),
+      getCurrentSelection: vi.fn().mockResolvedValue(selection),
+      runAction,
+      hideToolbar: vi.fn().mockResolvedValue(undefined),
+      reportToolbarSize: vi.fn().mockResolvedValue(undefined),
+      presentToolbar: vi.fn().mockResolvedValue(true),
+      onSelection: vi.fn((listener: (payload: SelectionPayload) => void) => {
+        selectionListener = listener
+        return () => undefined
+      }),
+      onSettingsChanged: vi.fn().mockReturnValue(() => undefined),
+      onToolbarDismissed: vi.fn((listener: (payload: { selectionId?: string; reason: string }) => void) => {
+        dismissListener = listener
+        return () => undefined
+      })
+    } as unknown as WindowTextLensApi
+    Object.defineProperty(window, 'textLens', { configurable: true, value: api })
+    render(<ToolbarApp />)
+    const copy = await screen.findByRole('button', { name: '复制' })
+    act(() => selectionListener?.({ ...selection, selectionId: 'selection-2' }))
+    fireEvent.click(copy)
+    expect(copy).toBeDisabled()
+
+    act(() => {
+      dismissListener?.({ selectionId: 'selection-1', reason: 'mouseDown' })
+      dismissListener?.({ reason: 'mouseDown' })
+    })
+    expect(copy).toBeDisabled()
+
+    act(() => dismissListener?.({ selectionId: 'selection-2', reason: 'mouseDown' }))
+    expect(copy).not.toBeDisabled()
+    await act(async () => pending.resolve({ accepted: true }))
+    expect(copy.querySelector('.toolbar-copy-success')).toBeNull()
+
+    act(() => selectionListener?.({ ...selection, selectionId: 'selection-3' }))
+    fireEvent.click(copy)
+    expect(await screen.findByRole('alert')).toHaveTextContent('复制失败')
+    act(() => {
+      dismissListener?.({ selectionId: 'selection-2', reason: 'mouseDown' })
+      dismissListener?.({ reason: 'mouseDown' })
+    })
+    expect(screen.getByRole('alert')).toHaveTextContent('复制失败')
+    expect(screen.getByRole('toolbar')).toHaveAccessibleName('处理来自 TextEdit 的选中文本')
+  })
+
+  it('does not replay a selection dismissed while the initial selection request is pending', async () => {
+    let dismissListener: ((payload: { selectionId?: string; reason: string }) => void) | undefined
+    const initial = deferred<SelectionPayload | null>()
+    const presentToolbar = vi.fn().mockResolvedValue(true)
+    const api = {
+      getSettings: vi.fn().mockResolvedValue(DEFAULT_PUBLIC_SETTINGS),
+      getCurrentSelection: vi.fn().mockReturnValue(initial.promise),
+      hideToolbar: vi.fn().mockResolvedValue(undefined),
+      reportToolbarSize: vi.fn().mockResolvedValue(undefined),
+      presentToolbar,
+      onSelection: vi.fn().mockReturnValue(() => undefined),
+      onSettingsChanged: vi.fn().mockReturnValue(() => undefined),
+      onToolbarDismissed: vi.fn((listener: (payload: { selectionId?: string; reason: string }) => void) => {
+        dismissListener = listener
+        return () => undefined
+      })
+    } as unknown as WindowTextLensApi
+    Object.defineProperty(window, 'textLens', { configurable: true, value: api })
+    render(<ToolbarApp />)
+    await screen.findByRole('button', { name: '复制' })
+    act(() => dismissListener?.({ selectionId: 'selection-1', reason: 'mouseDown' }))
+    await act(async () => initial.resolve(selection))
+    expect(screen.getByRole('toolbar')).toHaveAccessibleName('划词动作')
+    expect(presentToolbar).not.toHaveBeenCalled()
+  })
+
   it('keeps the original copy icon and toolbar when copy is rejected', async () => {
     const hideToolbar = vi.fn().mockResolvedValue(undefined)
     const runAction = vi.fn().mockResolvedValue({

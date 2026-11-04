@@ -10,9 +10,11 @@
 use super::{
     automatic_selection_fingerprint, automatic_selection_pointer_matches_bounds,
     classify_windows_mouse_selection, direction_from_points, selection_bounds_are_reasonable,
-    union_selection_bounds, windows_text_budget, DismissEvent, SelectionBounds, SelectionDirection,
-    SelectionError, SelectionEvent, SelectionMethod, SelectionMouse, SelectionPayload,
-    SelectionPoint, SelectionTrigger, SourceApplication,
+    union_selection_bounds, windows_click_pair_matches, windows_double_click_matches_text_range,
+    windows_text_budget, DismissEvent, SelectionBounds, SelectionDirection, SelectionError,
+    SelectionEvent, SelectionMethod, SelectionMouse, SelectionPayload, SelectionPoint,
+    SelectionTrigger, SourceApplication, WindowsSelectionEvidence,
+    WindowsSelectionObservationContext, WINDOWS_CLICK_DRIFT_DISTANCE_SQUARED,
 };
 use crate::{
     clipboard,
@@ -71,28 +73,32 @@ use windows::{
                 IUIAutomation, IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern,
                 IUIAutomationTextPattern, IUIAutomationTextRange, SetWinEventHook,
                 TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
-                UIA_DocumentControlTypeId, UIA_LegacyIAccessiblePatternId,
-                UIA_SelectionActiveEndAttributeId, UIA_TextPatternId, UnhookWinEvent,
+                UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_DocumentControlTypeId,
+                UIA_EditControlTypeId, UIA_LegacyIAccessiblePatternId, UIA_ListItemControlTypeId,
+                UIA_MenuItemControlTypeId, UIA_RadioButtonControlTypeId,
+                UIA_SelectionActiveEndAttributeId, UIA_TabItemControlTypeId, UIA_TextPatternId,
+                UIA_TreeItemControlTypeId, UnhookWinEvent,
             },
             Input::KeyboardAndMouse::{
-                GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-                KEYEVENTF_KEYUP, VK_A, VK_C, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LCONTROL,
-                VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RCONTROL,
-                VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_UP, VK_V, VK_X,
+                GetAsyncKeyState, GetDoubleClickTime, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD,
+                KEYBDINPUT, KEYEVENTF_KEYUP, VK_A, VK_C, VK_CONTROL, VK_DOWN, VK_END, VK_HOME,
+                VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR,
+                VK_RCONTROL, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_UP, VK_V, VK_X,
             },
             WindowsAndMessaging::{
                 CallNextHookEx, DispatchMessageW, GetAncestor, GetClassNameW, GetCursorPos,
-                GetForegroundWindow, GetGUIThreadInfo, GetParent, GetWindowLongPtrW, GetWindowRect,
-                GetWindowTextW, GetWindowThreadProcessId, IsZoomed, MsgWaitForMultipleObjectsEx,
-                PeekMessageW, PostThreadMessageW, SendMessageTimeoutW, SetWindowsHookExW,
-                TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, ES_PASSWORD,
-                EVENT_SYSTEM_FOREGROUND, GA_ROOT, GUITHREADINFO, GWL_STYLE, HC_ACTION,
-                KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT, MWMO_INPUTAVAILABLE,
-                OBJID_CLIENT, OBJID_NATIVEOM, OBJID_WINDOW, PM_REMOVE, QS_ALLINPUT,
-                SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, WH_KEYBOARD_LL, WH_MOUSE_LL,
-                WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_GETTEXT, WM_GETTEXTLENGTH,
-                WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEHWHEEL,
-                WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+                GetForegroundWindow, GetGUIThreadInfo, GetParent, GetSystemMetrics,
+                GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+                IsZoomed, MsgWaitForMultipleObjectsEx, PeekMessageW, PostThreadMessageW,
+                SendMessageTimeoutW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+                WindowFromPoint, ES_PASSWORD, EVENT_SYSTEM_FOREGROUND, GA_ROOT, GUITHREADINFO,
+                GWL_STYLE, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT,
+                MWMO_INPUTAVAILABLE, OBJID_CLIENT, OBJID_NATIVEOM, OBJID_WINDOW, PM_REMOVE,
+                QS_ALLINPUT, SMTO_ABORTIFHUNG, SMTO_ERRORONEXIT, SM_CXDOUBLECLK, SM_CYDOUBLECLK,
+                WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+                WM_GETTEXT, WM_GETTEXTLENGTH, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+                WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
+                WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
             },
         },
     },
@@ -174,8 +180,6 @@ const EM_GETPASSWORDCHAR_MESSAGE: u32 = 0x00D2;
 const PDF_ACCESSIBILITY_PROBE_BUDGET: Duration = Duration::from_millis(36);
 const OFFICE_ACCESSIBILITY_PROBE_BUDGET: Duration = Duration::from_millis(56);
 const MODIFIER_RELEASE_ATTEMPTS: usize = 12;
-const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
-const DOUBLE_CLICK_DISTANCE_SQUARED: f64 = 16.0;
 const MAX_DRAG_DURATION: Duration = Duration::from_secs(15);
 // Longer / slower drags need the host to finish committing the selection
 // *before* any capture attempt.
@@ -274,7 +278,7 @@ const CAPTURE_EXECUTOR_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const HELPER_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 const HELPER_FRAME_LIMIT: usize = 16 * 1024 * 1024;
 const SELECTION_HELPER_FLAG: &str = "--textlens-selection-helper";
-const SELECTION_HELPER_PROTOCOL_VERSION: u32 = 2;
+const SELECTION_HELPER_PROTOCOL_VERSION: u32 = 3;
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 const MAX_UIA_ANCESTORS: usize = 32;
 const MAX_UIA_RUNTIME_ID_VALUES: usize = 128;
@@ -461,6 +465,7 @@ enum RawInput {
         sequence: u64,
         message: u32,
         point: RawPoint,
+        event_time: u32,
         generation: u64,
         modifiers: ModifierSnapshot,
         timestamp_ms: u64,
@@ -505,6 +510,12 @@ impl RawPoint {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct CaptureRequest {
+    /// First-click snapshots never emit a selection or inject a copy chord.
+    #[serde(default)]
+    observation_only: bool,
+    /// Exact first-click identity, independent of later focus/scroll epochs.
+    #[serde(default)]
+    observation_generation: Option<u64>,
     trigger: SelectionTrigger,
     start: Option<RawPoint>,
     end: Option<RawPoint>,
@@ -527,6 +538,12 @@ struct CaptureRequest {
     /// never race a capture already tied to a user gesture.
     #[serde(default)]
     capture_strategy: SelectionCaptureStrategy,
+}
+
+impl CaptureRequest {
+    fn may_inject_copy(&self) -> bool {
+        !self.observation_only && self.trigger != SelectionTrigger::DoubleClick
+    }
 }
 
 struct CaptureJob {
@@ -927,7 +944,8 @@ fn capture_with_timeout_on_lane(
                 if let Some(capture_executor) = executor.take() {
                     capture_executor.shutdown(Duration::ZERO);
                 }
-            } else if request.capture_strategy == SelectionCaptureStrategy::Clipboard
+            } else if request.may_inject_copy()
+                && request.capture_strategy == SelectionCaptureStrategy::Clipboard
                 && matches!(&result, Ok(None))
                 && !cancelled.load(Ordering::Acquire)
                 && !user_keyboard.load(Ordering::Acquire)
@@ -1088,7 +1106,9 @@ fn selection_worker_main(
         mouse_down_at: None,
         mouse_down_on_self: false,
         mouse_down_target_root: 0,
+        mouse_down_target_window: 0,
         mouse_down_shift: false,
+        mouse_down_unmodified: false,
         mouse_down_clipboard_sequence: None,
         last_mouse_up: None,
         last_click: None,
@@ -1130,13 +1150,15 @@ struct SelectionWorker {
     hook_exit_check_due: Option<(u64, Instant)>,
     hook_health_due: Option<Instant>,
     mouse_down: Option<RawPoint>,
-    mouse_down_at: Option<Instant>,
+    mouse_down_at: Option<u32>,
     mouse_down_on_self: bool,
     mouse_down_target_root: isize,
+    mouse_down_target_window: isize,
     mouse_down_shift: bool,
+    mouse_down_unmodified: bool,
     mouse_down_clipboard_sequence: Option<u32>,
     last_mouse_up: Option<RawPoint>,
-    last_click: Option<(Instant, RawPoint)>,
+    last_click: Option<(u32, RawPoint, isize, u64)>,
     keyboard_selection_key: Option<u32>,
     pending_capture: Option<PendingCapture>,
     last_automatic_fingerprint: Option<(u64, u64, Instant)>,
@@ -1225,6 +1247,8 @@ impl SelectionWorker {
                 let source_process_id = window_process_id(foreground);
                 self.submit_capture(
                     CaptureRequest {
+                        observation_generation: None,
+                        observation_only: false,
                         trigger: SelectionTrigger::Manual,
                         start: None,
                         end: None,
@@ -1385,10 +1409,18 @@ impl SelectionWorker {
                 sequence: _,
                 message,
                 point,
+                event_time,
                 generation,
                 modifiers,
                 timestamp_ms,
-            } => self.handle_mouse(message, point, generation, modifiers, timestamp_ms),
+            } => self.handle_mouse(
+                message,
+                point,
+                event_time,
+                generation,
+                modifiers,
+                timestamp_ms,
+            ),
             RawInput::Keyboard {
                 sequence: _,
                 message,
@@ -1484,7 +1516,9 @@ impl SelectionWorker {
         self.mouse_down_at = None;
         self.mouse_down_on_self = false;
         self.mouse_down_target_root = 0;
+        self.mouse_down_target_window = 0;
         self.mouse_down_shift = false;
+        self.mouse_down_unmodified = false;
         self.mouse_down_clipboard_sequence = None;
         self.last_mouse_up = None;
         self.last_click = None;
@@ -1539,10 +1573,12 @@ impl SelectionWorker {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_mouse(
         &mut self,
         message: u32,
         point: RawPoint,
+        event_time: u32,
         generation: u64,
         modifiers: ModifierSnapshot,
         timestamp_ms: u64,
@@ -1567,11 +1603,14 @@ impl SelectionWorker {
                     self.last_mouse_up = None;
                 }
                 self.mouse_down = Some(point);
-                self.mouse_down_at = Some(Instant::now());
+                self.mouse_down_at = Some(event_time);
                 self.mouse_down_on_self = target_is_self;
                 self.mouse_down_target_root = target_root.0 as isize;
+                self.mouse_down_target_window = target_window.0 as isize;
                 self.mouse_down_shift =
                     modifiers.shift && !modifiers.control && !modifiers.alt && !modifiers.windows;
+                self.mouse_down_unmodified =
+                    !modifiers.shift && !modifiers.control && !modifiers.alt && !modifiers.windows;
                 self.mouse_down_clipboard_sequence = Some(clipboard::windows_clipboard_sequence());
                 // Self clicks still produce Dismiss so runtime can preserve a
                 // click inside the no-activate toolbar while closing it for a
@@ -1581,29 +1620,51 @@ impl SelectionWorker {
             }
             WM_LBUTTONUP => {
                 let start = self.mouse_down.take().unwrap_or(point);
-                let now = Instant::now();
-                let press_duration = self
-                    .mouse_down_at
-                    .take()
-                    .map(|at| now.saturating_duration_since(at));
+                let pressed_at = self.mouse_down_at.take();
+                let press_duration = pressed_at.map(|at| event_time.wrapping_sub(at));
                 // A missing mouse-down (hook started mid-gesture) must not
                 // demote a real drag to a click; movement still gates the
                 // trigger in classify_windows_mouse_selection.
-                let drag_duration_valid =
-                    press_duration.is_none_or(|duration| duration <= MAX_DRAG_DURATION);
+                let drag_duration_valid = press_duration
+                    .is_none_or(|duration| u128::from(duration) <= MAX_DRAG_DURATION.as_millis());
+                let double_click_interval = unsafe { GetDoubleClickTime() };
                 let click_duration_valid =
-                    press_duration.is_some_and(|duration| duration <= DOUBLE_CLICK_INTERVAL);
+                    press_duration.is_some_and(|duration| duration <= double_click_interval);
                 let began_on_self = std::mem::take(&mut self.mouse_down_on_self);
                 let gesture_root = std::mem::take(&mut self.mouse_down_target_root);
+                let gesture_window = std::mem::take(&mut self.mouse_down_target_window);
+                let unmodified_start = std::mem::take(&mut self.mouse_down_unmodified);
                 let clipboard_sequence_at_start = self.mouse_down_clipboard_sequence.take();
                 let previous_mouse_up = self.last_mouse_up;
                 if began_on_self || target_is_self {
+                    self.last_click = None;
                     return;
                 }
-                let is_double_click = self.last_click.is_some_and(|(at, previous)| {
-                    now.saturating_duration_since(at) <= DOUBLE_CLICK_INTERVAL
-                        && previous.distance_squared(point) <= DOUBLE_CLICK_DISTANCE_SQUARED
-                });
+                let unmodified = unmodified_start
+                    && !modifiers.shift
+                    && !modifiers.control
+                    && !modifiers.alt
+                    && !modifiers.windows;
+                let previous_observation_generation = self.last_click.map(|click| click.3);
+                let is_double_click = unmodified
+                    && click_duration_valid
+                    && gesture_window != 0
+                    && gesture_window == target_window.0 as isize
+                    && self.last_click.zip(pressed_at).is_some_and(
+                        |((at, previous, window, _), current_time)| {
+                            windows_click_pair_matches(
+                                (at, raw_selection_point(previous), window),
+                                (current_time, raw_selection_point(start), gesture_window),
+                                double_click_interval,
+                                unsafe {
+                                    (
+                                        GetSystemMetrics(SM_CXDOUBLECLK),
+                                        GetSystemMetrics(SM_CYDOUBLECLK),
+                                    )
+                                },
+                            )
+                        },
+                    );
                 let start_point = raw_selection_point(start);
                 let end_point = raw_selection_point(point);
                 let trigger = classify_windows_mouse_selection(
@@ -1614,10 +1675,14 @@ impl SelectionWorker {
                     drag_duration_valid,
                 );
                 self.last_mouse_up = Some(point);
-                if click_duration_valid
-                    && start.distance_squared(point) < DOUBLE_CLICK_DISTANCE_SQUARED
+                if unmodified
+                    && click_duration_valid
+                    && start.distance_squared(point) <= WINDOWS_CLICK_DRIFT_DISTANCE_SQUARED
+                    && gesture_window != 0
+                    && gesture_window == target_window.0 as isize
+                    && !is_double_click
                 {
-                    self.last_click = Some((now, point));
+                    self.last_click = pressed_at.map(|at| (at, start, gesture_window, generation));
                 } else {
                     self.last_click = None;
                 }
@@ -1627,9 +1692,7 @@ impl SelectionWorker {
                         SelectionTrigger::ShiftClick => previous_mouse_up.unwrap_or(start),
                         _ => start,
                     };
-                    let press_duration_ms = press_duration
-                        .map(|duration| u32::try_from(duration.as_millis()).unwrap_or(u32::MAX))
-                        .unwrap_or(0);
+                    let press_duration_ms = press_duration.unwrap_or(0);
                     self.schedule_capture(
                         CaptureRequest {
                             trigger,
@@ -1640,7 +1703,27 @@ impl SelectionWorker {
                             clipboard_sequence_at_start,
                             press_duration_ms,
                             capture_strategy: SelectionCaptureStrategy::SelectionHook,
+                            observation_only: false,
+                            observation_generation: if is_double_click {
+                                previous_observation_generation
+                            } else {
+                                None
+                            },
                         },
+                        if gesture_root == 0 {
+                            target_root.0 as isize
+                        } else {
+                            gesture_root
+                        },
+                    );
+                } else if unmodified
+                    && click_duration_valid
+                    && gesture_window != 0
+                    && gesture_window == target_window.0 as isize
+                {
+                    self.schedule_selection_observation(
+                        point,
+                        generation,
                         if gesture_root == 0 {
                             target_root.0 as isize
                         } else {
@@ -1650,9 +1733,11 @@ impl SelectionWorker {
                 }
             }
             WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                self.last_click = None;
                 self.emit_dismiss("scroll", point, target_window, timestamp_ms);
             }
             WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+                self.last_click = None;
                 self.emit_dismiss("mouseDown", point, target_window, timestamp_ms);
             }
             _ => {}
@@ -1681,6 +1766,7 @@ impl SelectionWorker {
             self.cancel_active_capture_for_user_keyboard();
             self.pending_capture = None;
             self.recent_capture = None;
+            self.last_click = None;
         }
         let foreground = unsafe { GetForegroundWindow() };
         if window_process_id(foreground) == self.own_process_id {
@@ -1697,6 +1783,8 @@ impl SelectionWorker {
                 let point = current_cursor_position();
                 self.schedule_capture(
                     CaptureRequest {
+                        observation_generation: None,
+                        observation_only: false,
                         trigger: SelectionTrigger::Keyboard,
                         start: None,
                         end: None,
@@ -1744,6 +1832,29 @@ impl SelectionWorker {
 
     fn schedule_capture(&mut self, request: CaptureRequest, source_root_window: isize) {
         self.schedule_capture_with_options(request, source_root_window, 0, None);
+    }
+
+    fn schedule_selection_observation(
+        &mut self,
+        point: RawPoint,
+        generation: u64,
+        source_root_window: isize,
+    ) {
+        self.schedule_capture(
+            CaptureRequest {
+                observation_only: true,
+                observation_generation: Some(generation),
+                trigger: SelectionTrigger::DoubleClick,
+                start: Some(point),
+                end: Some(point),
+                current: point,
+                generation: Some(generation),
+                clipboard_sequence_at_start: None,
+                press_duration_ms: 0,
+                capture_strategy: SelectionCaptureStrategy::SelectionHook,
+            },
+            source_root_window,
+        );
     }
 
     fn schedule_capture_with_options(
@@ -2017,6 +2128,9 @@ impl SelectionWorker {
         source_root_window: isize,
         source_process_id: u32,
     ) -> bool {
+        if request.observation_only {
+            return false;
+        }
         // Every capture is non-destructive and generation-bound. A stale AX
         // result must never repaint the toolbar after a newer selection.
         let generation_mismatch = request
@@ -2025,6 +2139,18 @@ impl SelectionWorker {
         if generation_mismatch {
             trace_selection_capture(
                 "discarded-generation",
+                &request,
+                source_root_window,
+                source_process_id,
+            );
+            return false;
+        }
+        if request.trigger == SelectionTrigger::DoubleClick
+            && (!selection.has_verified_windows_double_click()
+                || selection.mouse.current != raw_selection_point(request.current))
+        {
+            trace_selection_capture(
+                "rejected-missing-selection-evidence",
                 &request,
                 source_root_window,
                 source_process_id,
@@ -2420,11 +2546,12 @@ impl SelectionHelperProcess {
         {
             return Ok(Ok(None));
         }
-        let mut helper_request = request;
-        helper_request.generation = None;
+        // Preserve the parent's gesture id for first/second-click correlation.
+        // Only the parent compares it to hook_generation(); the helper uses
+        // CaptureControl's request cancellation channel, never its own hooks.
         self.send(&HelperCommand::Capture {
             request_id,
-            request: helper_request,
+            request,
             source_window: source_window.0 as isize,
             source_process_id,
             textlens_process_id: own_process_id,
@@ -2911,6 +3038,15 @@ fn selection_helper_main() -> io::Result<()> {
                     match engine.capture(request, &control) {
                         Ok(Some(selection)) => {
                             let provider = engine.capture_provider(&control);
+                            if selection_trace_enabled() {
+                                trace_selection_line(format!(
+                                    "[selection-evidence] trigger={:?} method={:?} evidence={:?} has_bounds={}",
+                                    selection.trigger,
+                                    selection.method,
+                                    selection.windows_selection_evidence,
+                                    selection.bounds.is_some(),
+                                ));
+                            }
                             trace_selection_provider(
                                 "helper-provider",
                                 control.source_window,
@@ -2960,7 +3096,20 @@ struct CaptureEngine {
     // still publish one delayed, source-owned write after a successful restore.
     // The helper is long-lived, so this safely spans the next mouse gesture.
     clipboard_recovery: RefCell<Option<ClipboardRecovery>>,
+    observation: RefCell<Option<SelectionObservation>>,
     _apartment: ComApartment,
+}
+
+/// A short-lived baseline taken after the first click has reached the host.
+/// Only explicit ranges are retained; no names, values or document text.
+struct SelectionObservation {
+    source_window: isize,
+    source_process_id: u32,
+    generation: u64,
+    captured_at: Instant,
+    uia: Vec<(IUIAutomationElement, Vec<IUIAutomationTextRange>)>,
+    native: HashMap<isize, (u32, u32)>,
+    word: HashMap<isize, (i32, i32, i32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3017,9 +3166,41 @@ enum AccessibilityCapture {
 }
 
 enum TextPatternSearch {
-    Found(IUIAutomationTextPattern),
+    Found(Vec<(IUIAutomationTextPattern, IUIAutomationElement)>),
     Protected,
     NotFound,
+}
+
+/// Keep the existing preference for the highest document provider, or the
+/// first non-document provider if there is no document. Double-clicks may
+/// additionally try the remaining candidates if that preference is stale.
+fn order_text_pattern_candidates<T>(mut candidates: Vec<(T, bool)>, alternatives: bool) -> Vec<T> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let preferred = candidates
+        .iter()
+        .rposition(|(_, is_document)| *is_document)
+        .unwrap_or(0);
+    let (preferred, _) = candidates.remove(preferred);
+    let mut ordered = vec![preferred];
+    if alternatives {
+        ordered.extend(candidates.into_iter().map(|(candidate, _)| candidate));
+    }
+    ordered
+}
+
+fn first_double_click_candidate<T>(
+    candidates: impl IntoIterator<Item = T>,
+    mut capture: impl FnMut(T) -> AccessibilityCapture,
+) -> AccessibilityCapture {
+    for candidate in candidates {
+        match capture(candidate) {
+            AccessibilityCapture::NotFound => continue,
+            result => return result,
+        }
+    }
+    AccessibilityCapture::NotFound
 }
 
 impl CaptureEngine {
@@ -3035,7 +3216,179 @@ impl CaptureEngine {
             deadline: Cell::new(Instant::now() + CAPTURE_ENGINE_BUDGET),
             app_route_cache: RefCell::new(HashMap::new()),
             clipboard_recovery: RefCell::new(None),
+            observation: RefCell::new(None),
             _apartment: apartment,
+        })
+    }
+
+    fn observation_matches(
+        &self,
+        observation: &SelectionObservation,
+        request: CaptureRequest,
+        control: &CaptureControl,
+    ) -> bool {
+        request.trigger == SelectionTrigger::DoubleClick
+            && request.generation.is_some_and(|generation| {
+                WindowsSelectionObservationContext {
+                    source_root: observation.source_window,
+                    process_id: observation.source_process_id,
+                    generation: observation.generation,
+                }
+                .matches_double_click(
+                    WindowsSelectionObservationContext {
+                        source_root: root_window(control.source_window).0 as isize,
+                        process_id: control.source_process_id,
+                        generation,
+                    },
+                    request.observation_generation,
+                    observation.captured_at.elapsed(),
+                    Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }) + 100),
+                )
+            })
+            && root_window(unsafe { GetForegroundWindow() }) == root_window(control.source_window)
+            && !control.is_cancelled()
+    }
+
+    fn observe_selection(&self, request: CaptureRequest, control: &CaptureControl) {
+        // This path is intentionally separate from capture(): even a configured
+        // clipboard host receives no synthetic keys for a simple click.
+        self.deadline
+            .set(Instant::now() + Duration::from_millis(100));
+        *self.observation.borrow_mut() = Some(SelectionObservation {
+            source_window: root_window(control.source_window).0 as isize,
+            source_process_id: control.source_process_id,
+            generation: request.observation_generation.unwrap_or_default(),
+            captured_at: Instant::now(),
+            uia: Vec::new(),
+            native: HashMap::new(),
+            word: HashMap::new(),
+        });
+        let mut parents = None;
+        let mut source_app = None;
+        if process_image_path(control.source_process_id)
+            .is_some_and(|image| word_application_executable(&executable_name(&image)))
+        {
+            let application = source_application(control.source_process_id, control.source_window);
+            let _ = self.capture_word_com_selection(request, control, application);
+        }
+        if !control.is_cancelled() && Instant::now() < self.deadline.get() {
+            let _ =
+                self.capture_native_text_control(request, control, &mut parents, &mut source_app);
+        }
+        let target =
+            self.acquire_capture_target(request, control, &mut parents, &mut source_app, false);
+        if let CaptureTargetLookup::Found(target) = target {
+            if !self.target_is_non_text_action(&target, control) {
+                let walkers = [
+                    unsafe { self.automation.ControlViewWalker() }.ok(),
+                    unsafe { self.automation.RawViewWalker() }.ok(),
+                ];
+                let mut visited_runtime_ids = HashSet::new();
+                let mut visited_without_runtime_id = Vec::<IUIAutomationElement>::new();
+                for walker in walkers.into_iter().flatten() {
+                    let mut element = target.element.clone();
+                    for _ in 0..MAX_UIA_ANCESTORS {
+                        if control.is_cancelled() || Instant::now() >= self.deadline.get() {
+                            break;
+                        }
+                        if unsafe { element.CurrentIsPassword() }
+                            .ok()
+                            .is_some_and(|value| value.as_bool())
+                        {
+                            self.observation.borrow_mut().take();
+                            return;
+                        }
+                        let runtime_id = element_runtime_id(&element);
+                        let duplicate = runtime_id.as_ref().map_or_else(
+                            || {
+                                visited_without_runtime_id.iter().any(|previous| {
+                                    unsafe { self.automation.CompareElements(previous, &element) }
+                                        .ok()
+                                        .is_some_and(|same| same.as_bool())
+                                })
+                            },
+                            |runtime_id| !visited_runtime_ids.insert(runtime_id.clone()),
+                        );
+                        if !duplicate {
+                            if let Ok(pattern) = unsafe {
+                                element.GetCurrentPatternAs::<IUIAutomationTextPattern>(
+                                    UIA_TextPatternId,
+                                )
+                            } {
+                                if let Some(ranges) =
+                                    snapshot_uia_selection(&pattern, control, self.deadline.get())
+                                {
+                                    if let Some(observation) =
+                                        self.observation.borrow_mut().as_mut()
+                                    {
+                                        observation.uia.push((element.clone(), ranges));
+                                    }
+                                }
+                            }
+                            if runtime_id.is_none() {
+                                visited_without_runtime_id.push(element.clone());
+                            }
+                        }
+                        element = match unsafe { walker.GetParentElement(&element) } {
+                            Ok(parent) => parent,
+                            Err(_) => break,
+                        };
+                    }
+                }
+            }
+        }
+        if control.is_cancelled() {
+            self.observation.borrow_mut().take();
+        }
+        trace_selection_capture(
+            "selection-observed",
+            &request,
+            control.source_window.0 as isize,
+            control.source_process_id,
+        );
+    }
+
+    fn uia_selection_changed(
+        &self,
+        owner: &IUIAutomationElement,
+        range: &IUIAutomationTextRange,
+        request: CaptureRequest,
+        control: &CaptureControl,
+    ) -> bool {
+        let observation = self.observation.borrow();
+        let Some(observation) = observation
+            .as_ref()
+            .filter(|observation| self.observation_matches(observation, request, control))
+        else {
+            return false;
+        };
+        let Some((_, previous)) = observation.uia.iter().find(|(element, _)| {
+            unsafe { self.automation.CompareElements(element, owner) }
+                .ok()
+                .is_some_and(|same| same.as_bool())
+        }) else {
+            return false;
+        };
+        if previous.is_empty() {
+            return true;
+        }
+        // A failed cross-document endpoint comparison is unknown, not a change.
+        previous.iter().all(|old| {
+            let start = unsafe {
+                range.CompareEndpoints(
+                    TextPatternRangeEndpoint_Start,
+                    old,
+                    TextPatternRangeEndpoint_Start,
+                )
+            };
+            let end = unsafe {
+                range.CompareEndpoints(
+                    TextPatternRangeEndpoint_End,
+                    old,
+                    TextPatternRangeEndpoint_End,
+                )
+            };
+            matches!((start, end), (Ok(start), Ok(end)) if start != 0 || end != 0)
         })
     }
 
@@ -3052,6 +3405,24 @@ impl CaptureEngine {
         let executable_key = process_image_path(control.source_process_id)
             .map(|path| executable_name(&path))
             .filter(|name| !name.is_empty());
+        if request.trigger != SelectionTrigger::Manual
+            && executable_key
+                .as_deref()
+                .is_some_and(screenshot_application_executable)
+        {
+            trace_selection_capture(
+                "rejected-screenshot-host",
+                &request,
+                control.source_window.0 as isize,
+                control.source_process_id,
+            );
+            self.observation.borrow_mut().take();
+            return Ok(None);
+        }
+        if request.observation_only {
+            self.observe_selection(request, control);
+            return Ok(None);
+        }
         let word_host = executable_key
             .as_deref()
             .is_some_and(word_application_executable);
@@ -3059,6 +3430,30 @@ impl CaptureEngine {
             .as_deref()
             .is_some_and(pdf_accessibility_first_application);
         let mut source_app = None;
+        if request.trigger != SelectionTrigger::Manual {
+            let mut parents = None;
+            match self.acquire_capture_target(
+                request,
+                control,
+                &mut parents,
+                &mut source_app,
+                request.trigger == SelectionTrigger::Keyboard,
+            ) {
+                CaptureTargetLookup::Found(target)
+                    if self.target_is_non_text_action(&target, control) =>
+                {
+                    trace_selection_capture(
+                        "rejected-non-text-control",
+                        &request,
+                        control.source_window.0 as isize,
+                        control.source_process_id,
+                    );
+                    return Ok(None);
+                }
+                CaptureTargetLookup::Stop => return Ok(None),
+                _ => {}
+            }
+        }
 
         // Word exposes the authoritative live range through its native object
         // model. Query it before UIA so a document/title-like TextPattern can
@@ -3097,10 +3492,11 @@ impl CaptureEngine {
         // hook: query UI Automation and legacy accessibility only. Document
         // hosts get a short MSAA `accSelection` probe first because Office and
         // PDF surfaces often expose it before UIA publishes a text range.
-        let abbreviate_uia_retries = pdf_host
-            || executable_key
-                .as_deref()
-                .is_some_and(|key| self.should_abbreviate_uia_retries_for_key(key));
+        let abbreviate_uia_retries = request.trigger != SelectionTrigger::DoubleClick
+            && (pdf_host
+                || executable_key
+                    .as_deref()
+                    .is_some_and(|key| self.should_abbreviate_uia_retries_for_key(key)));
         let document_accessibility_probe = executable_key
             .as_deref()
             .and_then(document_accessibility_probe_budget);
@@ -3198,7 +3594,9 @@ impl CaptureEngine {
         // transaction has already restored the user's state and completed its
         // bounded retries. End it here so known-broken UIA/MSAA providers do
         // not occupy the isolated helper until the two-second engine timeout.
-        if request.capture_strategy == SelectionCaptureStrategy::Clipboard {
+        if request.trigger != SelectionTrigger::DoubleClick
+            && request.capture_strategy == SelectionCaptureStrategy::Clipboard
+        {
             let foreground = unsafe { GetForegroundWindow() };
             let process_id = if control.source_process_id != 0 {
                 control.source_process_id
@@ -3233,28 +3631,32 @@ impl CaptureEngine {
         // this read-only path before the broader accessibility walk so a
         // classic editor can respond on the first frame without any clipboard
         // mutation.
-        match self.capture_native_text_control(
-            request,
-            control,
-            &mut process_parents,
-            &mut source_app,
-        ) {
-            AccessibilityCapture::Selection(selection) => return Ok(Some(selection)),
-            AccessibilityCapture::Protected => return Ok(None),
-            AccessibilityCapture::NotFound => {}
-        }
-
-        if let Some(probe_budget) = document_accessibility_probe {
-            match self.capture_document_accessibility(
+        {
+            match self.capture_native_text_control(
                 request,
                 control,
                 &mut process_parents,
                 &mut source_app,
-                probe_budget,
             ) {
                 AccessibilityCapture::Selection(selection) => return Ok(Some(selection)),
                 AccessibilityCapture::Protected => return Ok(None),
                 AccessibilityCapture::NotFound => {}
+            }
+
+            if let Some(probe_budget) = document_accessibility_probe
+                .filter(|_| request.trigger != SelectionTrigger::DoubleClick)
+            {
+                match self.capture_document_accessibility(
+                    request,
+                    control,
+                    &mut process_parents,
+                    &mut source_app,
+                    probe_budget,
+                ) {
+                    AccessibilityCapture::Selection(selection) => return Ok(Some(selection)),
+                    AccessibilityCapture::Protected => return Ok(None),
+                    AccessibilityCapture::NotFound => {}
+                }
             }
         }
 
@@ -3308,6 +3710,14 @@ impl CaptureEngine {
                         CaptureTargetLookup::Retryable => continue,
                         CaptureTargetLookup::Stop => return Ok(None),
                     };
+                    if request.trigger != SelectionTrigger::Manual
+                        && self.target_is_non_text_action(&target, control)
+                    {
+                        // Explorer marks icons as selected objects. Their labels
+                        // are not text selections, even when an accessibility
+                        // provider exposes the label through a text pattern.
+                        return Ok(None);
+                    }
                     match self.capture_target_selection(&target, request, control)? {
                         AccessibilityCapture::Selection(selection) => return Ok(Some(selection)),
                         AccessibilityCapture::Protected => return Ok(None),
@@ -3353,7 +3763,10 @@ impl CaptureEngine {
             }
         }
 
-        if Instant::now() >= self.deadline.get() || control.is_cancelled() {
+        if request.trigger == SelectionTrigger::DoubleClick
+            || Instant::now() >= self.deadline.get()
+            || control.is_cancelled()
+        {
             return Ok(None);
         }
         // Legacy IAccessible is the final non-destructive accessibility
@@ -3569,7 +3982,66 @@ impl CaptureEngine {
         process_parents: &mut Option<Option<HashMap<u32, u32>>>,
         control: &CaptureControl,
     ) -> Result<Option<SelectionPayload>, SelectionError> {
+        if !request.may_inject_copy() {
+            trace_selection_capture(
+                "rejected-unverified-clipboard-double-click",
+                &request,
+                source_window.0 as isize,
+                process_id,
+            );
+            return Ok(None);
+        }
         let image_path = source_app.bundle_id.clone();
+        if request.trigger != SelectionTrigger::Manual
+            && !known_copy_compatibility_application(&image_path)
+        {
+            let mut application = None;
+            let target = self.acquire_capture_target(
+                request,
+                control,
+                process_parents,
+                &mut application,
+                request.trigger == SelectionTrigger::Keyboard,
+            );
+            let text_context = match target {
+                CaptureTargetLookup::Found(target)
+                    if !self.target_is_non_text_action(&target, control) =>
+                {
+                    let walker = unsafe { self.automation.ControlViewWalker() }.ok();
+                    let mut element = Some(target.element);
+                    let mut text_context = false;
+                    for _ in 0..MAX_UIA_ANCESTORS {
+                        if control.is_cancelled() || Instant::now() >= self.deadline.get() {
+                            break;
+                        }
+                        let Some(current) = element.take() else {
+                            break;
+                        };
+                        let kind = unsafe { current.CurrentControlType() }.ok();
+                        if kind == Some(UIA_EditControlTypeId)
+                            || kind == Some(UIA_DocumentControlTypeId)
+                        {
+                            text_context = true;
+                            break;
+                        }
+                        element = walker
+                            .as_ref()
+                            .and_then(|walker| unsafe { walker.GetParentElement(&current) }.ok());
+                    }
+                    text_context
+                }
+                _ => false,
+            };
+            if !text_context {
+                trace_selection_capture(
+                    "rejected-clipboard-unverified-text-context",
+                    &request,
+                    source_window.0 as isize,
+                    process_id,
+                );
+                return Ok(None);
+            }
+        }
         let clipboard_profile = clipboard_capture_profile(&image_path);
         let password_state = if clipboard_profile.uses_native_password_probe() {
             Some(focused_native_control_is_password(source_window))
@@ -3930,6 +4402,7 @@ impl CaptureEngine {
             trigger: request.trigger,
             timestamp_ms: timestamp_ms(),
             sequence: 0,
+            windows_selection_evidence: None,
         }))
     }
 
@@ -3945,6 +4418,13 @@ impl CaptureEngine {
         let source_root = root_window(control.source_window);
         let source_process_id = control.source_process_id;
         if source_root.0 == ptr::null_mut() || source_process_id == 0 {
+            return None;
+        }
+        if matches!(
+            request.trigger,
+            SelectionTrigger::DoubleClick | SelectionTrigger::Drag | SelectionTrigger::ShiftClick
+        ) && window_class_name(window_at_point(request.current)).as_deref() != Some("_WwG")
+        {
             return None;
         }
 
@@ -3988,6 +4468,51 @@ impl CaptureEngine {
             let Some(range) = com_property_dispatch(&selection, w!("Range")) else {
                 continue;
             };
+            let signature = com_property_i32(&range, w!("Start"))
+                .zip(com_property_i32(&range, w!("End")))
+                .zip(com_property_i32(&range, w!("StoryType")))
+                .map(|((start, end), story)| (start, end, story));
+            if request.observation_only {
+                if let (Some(observation), Some(signature)) =
+                    (self.observation.borrow_mut().as_mut(), signature)
+                {
+                    observation.word.insert(source_window.0 as isize, signature);
+                }
+                continue;
+            }
+            if signature.is_some_and(|(start, end, _)| {
+                end <= start || i64::from(end) - i64::from(start) > 1_000_000
+            }) || (request.trigger != SelectionTrigger::Manual && signature.is_none())
+            {
+                continue;
+            }
+            if request.trigger == SelectionTrigger::DoubleClick {
+                let changed = signature.is_some_and(|signature| {
+                    signature.1 > signature.0
+                        && self
+                            .observation
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|observation| {
+                                self.observation_matches(observation, request, control)
+                                    && observation
+                                        .word
+                                        .get(&(source_window.0 as isize))
+                                        .is_some_and(|old| {
+                                            old.2 == signature.2 && *old != signature
+                                        })
+                            })
+                });
+                if !changed || com_property_i32(&selection, w!("Type")) != Some(2) {
+                    trace_selection_capture(
+                        "rejected-word-range-unchanged-or-unobserved",
+                        &request,
+                        source_root.0 as isize,
+                        source_process_id,
+                    );
+                    continue;
+                }
+            }
             let Some(text) = com_property_text(&range, w!("Text")) else {
                 continue;
             };
@@ -4021,6 +4546,8 @@ impl CaptureEngine {
                 trigger: request.trigger,
                 timestamp_ms: timestamp_ms(),
                 sequence: 0,
+                windows_selection_evidence: (request.trigger == SelectionTrigger::DoubleClick)
+                    .then_some(WindowsSelectionEvidence::WordRangeChanged),
             });
         }
         None
@@ -4117,16 +4644,53 @@ impl CaptureEngine {
             if !native_text_control_matches_request(window, request) {
                 continue;
             }
+            let Some(offsets) = read_native_text_control_offsets(window) else {
+                continue;
+            };
+            if request.observation_only {
+                if let Some(observation) = self.observation.borrow_mut().as_mut() {
+                    observation.native.insert(window.0 as isize, offsets);
+                }
+                continue;
+            }
+            let changed = self
+                .observation
+                .borrow()
+                .as_ref()
+                .is_some_and(|observation| {
+                    self.observation_matches(observation, request, control)
+                        && observation
+                            .native
+                            .get(&(window.0 as isize))
+                            .is_some_and(|previous| *previous != offsets)
+                });
+            if request.trigger == SelectionTrigger::DoubleClick && !changed {
+                trace_selection_capture(
+                    "rejected-native-range-unchanged-or-unobserved",
+                    &request,
+                    identity_window.0 as isize,
+                    identity_process_id,
+                );
+                continue;
+            }
             let Some(text) = read_native_text_control_selection(window) else {
                 continue;
             };
-            let selection = accessibility_selection_payload(
+            // Selection may change while bounded cross-process reads run.
+            if read_native_text_control_offsets(window) != Some(offsets) {
+                continue;
+            }
+            let mut selection = accessibility_selection_payload(
                 text,
                 None,
                 application.clone(),
                 identity_window,
                 request,
             );
+            if request.trigger == SelectionTrigger::DoubleClick {
+                selection.windows_selection_evidence =
+                    Some(WindowsSelectionEvidence::NativeRangeChanged);
+            }
             self.record_provider(window, window_process_id);
             return AccessibilityCapture::Selection(selection);
         }
@@ -4333,6 +4897,17 @@ impl CaptureEngine {
         request: CaptureRequest,
         control: &CaptureControl,
     ) -> Result<AccessibilityCapture, SelectionError> {
+        if request.trigger != SelectionTrigger::Manual
+            && self.target_is_non_text_action(target, control)
+        {
+            trace_selection_capture(
+                "rejected-non-text-control",
+                &request,
+                target.source_window.0 as isize,
+                target.process_id,
+            );
+            return Ok(AccessibilityCapture::NotFound);
+        }
         match self.capture_accessibility(
             &target.element,
             target.source_window,
@@ -4359,6 +4934,48 @@ impl CaptureEngine {
             }
             other => Ok(other),
         }
+    }
+
+    fn target_is_non_text_action(&self, target: &CaptureTarget, control: &CaptureControl) -> bool {
+        let walkers = [
+            unsafe { self.automation.ControlViewWalker() }.ok(),
+            unsafe { self.automation.RawViewWalker() }.ok(),
+        ];
+        let mut found_item = false;
+        for walker in walkers.into_iter().flatten() {
+            let mut element = target.element.clone();
+            for _ in 0..MAX_UIA_ANCESTORS {
+                if Instant::now() >= self.deadline.get() || control.is_cancelled() {
+                    return true;
+                }
+                if let Ok(kind) = unsafe { element.CurrentControlType() } {
+                    if kind == UIA_EditControlTypeId || kind == UIA_DocumentControlTypeId {
+                        // Editors and document content may live in a list
+                        // item (file rename, chat message, HTML list). They
+                        // still need an explicit selected text range below.
+                        return false;
+                    }
+                    if kind == UIA_ButtonControlTypeId
+                        || kind == UIA_CheckBoxControlTypeId
+                        || kind == UIA_RadioButtonControlTypeId
+                        || kind == UIA_MenuItemControlTypeId
+                        || kind == UIA_TabItemControlTypeId
+                    {
+                        return true;
+                    }
+                    if kind == UIA_ListItemControlTypeId || kind == UIA_TreeItemControlTypeId {
+                        // Keep looking for a containing text document. Plain
+                        // shell/file items have no such text context.
+                        found_item = true;
+                    }
+                }
+                element = match unsafe { walker.GetParentElement(&element) } {
+                    Ok(parent) => parent,
+                    Err(_) => break,
+                };
+            }
+        }
+        found_item
     }
 
     /// Fast native accessibility fallback for known document/Office hosts.
@@ -4511,7 +5128,10 @@ impl CaptureEngine {
         // its immediate MSAA containers. Office and custom document surfaces
         // often expose the hit-tested text as a child while the live selected
         // range belongs to the parent canvas.
-        if let Some((text, bounds)) = accessible_selection_data_from_point_ancestors(&accessible) {
+        if let Some((text, bounds)) = accessible_selection_data_from_point_ancestors(
+            &accessible,
+            request.trigger == SelectionTrigger::Manual,
+        ) {
             let selection = accessibility_selection_payload(
                 text,
                 bounds,
@@ -4527,7 +5147,10 @@ impl CaptureEngine {
         // Some providers return the selected object as VT_UNKNOWN/VT_DISPATCH
         // in the child VARIANT and expose accValue only on that object.
         if let Some(child_accessible) = accessible_from_variant(&child.0) {
-            if let Some((text, bounds)) = accessible_selection_data(&child_accessible) {
+            if let Some((text, bounds)) = accessible_selection_data(
+                &child_accessible,
+                request.trigger == SelectionTrigger::Manual,
+            ) {
                 let selection = accessibility_selection_payload(
                     text,
                     bounds,
@@ -4541,7 +5164,10 @@ impl CaptureEngine {
             }
         }
 
-        // Last-resort point fallback for classic Office/custom controls. It
+        if request.trigger != SelectionTrigger::Manual {
+            return AccessibilityCapture::NotFound;
+        }
+        // Last-resort point fallback for explicit captures. It
         // is deliberately geometry-gated: without a child rectangle, a
         // window-level accName/accValue is too easy to mistake for selected
         // text. The normal UIA/MSAA selection paths always run first.
@@ -4587,7 +5213,9 @@ impl CaptureEngine {
             }
 
             let accessible = unsafe { IAccessible::from_raw(raw_accessible) };
-            let Some((text, bounds)) = accessible_selection_data(&accessible) else {
+            let Some((text, bounds)) =
+                accessible_selection_data(&accessible, request.trigger == SelectionTrigger::Manual)
+            else {
                 continue;
             };
             let selection = accessibility_selection_payload(
@@ -4613,23 +5241,42 @@ impl CaptureEngine {
         control: &CaptureControl,
         allow_document_range: bool,
     ) -> Result<AccessibilityCapture, SelectionError> {
-        let pattern = match self.find_text_pattern(focused, control, &source_app, source_window) {
-            TextPatternSearch::Found(pattern) => pattern,
-            TextPatternSearch::Protected => return Ok(AccessibilityCapture::Protected),
-            TextPatternSearch::NotFound => {
-                // A number of Win32, Java, and Office controls expose their
-                // current selection through the legacy accessibility pattern
-                // but do not implement UIA TextPattern. Keep this fallback
-                // bounded and only enter it after the fast TextPattern path.
-                return self.capture_legacy_or_document_range(
-                    focused,
-                    source_window,
-                    source_app,
-                    request,
-                    control,
-                    allow_document_range,
-                );
-            }
+        let patterns =
+            match self.find_text_pattern(focused, control, &source_app, source_window, request) {
+                TextPatternSearch::Found(patterns) => patterns,
+                TextPatternSearch::Protected => return Ok(AccessibilityCapture::Protected),
+                TextPatternSearch::NotFound => {
+                    // A number of Win32, Java, and Office controls expose their
+                    // current selection through the legacy accessibility pattern
+                    // but do not implement UIA TextPattern. Keep this fallback
+                    // bounded and only enter it after the fast TextPattern path.
+                    return self.capture_legacy_or_document_range(
+                        focused,
+                        source_window,
+                        source_app,
+                        request,
+                        control,
+                        allow_document_range,
+                    );
+                }
+            };
+        if request.trigger == SelectionTrigger::DoubleClick {
+            return Ok(first_double_click_candidate(
+                patterns,
+                |(pattern, owner)| {
+                    self.capture_double_click_text_range(
+                        &pattern,
+                        &owner,
+                        source_window,
+                        source_app.clone(),
+                        request,
+                        control,
+                    )
+                },
+            ));
+        }
+        let Some((pattern, _owner)) = patterns.into_iter().next() else {
+            return Ok(AccessibilityCapture::NotFound);
         };
         let ranges = match unsafe { pattern.GetSelection() } {
             Ok(ranges) => ranges,
@@ -4746,6 +5393,7 @@ impl CaptureEngine {
             trigger: request.trigger,
             timestamp_ms: timestamp_ms(),
             sequence: 0,
+            windows_selection_evidence: None,
         };
         // Word and some document providers expose the window/document title
         // through TextPattern.GetSelection even when a real range exists on a
@@ -4770,6 +5418,97 @@ impl CaptureEngine {
         Ok(AccessibilityCapture::Selection(selection))
     }
 
+    fn capture_double_click_text_range(
+        &self,
+        pattern: &IUIAutomationTextPattern,
+        owner: &IUIAutomationElement,
+        source_window: HWND,
+        source_app: SourceApplication,
+        request: CaptureRequest,
+        control: &CaptureControl,
+    ) -> AccessibilityCapture {
+        if Instant::now() >= self.deadline.get() || control.is_cancelled() {
+            return AccessibilityCapture::NotFound;
+        }
+        let Ok(ranges) = (unsafe { pattern.GetSelection() }) else {
+            return AccessibilityCapture::NotFound;
+        };
+        let count = unsafe { ranges.Length() }.unwrap_or(0);
+        if count <= 0 || count > MAX_UIA_SELECTION_RANGES {
+            return AccessibilityCapture::NotFound;
+        }
+        for index in 0..count {
+            if Instant::now() >= self.deadline.get() || control.is_cancelled() {
+                return AccessibilityCapture::NotFound;
+            }
+            let Ok(range) = (unsafe { ranges.GetElement(index) }) else {
+                continue;
+            };
+            let Some((remaining, limit)) = windows_text_budget(0, false) else {
+                return AccessibilityCapture::NotFound;
+            };
+            let Ok(text) = (unsafe { range.GetText(limit) }) else {
+                continue;
+            };
+            let text = normalize_captured_text(&text.to_string());
+            if text.chars().count() > remaining {
+                continue;
+            }
+            let rectangles = bounding_rectangle_values(&range)
+                .ok()
+                .map(|values| rectangles_from_values(&values))
+                .unwrap_or_default();
+            let at_point = windows_double_click_matches_text_range(
+                &text,
+                &rectangles,
+                raw_selection_point(request.current),
+            );
+            // A no-geometry provider is accepted only after the same provider
+            // changed its explicit selection since this gesture's first click.
+            // RangeFromPoint alone is deliberately insufficient: it snaps to
+            // the nearest text even when the pointer is on blank space.
+            let changed = rectangles.is_empty()
+                && self.uia_selection_changed(owner, &range, request, control);
+            if !at_point && !changed {
+                trace_selection_capture(
+                    if rectangles.is_empty() {
+                        "rejected-uia-range-unobserved-or-unchanged"
+                    } else {
+                        "rejected-pointer-outside-text"
+                    },
+                    &request,
+                    source_window.0 as isize,
+                    control.source_process_id,
+                );
+                continue;
+            }
+            let mut selection = accessibility_selection_payload(
+                text,
+                union_selection_bounds(&rectangles),
+                source_app.clone(),
+                source_window,
+                request,
+            );
+            selection.windows_selection_evidence = Some(if at_point {
+                WindowsSelectionEvidence::UiaRangeAtPoint
+            } else {
+                WindowsSelectionEvidence::UiaRangeChanged
+            });
+            (
+                selection.start_top,
+                selection.start_bottom,
+                selection.end_top,
+                selection.end_bottom,
+            ) = endpoint_points(&rectangles, selection.direction);
+            if selection.has_verified_windows_double_click()
+                && accessibility_selection_payload_is_plausible(&selection, source_window)
+            {
+                return AccessibilityCapture::Selection(selection);
+            }
+        }
+        AccessibilityCapture::NotFound
+    }
+
     /// Resolve explicit selection providers before consulting DocumentRange.
     /// A few PDF viewers expose a non-empty document range even while their
     /// selection provider is temporarily empty; treating that range as the
@@ -4784,6 +5523,9 @@ impl CaptureEngine {
         control: &CaptureControl,
         allow_document_range: bool,
     ) -> Result<AccessibilityCapture, SelectionError> {
+        if request.trigger == SelectionTrigger::DoubleClick {
+            return Ok(AccessibilityCapture::NotFound);
+        }
         let legacy = self.capture_legacy_accessibility(
             focused,
             source_window,
@@ -4805,7 +5547,12 @@ impl CaptureEngine {
         request: CaptureRequest,
         control: &CaptureControl,
     ) -> Result<AccessibilityCapture, SelectionError> {
-        if Instant::now() >= self.deadline.get() || control.is_cancelled() {
+        // DocumentRange represents a document, not an explicit selection.
+        // Its active-end attribute alone cannot authorize automatic capture.
+        if request.trigger != SelectionTrigger::Manual
+            || Instant::now() >= self.deadline.get()
+            || control.is_cancelled()
+        {
             return Ok(AccessibilityCapture::NotFound);
         }
         if unsafe { focused.CurrentIsPassword() }
@@ -4913,7 +5660,10 @@ impl CaptureEngine {
                     // element-array interpretation because it preserves the
                     // host's selected child/value semantics.
                     if let Ok(accessible) = unsafe { pattern.GetIAccessible() } {
-                        if let Some((text, bounds)) = accessible_selection_data(&accessible) {
+                        if let Some((text, bounds)) = accessible_selection_data(
+                            &accessible,
+                            request.trigger == SelectionTrigger::Manual,
+                        ) {
                             let selection = accessibility_selection_payload(
                                 text,
                                 bounds,
@@ -4928,6 +5678,13 @@ impl CaptureEngine {
                                 return AccessibilityCapture::Selection(selection);
                             }
                         }
+                    }
+                    if request.trigger != SelectionTrigger::Manual {
+                        element = match unsafe { walker.GetParentElement(&element) } {
+                            Ok(parent) => parent,
+                            Err(_) => break,
+                        };
+                        continue;
                     }
                     let Ok(selected) = (unsafe { pattern.GetCurrentSelection() }) else {
                         element = match unsafe { walker.GetParentElement(&element) } {
@@ -5030,6 +5787,7 @@ impl CaptureEngine {
                             trigger: request.trigger,
                             timestamp_ms: timestamp_ms(),
                             sequence: 0,
+                            windows_selection_evidence: None,
                         };
                         if legacy_accessibility_selection_is_plausible(&selection, source_window) {
                             return AccessibilityCapture::Selection(selection);
@@ -5051,6 +5809,7 @@ impl CaptureEngine {
         control: &CaptureControl,
         source_app: &SourceApplication,
         source_window: HWND,
+        request: CaptureRequest,
     ) -> TextPatternSearch {
         let walkers = [
             unsafe { self.automation.ControlViewWalker() }.ok(),
@@ -5058,8 +5817,7 @@ impl CaptureEngine {
         ];
         let mut visited_runtime_ids = HashSet::new();
         let mut visited_without_runtime_id = Vec::<IUIAutomationElement>::new();
-        let mut fallback_pattern = None;
-        let mut document_pattern = None;
+        let mut candidates = Vec::new();
         for walker in walkers.into_iter().flatten() {
             let mut element = focused.clone();
             for _ in 0..MAX_UIA_ANCESTORS {
@@ -5102,25 +5860,24 @@ impl CaptureEngine {
                         // still own the live range. Verify the pattern before
                         // stopping the ancestor walk so those hosts reach the
                         // actual selected-text provider.
-                        if text_pattern_has_nonempty_selection(
+                        let has_selection = text_pattern_has_nonempty_selection(
                             &pattern,
                             control,
                             self.deadline.get(),
-                        ) && !text_pattern_candidate_is_host_identity(
-                            &pattern,
-                            source_app,
-                            source_window,
-                            self.deadline.get(),
-                        ) {
+                        );
+                        if has_selection
+                            && !text_pattern_candidate_is_host_identity(
+                                &pattern,
+                                source_app,
+                                source_window,
+                                self.deadline.get(),
+                            )
+                        {
                             let is_document =
                                 unsafe { element.CurrentControlType() }.ok().is_some_and(
                                     |control_type| control_type == UIA_DocumentControlTypeId,
                                 );
-                            if is_document {
-                                document_pattern = Some(pattern);
-                            } else if fallback_pattern.is_none() {
-                                fallback_pattern = Some(pattern);
-                            }
+                            candidates.push(((pattern, element.clone()), is_document));
                         }
                     }
                     if runtime_id.is_none() {
@@ -5133,10 +5890,37 @@ impl CaptureEngine {
                 };
             }
         }
-        document_pattern
-            .or(fallback_pattern)
-            .map_or(TextPatternSearch::NotFound, TextPatternSearch::Found)
+        let candidates = order_text_pattern_candidates(
+            candidates,
+            request.trigger == SelectionTrigger::DoubleClick,
+        );
+        if candidates.is_empty() {
+            TextPatternSearch::NotFound
+        } else {
+            TextPatternSearch::Found(candidates)
+        }
     }
+}
+
+fn snapshot_uia_selection(
+    pattern: &IUIAutomationTextPattern,
+    control: &CaptureControl,
+    deadline: Instant,
+) -> Option<Vec<IUIAutomationTextRange>> {
+    let ranges = unsafe { pattern.GetSelection() }.ok()?;
+    let count = unsafe { ranges.Length() }.ok()?;
+    if !(0..=16).contains(&count) {
+        return None;
+    }
+    let mut snapshot = Vec::new();
+    for index in 0..count {
+        if control.is_cancelled() || Instant::now() >= deadline {
+            return None;
+        }
+        let range = unsafe { ranges.GetElement(index) }.ok()?;
+        snapshot.push(unsafe { range.Clone() }.ok()?);
+    }
+    (!control.is_cancelled() && Instant::now() < deadline).then_some(snapshot)
 }
 
 /// Verify that a TextPattern selection actually contains text before treating
@@ -5251,6 +6035,7 @@ fn accessibility_selection_payload(
         trigger: request.trigger,
         timestamp_ms: timestamp_ms(),
         sequence: 0,
+        windows_selection_evidence: None,
     }
 }
 
@@ -5525,19 +6310,24 @@ fn document_title_stem(value: &str) -> String {
 
 fn accessible_selection_data(
     accessible: &IAccessible,
+    allow_object_selection: bool,
 ) -> Option<(String, Option<SelectionBounds>)> {
     let selection = unsafe { accessible.accSelection().ok()? };
     let selection = OwnedVariant(selection);
+    if !allow_object_selection && variant_type(&selection.0) != VT_BSTR.0 {
+        return None;
+    }
     accessible_selection_variant_data(accessible, &selection.0)
 }
 
 fn accessible_selection_data_from_point_ancestors(
     accessible: &IAccessible,
+    allow_object_selection: bool,
 ) -> Option<(String, Option<SelectionBounds>)> {
     let mut current = Some(accessible.clone());
     for _ in 0..MAX_ACCESSIBLE_POINT_ANCESTORS {
         let candidate = current?;
-        if let Some(selection) = accessible_selection_data(&candidate) {
+        if let Some(selection) = accessible_selection_data(&candidate, allow_object_selection) {
             return Some(selection);
         }
         current = unsafe { candidate.accParent() }
@@ -5669,7 +6459,7 @@ fn accessible_selection_bstr_data(
     (!text.trim().is_empty()).then_some((text, None))
 }
 
-fn read_native_text_control_selection(window: HWND) -> Option<String> {
+fn read_native_text_control_offsets(window: HWND) -> Option<(u32, u32)> {
     if window.0 == ptr::null_mut() || window.is_invalid() {
         return None;
     }
@@ -5695,10 +6485,14 @@ fn read_native_text_control_selection(window: HWND) -> Option<String> {
             None,
         )
     };
-    if selection_read.0 == 0 || end <= start {
+    (selection_read.0 != 0).then_some((start, end))
+}
+
+fn read_native_text_control_selection(window: HWND) -> Option<String> {
+    let (start, end) = read_native_text_control_offsets(window)?;
+    if end <= start {
         return None;
     }
-
     let text_length = send_native_message(window, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0))?;
     let max_chars = windows_text_budget(0, false)?.0;
     if text_length == 0 || text_length > max_chars {
@@ -6640,10 +7434,11 @@ fn capture_settle_delay_for_distance(distance_squared: i64) -> Duration {
 /// Mouse-driven selections may finish committing after the first attempt
 /// (especially multi-paragraph PDF). Keyboard/manual keep single-shot.
 fn should_retry_empty_capture(request: &CaptureRequest) -> bool {
-    matches!(
-        request.trigger,
-        SelectionTrigger::Drag | SelectionTrigger::ShiftClick | SelectionTrigger::DoubleClick
-    )
+    !request.observation_only
+        && matches!(
+            request.trigger,
+            SelectionTrigger::Drag | SelectionTrigger::ShiftClick | SelectionTrigger::DoubleClick
+        )
 }
 
 fn request_vertical_distance(request: &CaptureRequest) -> Option<i64> {
@@ -6807,30 +7602,38 @@ fn focused_native_control_is_password(source_window: HWND) -> bool {
 }
 
 fn prohibited_clipboard_application(image_path: &str) -> bool {
+    screenshot_application_executable(&executable_name(image_path))
+        || matches!(
+            executable_name(image_path).as_str(),
+            "cmd.exe"
+                | "powershell.exe"
+                | "pwsh.exe"
+                | "wt.exe"
+                | "windowsterminal.exe"
+                | "openconsole.exe"
+                | "conhost.exe"
+                | "1password.exe"
+                | "bitwarden.exe"
+                | "keepass.exe"
+                | "keepassxc.exe"
+                | "dashlane.exe"
+                | "enpass.exe"
+                | "lastpass.exe"
+                | "protonpass.exe"
+                | "mstsc.exe"
+                | "teamviewer.exe"
+                | "anydesk.exe"
+                | "rustdesk.exe"
+                | "todesk.exe"
+                | "sunloginclient.exe"
+                | "parsecd.exe"
+        )
+}
+
+fn screenshot_application_executable(executable: &str) -> bool {
     matches!(
-        executable_name(image_path).as_str(),
-        "cmd.exe"
-            | "powershell.exe"
-            | "pwsh.exe"
-            | "wt.exe"
-            | "windowsterminal.exe"
-            | "openconsole.exe"
-            | "conhost.exe"
-            | "1password.exe"
-            | "bitwarden.exe"
-            | "keepass.exe"
-            | "keepassxc.exe"
-            | "dashlane.exe"
-            | "enpass.exe"
-            | "lastpass.exe"
-            | "protonpass.exe"
-            | "mstsc.exe"
-            | "teamviewer.exe"
-            | "anydesk.exe"
-            | "rustdesk.exe"
-            | "todesk.exe"
-            | "sunloginclient.exe"
-            | "parsecd.exe"
+        executable,
+        "pixpin.exe" | "snipaste.exe" | "snippingtool.exe" | "screenclippinghost.exe"
     )
 }
 
@@ -7379,8 +8182,8 @@ fn trace_selection_capture(
         return;
     }
     trace_selection_line(format!(
-        "[selection] stage={stage} trigger={:?} root={source_root_window:#x} pid={source_process_id} generation={:?}",
-        request.trigger, request.generation
+            "[selection] stage={stage} trigger={:?} observation={} root={source_root_window:#x} pid={source_process_id} generation={:?} first_click={:?}",
+        request.trigger, request.observation_only, request.generation, request.observation_generation
     ));
 }
 
@@ -7450,11 +8253,13 @@ fn selection_trace_directory() -> Option<std::path::PathBuf> {
 
 fn trace_selection_line(line: String) {
     eprintln!("{line}");
-    let Some(path) =
-        selection_trace_directory().map(|directory| directory.join("selection-diagnostic.log"))
-    else {
+    let Some(directory) = selection_trace_directory() else {
         return;
     };
+    if std::fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let path = directory.join("selection-diagnostic.log");
     let Ok(mut output) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -7669,6 +8474,28 @@ fn com_property_dispatch(object: &IDispatch, name: windows::core::PCWSTR) -> Opt
         .or_else(|| variant_unknown(&value).and_then(|unknown| unknown.cast().ok()));
     let _ = unsafe { VariantClear(&mut value) };
     dispatch
+}
+
+fn com_property_i32(object: &IDispatch, name: windows::core::PCWSTR) -> Option<i32> {
+    let mut dispid = 0;
+    let iid = GUID::zeroed();
+    unsafe { object.GetIDsOfNames(&iid, &name, 1, 0, &mut dispid) }.ok()?;
+    let mut value = OwnedVariant(VARIANT::default());
+    unsafe {
+        object.Invoke(
+            dispid,
+            &iid,
+            0,
+            DISPATCH_PROPERTYGET,
+            &DISPPARAMS::default(),
+            Some(&mut value.0),
+            None,
+            None,
+        )
+    }
+    .ok()?;
+    (variant_type(&value.0) == VT_I4.0)
+        .then(|| unsafe { value.0.Anonymous.Anonymous.Anonymous.lVal })
 }
 
 fn word_selection_dispatch(native_object: &IDispatch) -> Option<IDispatch> {
@@ -8445,6 +9272,7 @@ unsafe extern "system" fn mouse_hook_callback(
                         x: input.pt.x,
                         y: input.pt.y,
                     },
+                    event_time: input.time,
                     generation,
                     modifiers: current_modifiers(),
                     timestamp_ms: strict_parent_timestamp_ms(),
@@ -8536,6 +9364,60 @@ unsafe extern "system" fn foreground_event_callback(
 mod tests {
     use super::*;
 
+    #[test]
+    fn double_click_tries_other_patterns_after_preferred_document_misses() {
+        let candidates = vec![("child", false), ("document", true)];
+        let ordered = order_text_pattern_candidates(candidates.clone(), true);
+        assert_eq!(ordered, vec!["document", "child"]);
+        // Non-double-click captures keep the former single-provider priority.
+        assert_eq!(
+            order_text_pattern_candidates(candidates, false),
+            vec!["document"]
+        );
+
+        let mut attempted = Vec::new();
+        let result = first_double_click_candidate(ordered, |candidate| {
+            attempted.push(candidate);
+            if candidate == "child" {
+                AccessibilityCapture::Selection(test_selection(SelectionTrigger::DoubleClick))
+            } else {
+                AccessibilityCapture::NotFound
+            }
+        });
+        assert!(matches!(result, AccessibilityCapture::Selection(_)));
+        assert_eq!(attempted, vec!["document", "child"]);
+    }
+
+    #[test]
+    fn double_click_stops_on_protected_candidate() {
+        let mut attempted = Vec::new();
+        let result = first_double_click_candidate(["protected", "child"], |candidate| {
+            attempted.push(candidate);
+            AccessibilityCapture::Protected
+        });
+        assert!(matches!(result, AccessibilityCapture::Protected));
+        assert_eq!(attempted, vec!["protected"]);
+        assert!(matches!(
+            first_double_click_candidate(std::iter::empty::<()>(), |_| unreachable!()),
+            AccessibilityCapture::NotFound
+        ));
+    }
+
+    #[test]
+    fn text_pattern_preference_matches_previous_non_double_click_order() {
+        assert_eq!(
+            order_text_pattern_candidates(vec![("first", false), ("second", false)], false),
+            vec!["first"]
+        );
+        assert_eq!(
+            order_text_pattern_candidates(
+                vec![("child", false), ("inner", true), ("outer", true)],
+                true,
+            ),
+            vec!["outer", "child", "inner"]
+        );
+    }
+
     fn test_worker(event_sender: Sender<SelectionEvent>) -> SelectionWorker {
         let (inbox, _receiver) = mpsc::channel();
         SelectionWorker {
@@ -8553,7 +9435,9 @@ mod tests {
             mouse_down_at: None,
             mouse_down_on_self: false,
             mouse_down_target_root: 0,
+            mouse_down_target_window: 0,
             mouse_down_shift: false,
+            mouse_down_unmodified: false,
             mouse_down_clipboard_sequence: None,
             last_mouse_up: None,
             last_click: None,
@@ -8588,6 +9472,7 @@ mod tests {
             trigger,
             timestamp_ms: 1,
             sequence: 0,
+            windows_selection_evidence: None,
         }
     }
 
@@ -8654,6 +9539,7 @@ mod tests {
             trigger: SelectionTrigger::Drag,
             timestamp_ms: 0,
             sequence: 0,
+            windows_selection_evidence: None,
         };
         assert!(!accessibility_selection_payload_is_plausible(
             &acrobat_selection,
@@ -8705,6 +9591,8 @@ mod tests {
             expires_at: Instant::now() + FOREGROUND_SETTLE_TIMEOUT,
             scheduled_at: Instant::now(),
             request: CaptureRequest {
+                observation_generation: None,
+                observation_only: false,
                 trigger: SelectionTrigger::Drag,
                 start: Some(RawPoint { x: 10, y: 10 }),
                 end: Some(RawPoint { x: 80, y: 10 }),
@@ -8735,6 +9623,8 @@ mod tests {
             expires_at: Instant::now() + FOREGROUND_SETTLE_TIMEOUT,
             scheduled_at: Instant::now(),
             request: CaptureRequest {
+                observation_generation: None,
+                observation_only: false,
                 trigger: SelectionTrigger::Drag,
                 start: Some(RawPoint { x: 10, y: 10 }),
                 end: Some(RawPoint { x: 80, y: 10 }),
@@ -8764,6 +9654,8 @@ mod tests {
             expires_at: Instant::now() + FOREGROUND_SETTLE_TIMEOUT,
             scheduled_at: Instant::now(),
             request: CaptureRequest {
+                observation_generation: None,
+                observation_only: false,
                 trigger: SelectionTrigger::Drag,
                 start: Some(RawPoint { x: 10, y: 10 }),
                 end: Some(RawPoint { x: 80, y: 10 }),
@@ -8840,6 +9732,8 @@ mod tests {
         let mut worker = test_worker(event_sender);
         let generation = hook_generation().load(Ordering::Acquire);
         let request = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
             trigger: SelectionTrigger::Drag,
             start: Some(RawPoint { x: 10, y: 10 }),
             end: Some(RawPoint { x: 80, y: 10 }),
@@ -8869,6 +9763,8 @@ mod tests {
         let mut worker = test_worker(event_sender);
         let generation = hook_generation().load(Ordering::Acquire);
         let request = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
             trigger: SelectionTrigger::Drag,
             start: Some(RawPoint { x: 10, y: 10 }),
             end: Some(RawPoint { x: 80, y: 10 }),
@@ -8895,6 +9791,133 @@ mod tests {
         };
         assert_eq!(selection.text, "selected text");
         assert_eq!(selection.bounds, None);
+    }
+
+    #[test]
+    fn double_click_event_requires_verified_accessibility_text_selection() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut worker = test_worker(event_sender);
+        let request = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
+            trigger: SelectionTrigger::DoubleClick,
+            start: Some(RawPoint { x: 80, y: 10 }),
+            end: Some(RawPoint { x: 80, y: 10 }),
+            current: RawPoint { x: 80, y: 10 },
+            generation: Some(hook_generation().load(Ordering::Acquire)),
+            clipboard_sequence_at_start: None,
+            press_duration_ms: 0,
+            capture_strategy: SelectionCaptureStrategy::Clipboard,
+        };
+        let mut valid = test_selection(SelectionTrigger::DoubleClick);
+        valid.windows_selection_evidence = Some(WindowsSelectionEvidence::UiaRangeAtPoint);
+        valid.bounds = Some(SelectionBounds {
+            x: 70.0,
+            y: 0.0,
+            width: 30.0,
+            height: 20.0,
+        });
+        let mut missing_bounds = valid.clone();
+        missing_bounds.bounds = None;
+        let mut distant_bounds = valid.clone();
+        distant_bounds.bounds.as_mut().expect("bounds").x = 500.0;
+        let mut short_text = valid.clone();
+        short_text.text = "字".to_owned();
+        let mut copied = valid.clone();
+        copied.method = SelectionMethod::Clipboard;
+        let mut wrong_trigger = valid.clone();
+        wrong_trigger.trigger = SelectionTrigger::Drag;
+        let mut wrong_pointer = valid.clone();
+        wrong_pointer.mouse.current.x = 79.0;
+        for rejected in [
+            missing_bounds,
+            distant_bounds,
+            short_text,
+            copied,
+            wrong_trigger,
+            wrong_pointer,
+        ] {
+            assert!(!worker.deliver_captured_selection(request, rejected, 42, 200));
+        }
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert!(worker.deliver_captured_selection(request, valid, 42, 200));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(SelectionEvent::Selection(_))
+        ));
+    }
+
+    #[test]
+    fn changed_selection_without_geometry_can_emit_a_double_click_event() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut worker = test_worker(event_sender);
+        let request = CaptureRequest {
+            observation_generation: Some(7),
+            observation_only: false,
+            trigger: SelectionTrigger::DoubleClick,
+            start: Some(RawPoint { x: 80, y: 10 }),
+            end: Some(RawPoint { x: 80, y: 10 }),
+            current: RawPoint { x: 80, y: 10 },
+            generation: Some(hook_generation().load(Ordering::Acquire)),
+            clipboard_sequence_at_start: None,
+            press_duration_ms: 0,
+            capture_strategy: SelectionCaptureStrategy::Clipboard,
+        };
+        let mut selection = test_selection(SelectionTrigger::DoubleClick);
+        selection.bounds = None;
+        selection.windows_selection_evidence = Some(WindowsSelectionEvidence::UiaRangeChanged);
+        assert!(worker.deliver_captured_selection(request, selection, 42, 200));
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(SelectionEvent::Selection(SelectionPayload {
+                bounds: None,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn first_click_observation_never_emits_retries_or_injects_copy() {
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut worker = test_worker(event_sender);
+        for strategy in [
+            SelectionCaptureStrategy::SelectionHook,
+            SelectionCaptureStrategy::Auto,
+            SelectionCaptureStrategy::Clipboard,
+        ] {
+            let request = CaptureRequest {
+                observation_only: true,
+                observation_generation: Some(7),
+                trigger: SelectionTrigger::DoubleClick,
+                start: None,
+                end: None,
+                current: RawPoint { x: 80, y: 10 },
+                generation: Some(hook_generation().load(Ordering::Acquire)),
+                clipboard_sequence_at_start: None,
+                press_duration_ms: 0,
+                capture_strategy: strategy,
+            };
+            assert!(!request.may_inject_copy());
+            assert!(!should_retry_empty_capture(&request));
+            assert!(!worker.deliver_captured_selection(
+                request,
+                test_selection(SelectionTrigger::DoubleClick),
+                42,
+                200,
+            ));
+            assert!(!CaptureRequest {
+                observation_only: false,
+                ..request
+            }
+            .may_inject_copy());
+        }
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -9327,6 +10350,8 @@ mod tests {
     #[test]
     fn accessibility_point_probes_prioritize_mouse_up_without_duplicates() {
         let request = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
             trigger: SelectionTrigger::Drag,
             start: Some(RawPoint { x: 10, y: 20 }),
             end: Some(RawPoint { x: 80, y: 20 }),
@@ -9434,6 +10459,8 @@ mod tests {
         // Slow careful multi-line press lengthens settle after a meaningful
         // vertical movement; a slow same-line click remains on the fast path.
         let slow = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
             trigger: SelectionTrigger::Drag,
             start: Some(RawPoint { x: 10, y: 10 }),
             end: Some(RawPoint { x: 20, y: 50 }),
@@ -9450,6 +10477,8 @@ mod tests {
         // A tall drag keeps the quick UIA probe; geometry alone must not route
         // browsers, editors or Office through a slower fallback route.
         let long = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
             trigger: SelectionTrigger::Drag,
             start: Some(RawPoint { x: 10, y: 10 }),
             end: Some(RawPoint { x: 10, y: 200 }),
@@ -9472,6 +10501,8 @@ mod tests {
             CAPTURE_SETTLE_MEDIUM_DELAY
         );
         let long_same_line = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
             trigger: SelectionTrigger::Drag,
             start: Some(RawPoint { x: 10, y: 10 }),
             end: Some(RawPoint { x: 320, y: 10 }),
@@ -9491,6 +10522,8 @@ mod tests {
     #[test]
     fn mouse_driven_empty_captures_are_retried_and_scroll_preserves_pending() {
         let drag = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
             trigger: SelectionTrigger::Drag,
             start: Some(RawPoint { x: 10, y: 10 }),
             end: Some(RawPoint { x: 80, y: 40 }),
@@ -9503,6 +10536,8 @@ mod tests {
         assert!(should_retry_empty_capture(&drag));
         assert_eq!(max_empty_capture_retries(&drag), 1);
         let long = CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
             trigger: SelectionTrigger::Drag,
             start: Some(RawPoint { x: 10, y: 10 }),
             end: Some(RawPoint { x: 10, y: 220 }),
@@ -9534,6 +10569,8 @@ mod tests {
             CLIPBOARD_EMPTY_CAPTURE_RETRY_DELAY
         );
         assert!(should_retry_empty_capture(&CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
             trigger: SelectionTrigger::DoubleClick,
             start: Some(RawPoint { x: 10, y: 10 }),
             end: Some(RawPoint { x: 10, y: 10 }),
@@ -9544,6 +10581,8 @@ mod tests {
             capture_strategy: SelectionCaptureStrategy::SelectionHook,
         }));
         assert!(!should_retry_empty_capture(&CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
             trigger: SelectionTrigger::Keyboard,
             start: None,
             end: None,
@@ -9686,11 +10725,13 @@ mod tests {
         let command = HelperCommand::Capture {
             request_id: 7,
             request: CaptureRequest {
+                observation_generation: Some(17),
+                observation_only: true,
                 trigger: SelectionTrigger::Drag,
                 start: Some(RawPoint { x: -20, y: 30 }),
                 end: Some(RawPoint { x: 40, y: 50 }),
                 current: RawPoint { x: 40, y: 50 },
-                generation: None,
+                generation: Some(19),
                 clipboard_sequence_at_start: None,
                 press_duration_ms: 0,
                 capture_strategy: SelectionCaptureStrategy::SelectionHook,
@@ -9714,6 +10755,9 @@ mod tests {
             } => {
                 assert_eq!(request_id, 7);
                 assert_eq!(request.current, RawPoint { x: 40, y: 50 });
+                assert_eq!(request.generation, Some(19));
+                assert_eq!(request.observation_generation, Some(17));
+                assert!(request.observation_only);
                 assert_eq!(source_window, 123);
                 assert_eq!(source_process_id, 456);
                 assert_eq!(textlens_process_id, 789);

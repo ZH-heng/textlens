@@ -107,6 +107,11 @@ void ExpectAppProfiles() {
     const AppTraits finder = ResolveAppTraits("com.apple.finder", "Finder");
     assert(finder.clipboard == ClipboardPolicy::Denied);
 
+    assert(ResolveAppTraits("com.depthpicture.PixPin", "").clipboard == ClipboardPolicy::Denied);
+    assert(ResolveAppTraits("", "PixPin").clipboard == ClipboardPolicy::Denied);
+    assert(ResolveAppTraits("com.example.editor", "PixPin Notes").clipboard ==
+        ClipboardPolicy::Allowed);
+
     const AppTraits passwordManager = ResolveAppTraits("com.1password.1password", "");
     assert(passwordManager.clipboard == ClipboardPolicy::Denied);
 

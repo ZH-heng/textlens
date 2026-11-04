@@ -104,6 +104,9 @@ export function ToolbarApp(): JSX.Element {
   const copySuccessActiveRef = useRef(false)
   const [settings, setSettings] = useState<PublicSettings | null>(null)
   const [selection, setSelection] = useState<SelectionPayload | null>(null)
+  // Native events can arrive in the same React batch. Keep the active owner
+  // synchronously available to callbacks before the state render commits.
+  const selectionIdRef = useRef<string | null>(null)
   const [busyActionId, setBusyActionId] = useState<string | null>(null)
   const [copySuccessActionId, setCopySuccessActionId] = useState<string | null>(null)
   const [hoveredControlId, setHoveredControlId] = useState<string | null>(null)
@@ -112,6 +115,17 @@ export function ToolbarApp(): JSX.Element {
   const operationGenerationRef = useRef(0)
   const selectionGenerationRef = useRef(0)
   const selectionTimingStartedAtRef = useRef<number | null>(null)
+
+  const publishSelection = (nextSelection: SelectionPayload): void => {
+    selectionIdRef.current = nextSelection.selectionId ?? null
+    setSelection(nextSelection)
+  }
+
+  const retireSelection = (selectionId: string | undefined): void => {
+    if (!selectionId || selectionIdRef.current !== selectionId) return
+    selectionIdRef.current = null
+    setSelection(null)
+  }
 
   const blurToolbarFocus = (): void => {
     const activeElement = document.activeElement
@@ -164,6 +178,8 @@ export function ToolbarApp(): JSX.Element {
   useEffect(() => {
     let disposed = false
     let settingsRetryTimer = 0
+    let initialReplayPending = true
+    const dismissedBeforeReplay = new Set<string>()
 
     const loadSettings = async (attempt: number): Promise<void> => {
       try {
@@ -203,22 +219,28 @@ export function ToolbarApp(): JSX.Element {
       clearRetainedToolbarFocus()
       selectionGenerationRef.current += 1
       operationGenerationRef.current += 1
-      setSelection(nextSelection)
+      publishSelection(nextSelection)
       setBusyActionId(null)
       setMessage('')
     })
     const initialSelectionGeneration = selectionGenerationRef.current
     const currentSelection = window.textLens.getCurrentSelection?.()
+    initialReplayPending = currentSelection !== undefined
     void currentSelection?.then((value) => {
       if (
         !disposed &&
         value &&
+        (!value.selectionId || !dismissedBeforeReplay.has(value.selectionId)) &&
         selectionGenerationRef.current === initialSelectionGeneration
       ) {
         clearRetainedToolbarFocus()
-        setSelection(value)
+        publishSelection(value)
       }
+      initialReplayPending = false
+      dismissedBeforeReplay.clear()
     }).catch((error: unknown) => {
+      initialReplayPending = false
+      dismissedBeforeReplay.clear()
       if (!disposed) logToolbarDiagnostic('selection-replay', undefined, 1, error)
     })
     const unsubscribeSettings = window.textLens.onSettingsChanged((nextSettings) => {
@@ -246,15 +268,22 @@ export function ToolbarApp(): JSX.Element {
       )
     }) ?? (() => undefined)
 
-    // Native dismiss force-hides the window; clear React selection / copy
-    // success so a single outside click does not leave a stale toolbar shell.
+    // A dismiss belongs only to the selection it names. Native messages can
+    // arrive after a newer selection or without an owner; neither may clear
+    // the newer selection, focus, operation, message or copy confirmation.
     const unsubscribeDismiss = window.textLens.onToolbarDismissed?.((payload) => {
+      if (!payload.selectionId) return
+      if (selectionIdRef.current !== payload.selectionId) {
+        if (!selectionIdRef.current && initialReplayPending) {
+          dismissedBeforeReplay.add(payload.selectionId)
+        }
+        return
+      }
+      selectionGenerationRef.current += 1
+      operationGenerationRef.current += 1
       resetCopySuccess()
       clearRetainedToolbarFocus()
-      setSelection((current) => {
-        if (!payload.selectionId) return null
-        return current?.selectionId === payload.selectionId ? null : current
-      })
+      retireSelection(payload.selectionId)
       setBusyActionId(null)
       setMessage('')
     }) ?? (() => undefined)
@@ -338,7 +367,7 @@ export function ToolbarApp(): JSX.Element {
           clearRetainedToolbarFocus()
           selectionGenerationRef.current += 1
           operationGenerationRef.current += 1
-          setSelection(current)
+          publishSelection(current)
           setBusyActionId(null)
           setMessage('')
         }
@@ -471,9 +500,7 @@ export function ToolbarApp(): JSX.Element {
               focus: 'actions',
               notice
             })
-            setSelection((current) =>
-              current?.selectionId === actedSelectionId ? null : current
-            )
+            retireSelection(actedSelectionId)
             await window.textLens.hideToolbar(actedSelectionId)
           } catch (error) {
             setMessage(getErrorMessage(error, result.message))
@@ -490,9 +517,7 @@ export function ToolbarApp(): JSX.Element {
       // Retire the consumed selection before clearing the busy state. Without
       // this, the layout effect can present the old toolbar again while the
       // backend's native hide is still being committed on Windows.
-      setSelection((current) =>
-        current?.selectionId === actedSelectionId ? null : current
-      )
+      retireSelection(actedSelectionId)
       await window.textLens.hideToolbar(actedSelectionId)
     } catch (error) {
       if (operationGenerationRef.current === operationGeneration) {
@@ -513,9 +538,7 @@ export function ToolbarApp(): JSX.Element {
         focus: 'actions',
         ...(notice ? { notice } : {})
       })
-      setSelection((current) =>
-        current?.selectionId === actedSelectionId ? null : current
-      )
+      retireSelection(actedSelectionId)
       await window.textLens.hideToolbar(actedSelectionId)
     } catch (error) {
       setMessage(getErrorMessage(error, '无法打开设置'))

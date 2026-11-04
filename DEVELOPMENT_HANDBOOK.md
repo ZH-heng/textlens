@@ -85,7 +85,7 @@
 - 共享前端源码 `src/`
 - 平台代码与资源 `apps/`、`assets/`
 - Rust/Tauri 后端 `src-tauri/`（不含编译产物）
-- 脚本、锁文件、配置、README（中/英）、本开发手册、许可证与第三方说明
+- 脚本、锁文件、配置（包括 `.github/` 与 `deny.toml`）、README（中/英）、本开发手册、许可证与第三方说明
 
 不会包含：
 
@@ -94,6 +94,11 @@
 - 依赖目录 `node_modules/`
 - Rust 编译目录 `src-tauri/target/`
 - 嵌套的 `portable-dev-sources/`、缓存、日志和 `.tsbuildinfo`
+- `.env` 等环境文件（保留 `.env.example`）、证书/私钥文件和符号链接
+
+导出时会对结果运行密钥扫描，扫描失败会删除未通过验证的导出目录。导出目录没有 `.git` 时，`pnpm check:secrets` 会扫描源码目录中的文件并跳过构建缓存；即使源码目录位于另一个 Git 仓库内，也不会误扫描外层仓库。该扫描只覆盖部分密钥格式，正式分享源码前仍应检查自定义配置是否包含敏感信息。
+
+导出与迁移脚本的独立验证：`node --test scripts/test-portable-dev-source.mjs`。
 
 ### 迁移到其他电脑后
 

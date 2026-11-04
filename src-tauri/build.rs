@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=../apps/macos/native/selection_bridge.h");
+    println!("cargo:rerun-if-changed=../apps/macos/native/app_profiles.h");
     println!("cargo:rerun-if-changed=../apps/macos/native/selection_policy.h");
     println!("cargo:rerun-if-changed=../apps/macos/native/selection_bridge.mm");
     println!("cargo:rerun-if-changed=../apps/macos/native/LICENSE.selection-hook");

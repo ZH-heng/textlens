@@ -6,6 +6,7 @@
   "actionId": "translate",
   "selection": {
     "selectionId": "selection-fixture",
+    "toolbarMaxWidth": 900.0,
     "text": "Hello",
     "sourceApp": {
       "name": "Fixture App",

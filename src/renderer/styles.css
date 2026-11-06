@@ -32,7 +32,7 @@
   --shadow-lg: 0 18px 50px rgba(78, 64, 44, 0.18);
   --highlight: rgba(255, 255, 255, 0.65);
   --focus-ring: 0 0 0 3px var(--accent-soft);
-  --border-subtle: color-mix(in srgb, var(--border) 65%, transparent);
+  --border-subtle: var(--border);
   --scrim: rgba(24, 22, 18, 0.28);
   --space-1: 4px;
   --space-2: 8px;
@@ -135,6 +135,7 @@ textarea:disabled {
 }
 
 :focus-visible {
+  outline: 3px solid var(--accent);
   outline: 3px solid color-mix(in srgb, var(--accent) 48%, transparent);
   outline-offset: 2px;
 }
@@ -209,6 +210,7 @@ textarea:disabled {
 .button--danger {
   color: var(--danger);
   background: transparent;
+  border-color: var(--danger);
   border-color: color-mix(in srgb, var(--danger) 35%, transparent);
 }
 
@@ -245,6 +247,7 @@ textarea:disabled {
 }
 
 .control:hover:not(:disabled) {
+  border-color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 42%, var(--border-strong));
 }
 
@@ -269,12 +272,14 @@ textarea.control {
 .notice--error {
   color: var(--danger);
   background: var(--danger-soft);
+  border-color: var(--danger);
   border-color: color-mix(in srgb, var(--danger) 22%, transparent);
 }
 
 .notice--success {
   color: var(--success);
   background: var(--success-soft);
+  border-color: var(--success);
   border-color: color-mix(in srgb, var(--success) 22%, transparent);
 }
 
@@ -296,5 +301,11 @@ textarea.control {
       color 120ms ease,
       box-shadow 120ms ease,
       opacity 120ms ease;
+  }
+}
+
+@supports (color: color-mix(in srgb, black, white)) {
+  :root {
+    --border-subtle: color-mix(in srgb, var(--border) 65%, transparent);
   }
 }

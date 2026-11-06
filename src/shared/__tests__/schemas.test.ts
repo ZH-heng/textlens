@@ -26,6 +26,7 @@ import {
   providerModelSchema,
   publicSettingsSchema,
   resultSessionSnapshotSchema,
+  resultReadyAckSchema,
   settingsUpdateSchema,
   toPublicSettings
 } from '..'
@@ -1036,5 +1037,32 @@ describe('Rust shared defaults', () => {
     )
     expect(block.match(/SelectionCaptureStrategy::Clipboard/gu) ?? []).toHaveLength(1)
     expect(block).toContain('default_strategy: SelectionCaptureStrategy::SelectionHook')
+  })
+})
+
+describe('replacement preparation wire contract', () => {
+  const transcript = [
+    { id: 'session-fixture:turn:0', role: 'user', content: '你好?', streaming: false, scalarCount: 3 },
+    { id: 'session-fixture:turn:1', role: 'assistant', content: '', streaming: true, scalarCount: 0 }
+  ]
+  const eventBase = { sessionId: 'session-fixture', sessionGeneration: 1, requestId: 'request-next', requestGeneration: 2, sequence: 8, actionId: 'ask-ai' }
+  const preparationFailure = { requestId: 'request-next', requestGeneration: 2, code: 'PREPARATION_FAILED', message: 'provider disabled', retryable: false, question: '你好?' }
+
+  it('accepts Started transcript and failure metadata while snapshot/ack retain the committed identity', () => {
+    const started = actionStreamEventSchema.parse({ ...eventBase, type: 'started', providerId: 'provider-next', modelId: 'model-next', question: '你好?', transcript })
+    expect(started).toMatchObject({ type: 'started', transcript })
+    expect(actionStreamEventSchema.parse({ ...eventBase, type: 'preparationFailed', code: preparationFailure.code, message: preparationFailure.message, retryable: false, question: '你好?' })).toMatchObject({ type: 'preparationFailed', requestGeneration: 2, sequence: 8 })
+    const restoredTranscript = [transcript[0], { ...transcript[1], content: '你好', streaming: false, scalarCount: 2 }]
+    const restored = resultSessionSnapshotSchema.parse({ ...resultSessionSnapshotFixture, status: 'completed', lastSequence: 8, preparationFailure, transcript: restoredTranscript })
+    expect(restored).toMatchObject({ requestId: 'request-fixture', requestGeneration: 1, content: '你好', lastSequence: 8, preparationFailure, transcript: restoredTranscript })
+    const ack = resultReadyAckSchema.parse({ sessionId: restored.sessionId, sessionGeneration: restored.sessionGeneration, requestGeneration: restored.requestGeneration, lastSequence: restored.lastSequence, handshakeGeneration: restored.handshakeGeneration })
+    expect(ack).toMatchObject({ requestGeneration: 1, lastSequence: 8 })
+  })
+
+  it('rejects corrupt transcript scalar counts in both Started and recoverable snapshots', () => {
+    const corrupt = [{ ...transcript[0], scalarCount: 4 }, transcript[1]]
+    expect(actionStreamEventSchema.safeParse({ ...eventBase, type: 'started', transcript: corrupt }).success).toBe(false)
+    expect(resultSessionSnapshotSchema.safeParse({ ...resultSessionSnapshotFixture, transcript: corrupt, preparationFailure }).success).toBe(false)
+    expect(actionStreamEventSchema.safeParse({ ...eventBase, type: 'started', transcript: [] }).success).toBe(true)
   })
 })

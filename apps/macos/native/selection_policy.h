@@ -9,6 +9,28 @@
 // with a plain C++ compiler.
 namespace textlens_selection_policy {
 
+// Stage deadlines stop that stage's work; they do not cancel the input request.
+inline bool CaptureRequestIsCurrent(bool running, uint64_t generation, uint64_t expected) {
+    return running && generation == expected;
+}
+
+inline bool CaptureStageIsCurrent(bool requestCurrent, uint64_t nowMs, uint64_t deadlineMs) {
+    return requestCurrent && nowMs < deadlineMs;
+}
+
+// Re-evaluate after snapshotting lazy pasteboard data and before every copy
+// injection. A snapshot can take long enough for any of these facts to change.
+inline bool CopyInjectionIsAllowed(
+    bool requestCurrent,
+    bool sameActiveApplication,
+    int64_t originalChangeCount,
+    int64_t currentChangeCount,
+    uint64_t nowMs,
+    uint64_t deadlineMs) {
+    return CaptureStageIsCurrent(requestCurrent, nowMs, deadlineMs) &&
+        sameActiveApplication && originalChangeCount == currentChangeCount;
+}
+
 inline bool CodePointIsLetterish(uint32_t codePoint) {
     return (codePoint >= 'a' && codePoint <= 'z') ||
         (codePoint >= 'A' && codePoint <= 'Z') ||

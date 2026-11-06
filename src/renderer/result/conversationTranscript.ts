@@ -84,3 +84,18 @@ export function patchStreamingAssistant(
   }
   return next
 }
+
+/** Hydration and batched terminal events use the complete answer, even when
+ * React never rendered the streaming state or a typewriter frame. */
+export function reconcileTranscriptContent(
+  turns: TranscriptTurn[],
+  content: string,
+  streaming: boolean,
+  requestId: string | null,
+  scalarCount: number
+): TranscriptTurn[] {
+  const base = content && !turns.some((turn) => turn.role === 'assistant')
+    ? beginAssistantTurn(turns, `${requestId ?? 'restored'}:assistant`)
+    : turns
+  return patchStreamingAssistant(base, content, streaming, scalarCount)
+}

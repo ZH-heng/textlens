@@ -11,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     models::AI_OUTPUT_LIMIT,
     openai_protocol::{
-        decode_json_content, provider_error_from_value, DecodedSseEvent, ProtocolError,
-        ProtocolLimits, ProviderErrorEnvelope, SseCodec, SseDecoder, SseTermination,
+        decode_json_content, is_incomplete_finish_reason, json_response_is_incomplete,
+        provider_error_from_value, DecodedSseEvent, ProtocolError, ProtocolLimits,
+        ProviderErrorEnvelope, SseCodec, SseDecoder, SseTermination,
     },
 };
 
@@ -331,7 +332,7 @@ where
             let termination = decoder
                 .finish()
                 .map_err(|error| protocol_failure(error, content_seen))?;
-            if content.is_empty() {
+            if content.trim().is_empty() {
                 return Err(empty_response_failure(content_seen));
             }
             return Ok(TransportSuccess {
@@ -364,6 +365,9 @@ where
                     .map_err(|error| protocol_failure(error, content_seen))?;
                 let Some(event) = event else {
                     if done_seen {
+                        if content.trim().is_empty() {
+                            return Err(empty_response_failure(content_seen));
+                        }
                         return Ok(TransportSuccess {
                             content,
                             transport: ResponseTransport::Sse,
@@ -377,6 +381,10 @@ where
                     DecodedSseEvent::Ignored => {}
                     DecodedSseEvent::Done => done_seen = true,
                     DecodedSseEvent::Data(data) => {
+                        let incomplete = data
+                            .finish_reason
+                            .as_deref()
+                            .is_some_and(is_incomplete_finish_reason);
                         let now = Instant::now();
                         if first_event_deadline.take().is_some() {
                             on_marker(TransportMarker::FirstValidEvent, now);
@@ -419,6 +427,9 @@ where
                                 on_marker(TransportMarker::FirstContent, marked_at);
                             }
                             idle_deadline = Some(marked_at + config.stream_idle);
+                        }
+                        if incomplete {
+                            return Err(incomplete_response_failure(content_seen));
                         }
                     }
                 }
@@ -475,7 +486,7 @@ async fn consume_json_chunks_for<S, D, M>(
     chunks: S,
     cancellation: &CancellationToken,
     budget: &GenerationBudget,
-    _headers_at: Instant,
+    headers_at: Instant,
     config: TransportConfig,
     mut on_delta: D,
     mut on_marker: M,
@@ -488,12 +499,20 @@ where
     futures_util::pin_mut!(chunks);
     let mut body = Vec::new();
     let mut first_body_seen = false;
+    let mut first_byte_deadline = Some(headers_at + config.first_event);
+    let mut idle_deadline = None;
     loop {
+        let deadline = earliest_active_deadline(
+            budget.total_deadline,
+            first_byte_deadline,
+            None,
+            idle_deadline,
+        );
         let next = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(cancelled_failure(false)),
-            _ = tokio::time::sleep_until(budget.total_deadline) => {
-                return Err(timeout_failure(DeadlineKind::Total, false));
+            _ = tokio::time::sleep_until(deadline.instant) => {
+                return Err(timeout_failure(deadline.kind, false));
             }
             next = chunks.next() => next,
         };
@@ -503,7 +522,11 @@ where
         let chunk = chunk?;
         if !first_body_seen && !chunk.is_empty() {
             first_body_seen = true;
+            first_byte_deadline = None;
             on_marker(TransportMarker::FirstBodyByte, Instant::now());
+        }
+        if !chunk.is_empty() {
+            idle_deadline = Some(Instant::now() + config.stream_idle);
         }
         if body.len().saturating_add(chunk.len()) > config.json_bytes {
             return Err(response_too_large_failure(false));
@@ -518,11 +541,15 @@ where
     }
     on_marker(TransportMarker::FirstValidEvent, Instant::now());
     let content = decode_json_content(codec, &value).unwrap_or_default();
+    let incomplete = json_response_is_incomplete(codec, &value);
     let scalar_count = content.chars().count();
     if scalar_count > config.output_scalars {
         return Err(output_limit_failure(false));
     }
-    if content.is_empty() {
+    if content.trim().is_empty() {
+        if incomplete {
+            return Err(incomplete_response_failure(false));
+        }
         return Err(empty_response_failure(false));
     }
     if cancellation.is_cancelled() {
@@ -532,6 +559,9 @@ where
         return Err(stale_ticket_failure(true));
     }
     on_marker(TransportMarker::FirstContent, Instant::now());
+    if incomplete {
+        return Err(incomplete_response_failure(true));
+    }
     Ok(TransportSuccess {
         content,
         transport: ResponseTransport::Json,
@@ -709,6 +739,19 @@ fn empty_response_failure(content_seen: bool) -> TransportFailure {
     failure(
         "EMPTY_RESPONSE",
         "模型服务未返回文本内容",
+        true,
+        content_seen,
+    )
+}
+
+fn incomplete_response_failure(content_seen: bool) -> TransportFailure {
+    failure(
+        "INCOMPLETE_RESPONSE",
+        if content_seen {
+            "模型回复未完整结束，已保留收到的内容，可重试当前请求"
+        } else {
+            "模型回复未完整结束，可重试当前请求"
+        },
         true,
         content_seen,
     )
@@ -969,6 +1012,177 @@ mod tests {
         )
         .await;
         assert!(result.unwrap_err().provider_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn transport_empty_done_and_whitespace_answers_never_complete() {
+        for wire in [
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"   \"}}]}\n\ndata: [DONE]\n\n",
+        ] {
+            let failure = consume_sse_chunks(
+                futures_util::stream::iter(vec![Ok(Bytes::from(wire.to_owned()))]),
+                &CancellationToken::new(),
+                &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
+                Instant::now(),
+                TransportConfig::test(),
+                |_| ControlFlow::Continue(()),
+                |_| ControlFlow::Continue(()),
+                |_, _| {},
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.code, "EMPTY_RESPONSE");
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_truncated_sse_preserves_final_content_before_reporting_failure() {
+        for (codec, wire) in [
+            (SseCodec::OpenAiChat, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\n"),
+            (SseCodec::OpenAiResponses, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\nevent: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}\n\n"),
+        ] {
+            let mut deltas = Vec::new();
+            let failure = consume_sse_chunks_for(codec,
+                futures_util::stream::iter(vec![Ok(Bytes::from(wire.to_owned()))]),
+                &CancellationToken::new(), &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
+                Instant::now(), TransportConfig::test(), |delta| { deltas.push(delta); ControlFlow::Continue(()) }, |_| ControlFlow::Continue(()), |_, _| {},
+            ).await.unwrap_err();
+            assert_eq!(failure.code, "INCOMPLETE_RESPONSE");
+            assert_eq!(deltas.concat(), "partial");
+            assert!(failure.content_seen);
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_json_incomplete_providers_preserve_content_and_successful_stop_completes() {
+        for (codec, body) in [
+            (
+                SseCodec::OpenAiChat,
+                serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}),
+            ),
+            (
+                SseCodec::OpenAiResponses,
+                serde_json::json!({"output_text":"partial","status":"incomplete"}),
+            ),
+            (
+                SseCodec::AnthropicMessages,
+                serde_json::json!({"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"}),
+            ),
+            (
+                SseCodec::Gemini,
+                serde_json::json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}),
+            ),
+        ] {
+            let mut deltas = Vec::new();
+            let failure = consume_json_chunks_for(
+                codec,
+                futures_util::stream::iter(vec![Ok(Bytes::from(
+                    serde_json::to_vec(&body).unwrap(),
+                ))]),
+                &CancellationToken::new(),
+                &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
+                Instant::now(),
+                TransportConfig::test(),
+                |delta| {
+                    deltas.push(delta);
+                    ControlFlow::Continue(())
+                },
+                |_, _| {},
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.code, "INCOMPLETE_RESPONSE", "{codec:?}");
+            assert!(failure.content_seen);
+            assert_eq!(deltas.concat(), "partial");
+        }
+        let success = consume_json_chunks(
+            futures_util::stream::iter(vec![Ok(Bytes::from_static(
+                br#"{"choices":[{"message":{"content":"complete"},"finish_reason":"stop"}]}"#,
+            ))]),
+            &CancellationToken::new(),
+            &GenerationBudget::new(Instant::now(), Duration::from_secs(10)),
+            Instant::now(),
+            TransportConfig::test(),
+            |_| ControlFlow::Continue(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(success.content, "complete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_json_without_body_times_out_at_first_byte_deadline() {
+        let start = Instant::now();
+        let config = TransportConfig::test();
+        let failure = consume_json_chunks(
+            futures_util::stream::pending(),
+            &CancellationToken::new(),
+            &GenerationBudget::new(start, config.total),
+            start,
+            config,
+            |_| ControlFlow::Continue(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.code, "FIRST_EVENT_TIMEOUT");
+        assert_eq!(Instant::now() - start, config.first_event);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_json_partial_body_times_out_when_reading_stalls() {
+        let start = Instant::now();
+        let config = TransportConfig::test();
+        let stream = futures_util::stream::iter(vec![Ok(Bytes::from_static(br#"{"choices":["#))])
+            .chain(futures_util::stream::pending());
+        let failure = consume_json_chunks(
+            stream,
+            &CancellationToken::new(),
+            &GenerationBudget::new(start, config.total),
+            start,
+            config,
+            |_| ControlFlow::Continue(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.code, "STREAM_IDLE_TIMEOUT");
+        assert_eq!(Instant::now() - start, config.stream_idle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_json_continuous_slow_body_resets_idle_budget() {
+        let config = TransportConfig::test();
+        let stream = futures_util::stream::unfold(
+            VecDeque::from(vec![
+                (
+                    Duration::ZERO,
+                    br#"{"choices":[{"message":{"content":"#.to_vec(),
+                ),
+                (config.stream_idle / 2, b"\"continuous".to_vec()),
+                (config.stream_idle / 2, b" slow".to_vec()),
+                (config.stream_idle / 2, b" body\"}}]}".to_vec()),
+            ]),
+            |mut chunks| async move {
+                let (delay, bytes) = chunks.pop_front()?;
+                tokio::time::sleep(delay).await;
+                Some((Ok(Bytes::from(bytes)), chunks))
+            },
+        );
+        let success = consume_json_chunks(
+            stream,
+            &CancellationToken::new(),
+            &GenerationBudget::new(Instant::now(), config.total),
+            Instant::now(),
+            config,
+            |_| ControlFlow::Continue(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(success.content, "continuous slow body");
     }
 
     #[tokio::test(start_paused = true)]

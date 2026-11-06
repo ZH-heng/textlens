@@ -11,6 +11,35 @@
    fall through to the shared dark tokens. */
 
 @media (prefers-color-scheme: light) {
+  [data-theme='warm'],
+  :root[data-theme='warm'] {
+    --bg: #f6f3ec;
+    --surface: rgba(253, 251, 245, 0.94);
+    --surface-solid: #fdfbf5;
+    --surface-muted: #f2eee4;
+    --surface-inset: #eae4d7;
+    --text: #24211b;
+    --text-secondary: #6c665a;
+    --text-tertiary: #9d9689;
+    --border: rgba(89, 75, 54, 0.13);
+    --border-strong: rgba(89, 75, 54, 0.22);
+    --accent: #3568d0;
+    --accent-hover: #2a56b4;
+    --accent-soft: rgba(53, 104, 208, 0.11);
+    --on-accent: #ffffff;
+    --danger: #b8443c;
+    --danger-soft: rgba(184, 68, 60, 0.11);
+    --success: #37794f;
+    --success-soft: rgba(55, 121, 79, 0.12);
+    --warning: #a06b15;
+    --warning-soft: rgba(160, 107, 21, 0.13);
+    --shadow-sm: 0 2px 10px rgba(78, 64, 44, 0.1);
+    --shadow-md: 0 8px 24px rgba(78, 64, 44, 0.13);
+    --shadow-lg: 0 18px 50px rgba(78, 64, 44, 0.18);
+    --highlight: rgba(255, 255, 255, 0.65);
+    --scrim: rgba(24, 22, 18, 0.28);
+  }
+
   [data-theme='classic'],
   :root[data-theme='classic'] {
     --bg: #f5f6f8;
@@ -125,6 +154,37 @@
 }
 
 @media (prefers-color-scheme: dark) {
+  [data-theme='warm'],
+  :root[data-theme='warm'],
+  [data-theme='classic'],
+  :root[data-theme='classic'] {
+    --bg: #15171b;
+    --surface: rgba(34, 37, 43, 0.94);
+    --surface-solid: #22252b;
+    --surface-muted: #2a2e35;
+    --surface-inset: #1b1f25;
+    --text: #f2f3f5;
+    --text-secondary: #b0b5bf;
+    --text-tertiary: #858b96;
+    --border: rgba(255, 255, 255, 0.1);
+    --border-strong: rgba(255, 255, 255, 0.2);
+    --accent: #78a0ff;
+    --accent-hover: #91b2ff;
+    --accent-soft: rgba(120, 160, 255, 0.15);
+    --on-accent: #10141d;
+    --danger: #ff8585;
+    --danger-soft: rgba(255, 133, 133, 0.13);
+    --success: #76d5a2;
+    --success-soft: rgba(118, 213, 162, 0.13);
+    --warning: #efbd6d;
+    --warning-soft: rgba(239, 189, 109, 0.14);
+    --shadow-sm: 0 2px 12px rgba(0, 0, 0, 0.25);
+    --shadow-md: 0 8px 26px rgba(0, 0, 0, 0.3);
+    --shadow-lg: 0 18px 54px rgba(0, 0, 0, 0.38);
+    --highlight: rgba(255, 255, 255, 0.045);
+    --scrim: rgba(0, 0, 0, 0.46);
+  }
+
   [data-theme='sand'],
   :root[data-theme='sand'] {
     --bg: #201b12;

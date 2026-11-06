@@ -55,9 +55,28 @@ describe('normalizeMarkdownSource', () => {
     )
   })
 
-  it('unescapes literal \\n sequences from model output', () => {
-    const input = '第一段。\\n\\n第二段。\\n- 条目'
-    expect(normalizeMarkdownSource(input)).toBe('第一段。\n\n第二段。\n\n- 条目')
+  it.each([
+    '```python\nprint("a\\nb\\nc\\nd\\ne")\n```',
+    '`a\\nb\\nc` and `\\t`',
+    '{"pattern":"\\n\\t","path":"C:\\new\\tools\\notes"}',
+    '/\\n\\t\\w+/gu',
+    '第一段。\\n\\n第二段。\\n- 条目'
+  ])('preserves literal escapes in already decoded content: %s', (input) => {
+    expect(normalizeMarkdownSource(input)).toBe(input)
+  })
+
+  it.each(['A title\n---', 'A title.\n===', 'A multi\nline title\n---'])('preserves Setext headings: %s', (input) => {
+    expect(normalizeMarkdownSource(input)).toBe(input)
+  })
+
+  it('does not let a shorter fence close an enclosing code sample', () => {
+    const input = ['````markdown', '```', '1、不要改', '正文。', '下一行。', '```', '````'].join('\n')
+    expect(normalizeMarkdownSource(input)).toBe(input)
+  })
+
+  it('preserves nested lists and indented continuations', () => {
+    const input = '- parent\n  continuation\n  - child\n    nested continuation\n- sibling'
+    expect(normalizeMarkdownSource(input)).toBe(input)
   })
 
   it('separates headings and blockquotes from preceding prose', () => {

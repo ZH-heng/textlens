@@ -55,9 +55,36 @@ const KANA = /[\u3040-\u309f\u30a0-\u30ff]/u
 const HANGUL = /[\uac00-\ud7af\u1100-\u11ff]/u
 const CYRILLIC = /[\u0400-\u04ff]/u
 const LETTER = /\p{Alphabetic}/u
+const LATIN_WORDS = {
+  'de-DE': new Set('der die das den dem des ein eine einer einem einen ist sind und mit für von auf nicht ich sie wir diese dies dieser dieses über aktuelle auswahl deutscher deutsch guten tag hallo danke bitte übersetzen'.split(' ')),
+  'fr-FR': new Set('le la les des du un une est sont et avec pour dans pas ce ces ceci cette vous nous français texte traduire bonjour merci salut au aux être été où à déjà'.split(' ')),
+  'en-US': new Set('the this that is are was were and with for from have has you your please to of in it not we a an english hello good morning'.split(' '))
+} as const
+const GERMAN_ACCENTS = /[äöüß]/u
+const FRENCH_ACCENTS = /[àâæçéèêëîïôœùûÿ]/u
+
+function detectLatinLanguage(text: string): TranslationLanguage {
+  const tokens = text.toLowerCase().split(/[^\p{Alphabetic}]+/u).filter(Boolean)
+  if (tokens.length === 1) {
+    if (['hallo', 'danke', 'bitte'].includes(tokens[0]!)) return 'de-DE'
+    if (['bonjour', 'merci', 'salut'].includes(tokens[0]!)) return 'fr-FR'
+  }
+  let german = 0
+  let french = 0
+  let english = 0
+  for (const word of new Set(tokens)) {
+    if (LATIN_WORDS['de-DE'].has(word) || GERMAN_ACCENTS.test(word)) german += 1
+    if (LATIN_WORDS['fr-FR'].has(word) || FRENCH_ACCENTS.test(word)) french += 1
+    if (LATIN_WORDS['en-US'].has(word)) english += 1
+  }
+  if (german >= 2 && german > french && german > english) return 'de-DE'
+  if (french >= 2 && french > german && french > english) return 'fr-FR'
+  return 'en-US'
+}
 
 /**
- * Detect the likely source language of selected text by script share.
+ * Detect the likely source language by script share and conservative Latin
+ * word/accent evidence. Ambiguous Latin text keeps the English fallback.
  *
  * A single foreign character must not hijack a whole paragraph, so each
  * script has to own a meaningful share of the letters. Kana uses a lower
@@ -83,7 +110,7 @@ export function detectTranslationLanguage(text: string): TranslationLanguage {
   if (hangul * 10 >= total * 3) return 'ko-KR'
   if (han * 10 >= total * 3) return 'zh-CN'
   if (cyrillic * 10 >= total * 3) return 'ru-RU'
-  return 'en-US'
+  return detectLatinLanguage(text)
 }
 
 export interface TranslationLanguageSettings {

@@ -11,6 +11,7 @@ import {
   detectTranslationLanguage,
   translationTargetEnglishName
 } from '../languages'
+import detectionFixtures from './fixtures/language-detection.json'
 
 const rustModelsSource = readFileSync(
   resolve(process.cwd(), 'src-tauri/src/models.rs'),
@@ -72,6 +73,17 @@ describe('translation languages', () => {
     expect(detectTranslationLanguage('Mixed English 中文中文中文')).toBe('zh-CN')
     expect(detectTranslationLanguage('日本語能力試験に合格した')).toBe('ja-JP')
     expect(detectTranslationLanguage('12345 — !')).toBe('en-US')
+  })
+
+  it.each(detectionFixtures)('detects $language with shared Rust fixtures: $text', ({ text, language }) => {
+    expect(detectTranslationLanguage(text)).toBe(language)
+  })
+
+  it.each(['de-DE', 'fr-FR'] as const)('reverses %s text to the default language', (language) => {
+    const text = detectionFixtures.find((fixture) => fixture.language === language)!.text
+    expect(defaultTranslationTarget(detectTranslationLanguage(text), {
+      defaultLanguage: 'zh-CN', targetLanguage: language
+    })).toBe('zh-CN')
   })
 
   it('translates into the target unless the text already uses it', () => {

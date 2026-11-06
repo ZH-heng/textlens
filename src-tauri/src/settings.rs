@@ -65,6 +65,7 @@ pub struct SettingsRepository {
     /// Serializes writers without holding the snapshot lock across disk I/O.
     write_serial: Arc<Mutex<()>>,
     persist_generation: Arc<AtomicU64>,
+    result_size_epoch: AtomicU64,
     secrets: Arc<dyn SecretStore>,
 }
 
@@ -149,6 +150,7 @@ impl SettingsRepository {
             state: RwLock::new(Arc::new(loaded.settings)),
             write_serial: Arc::new(Mutex::new(())),
             persist_generation: Arc::new(AtomicU64::new(0)),
+            result_size_epoch: AtomicU64::new(0),
             secrets,
         };
 
@@ -234,8 +236,56 @@ impl SettingsRepository {
         self.get_public_settings()
     }
 
+    pub fn result_size_epoch(&self) -> u64 {
+        self.result_size_epoch.load(Ordering::Acquire)
+    }
+
+    /// Invalidates already-dispatched resize writes while serialized with their commit.
+    pub fn invalidate_result_size_epoch(&self) -> u64 {
+        let _serial = self.write_serial.lock();
+        self.result_size_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn update_result_last_size_if_epoch(
+        &self,
+        size: WindowSize,
+        expected_epoch: u64,
+    ) -> Result<Option<PublicSettings>, SettingsError> {
+        self.update_result_last_size_if_epoch_and(size, expected_epoch, || true)
+    }
+
+    /// Recheck both the reset epoch and the caller's resize revision only once
+    /// this worker owns the durable writer lock, so queued writes cannot
+    /// overwrite a newer resize that committed while they were waiting.
+    pub fn update_result_last_size_if_epoch_and(
+        &self,
+        size: WindowSize,
+        expected_epoch: u64,
+        is_current: impl FnOnce() -> bool,
+    ) -> Result<Option<PublicSettings>, SettingsError> {
+        {
+            let _serial = self.write_serial.lock();
+            if self.result_size_epoch.load(Ordering::Acquire) != expected_epoch || !is_current() {
+                return Ok(None);
+            }
+            let mut candidate = self.state.read().as_ref().clone();
+            if !candidate.result.remember_size {
+                return Ok(None);
+            }
+            candidate.result.last_size = Some(size);
+            candidate = candidate
+                .normalize_and_validate()
+                .map_err(SettingsError::Validation)?;
+            self.persist(&candidate)?;
+            self.persist_generation.fetch_add(1, Ordering::AcqRel);
+            *self.state.write() = Arc::new(candidate);
+        }
+        self.get_public_settings().map(Some)
+    }
+
     pub fn clear_result_last_size(&self) -> Result<PublicSettings, SettingsError> {
         self.transact(|settings| {
+            self.result_size_epoch.fetch_add(1, Ordering::AcqRel);
             settings.result.last_size = None;
             Ok(())
         })?;
@@ -1199,6 +1249,18 @@ fn migrate_quote_to_ask_value(value: &mut serde_json::Value) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
+    let provider_ids: std::collections::HashSet<String> = object
+        .get("providers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|provider| {
+            provider
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect();
     let Some(actions) = object
         .get_mut("actions")
         .and_then(serde_json::Value::as_array_mut)
@@ -1206,7 +1268,16 @@ fn migrate_quote_to_ask_value(value: &mut serde_json::Value) {
         return;
     };
 
-    let mut saw_ask = false;
+    // An already-migrated Ask takes precedence over redundant legacy Quote.
+    // Preserve all current Ask definitions, including custom IDs and empty routes.
+    let mut saw_ask = actions.iter().any(|action| {
+        action
+            .get("kind")
+            .or_else(|| action.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("ask")
+            || action.get("id").and_then(serde_json::Value::as_str) == Some("ask-ai")
+    });
     let mut rewritten = Vec::with_capacity(actions.len());
     for action in actions.drain(..) {
         let Some(action_object) = action.as_object() else {
@@ -1219,8 +1290,10 @@ fn migrate_quote_to_ask_value(value: &mut serde_json::Value) {
             .and_then(serde_json::Value::as_str);
         let id = action_object.get("id").and_then(serde_json::Value::as_str);
         let is_quote = kind == Some("quote") || id == Some("quote");
-        let is_ask = kind == Some("ask") || id == Some("ask-ai");
-        if is_quote || is_ask {
+        // Current Ask actions may legitimately be unbound, or have custom IDs.
+        // Only legacy Quote data needs rewriting; re-migrating Ask silently
+        // reintroduced deleted providers and discarded additional Ask actions.
+        if is_quote {
             if saw_ask {
                 continue;
             }
@@ -1254,12 +1327,22 @@ fn migrate_quote_to_ask_value(value: &mut serde_json::Value) {
                 .get("providerId")
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(DEFAULT_PROVIDER_ID);
-            let model_id = action_object
-                .get("modelId")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
+                .filter(|value| !value.is_empty() && provider_ids.contains(*value))
+                .unwrap_or_else(|| {
+                    if provider_ids.contains(DEFAULT_PROVIDER_ID) {
+                        DEFAULT_PROVIDER_ID
+                    } else {
+                        ""
+                    }
+                });
+            let model_id = if provider_id.is_empty() {
+                ""
+            } else {
+                action_object
+                    .get("modelId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            };
             let thinking_mode = action_object
                 .get("thinkingMode")
                 .cloned()
@@ -1835,6 +1918,164 @@ mod tests {
             .get(&secret_account(DEFAULT_PROVIDER_ID))
             .unwrap()
             .is_none());
+        // Reconstruct the repository exactly as application startup does.
+        let reloaded =
+            SettingsRepository::with_secret_store(directory.path().join("settings.json"), secrets)
+                .unwrap();
+        assert_eq!(reloaded.get_public_settings().unwrap(), public);
+    }
+
+    #[test]
+    fn legacy_quote_migration_with_deleted_default_provider_restarts_unbound() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let secrets = Arc::new(MemorySecrets::default());
+        let repository = SettingsRepository::with_secret_store(&path, secrets.clone()).unwrap();
+        repository.delete_provider(DEFAULT_PROVIDER_ID).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["version"] = 10.into();
+        let ask = value["actions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|action| action["id"] == "ask-ai")
+            .unwrap();
+        ask["id"] = "quote".into();
+        ask["kind"] = "quote".into();
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let migrated = SettingsRepository::with_secret_store(&path, secrets.clone())
+            .unwrap()
+            .get_settings();
+        assert!(migrated.providers.is_empty());
+        let ask = migrated
+            .actions
+            .iter()
+            .find(|action| action.kind == ActionKind::Ask)
+            .unwrap();
+        assert_eq!(ask.provider_id.as_deref(), Some(""));
+        assert_eq!(ask.model_id.as_deref(), Some(""));
+        assert!(SettingsRepository::with_secret_store(path, secrets).is_ok());
+    }
+
+    #[test]
+    fn current_ask_migration_is_idempotent_and_preserves_unbound_actions() {
+        let mut value = serde_json::json!({"version": SETTINGS_VERSION, "actions": [
+            {"id":"ask-ai", "kind":"ask", "providerId":"", "modelId":"", "name":"My Ask", "order":0},
+            {"id":"custom-ask", "kind":"ask", "providerId":"", "modelId":"", "name":"Other Ask", "order":1}
+        ]});
+        let before = value.clone();
+        migrate_quote_to_ask_value(&mut value);
+        migrate_quote_to_ask_value(&mut value);
+        assert_eq!(value, before);
+        value["actions"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id":"quote", "kind":"quote"}));
+        migrate_quote_to_ask_value(&mut value);
+        assert_eq!(value, before);
+    }
+
+    #[test]
+    fn result_size_reset_rejects_a_scheduled_stale_write_inside_repository() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let secrets = Arc::new(MemorySecrets::default());
+        let repository =
+            Arc::new(SettingsRepository::with_secret_store(&path, secrets.clone()).unwrap());
+        let epoch = repository.result_size_epoch();
+        let size = WindowSize {
+            width: 812.0,
+            height: 536.0,
+        };
+        assert!(repository
+            .update_result_last_size_if_epoch(size, epoch)
+            .unwrap()
+            .is_some());
+        let scheduled = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let writer = {
+            let repository = repository.clone();
+            let scheduled = scheduled.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                // Emulate an already-scheduled spawn_blocking resize worker.
+                scheduled.wait();
+                release.wait();
+                repository
+                    .update_result_last_size_if_epoch(size, epoch)
+                    .unwrap()
+            })
+        };
+        scheduled.wait();
+        repository.clear_result_last_size().unwrap();
+        release.wait();
+        assert!(writer.join().unwrap().is_none());
+        assert_eq!(repository.get_settings().result.last_size, None);
+        let reloaded = SettingsRepository::with_secret_store(path, secrets).unwrap();
+        assert_eq!(reloaded.get_settings().result.last_size, None);
+        let current_epoch = repository.result_size_epoch();
+        assert!(current_epoch > epoch);
+        assert!(repository
+            .update_result_last_size_if_epoch(size, current_epoch)
+            .unwrap()
+            .is_some());
+        let invalidated = repository.invalidate_result_size_epoch();
+        assert!(invalidated > current_epoch);
+        assert!(repository
+            .update_result_last_size_if_epoch(size, current_epoch)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn same_epoch_stale_resize_cannot_overwrite_a_newer_committed_revision() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let secrets = Arc::new(MemorySecrets::default());
+        let repository =
+            Arc::new(SettingsRepository::with_secret_store(&path, secrets.clone()).unwrap());
+        let epoch = repository.result_size_epoch();
+        let revision = Arc::new(AtomicU64::new(1));
+        let scheduled = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let older = WindowSize {
+            width: 812.0,
+            height: 536.0,
+        };
+        let newer = WindowSize {
+            width: 920.0,
+            height: 640.0,
+        };
+        let writer = {
+            let repository = repository.clone();
+            let revision = revision.clone();
+            let scheduled = scheduled.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                let captured_revision = 1;
+                scheduled.wait();
+                release.wait();
+                repository
+                    .update_result_last_size_if_epoch_and(older, epoch, || {
+                        revision.load(Ordering::Acquire) == captured_revision
+                    })
+                    .unwrap()
+            })
+        };
+        scheduled.wait();
+        revision.store(2, Ordering::Release);
+        assert!(repository
+            .update_result_last_size_if_epoch_and(newer, epoch, || revision.load(Ordering::Acquire)
+                == 2)
+            .unwrap()
+            .is_some());
+        release.wait();
+        assert!(writer.join().unwrap().is_none());
+        assert_eq!(repository.get_settings().result.last_size, Some(newer));
+        let reloaded = SettingsRepository::with_secret_store(path, secrets).unwrap();
+        assert_eq!(reloaded.get_settings().result.last_size, Some(newer));
+        assert_eq!(repository.result_size_epoch(), epoch);
     }
 
     #[test]

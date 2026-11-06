@@ -83,6 +83,7 @@ export type SelectionDirection = z.infer<typeof selectionDirectionSchema>
 export const selectionPayloadSchema = z
   .object({
     selectionId: z.string().trim().min(1).max(128).optional(),
+    toolbarMaxWidth: z.number().finite().positive().max(900).optional(),
     text: z.string().min(1).max(1_000_000),
     sourceApp: sourceApplicationSchema,
     anchor: selectionAnchorSchema,
@@ -692,6 +693,27 @@ export const actionNoticeSchema = z
   .strict()
 export type ActionNotice = z.infer<typeof actionNoticeSchema>
 
+export const preparationFailureSchema = z.object({
+  requestId: z.string().trim().min(1).max(128),
+  requestGeneration: wireCounterSchema,
+  code: actionNoticeSchema.shape.code,
+  message: actionNoticeSchema.shape.message,
+  retryable: z.boolean(),
+  question: z.string().optional()
+}).strict()
+export type PreparationFailure = z.infer<typeof preparationFailureSchema>
+
+export const transcriptTurnSchema = z.object({
+  id: z.string().min(1).max(256),
+  role: z.enum(['user', 'assistant']),
+  content: z.string(),
+  streaming: z.boolean(),
+  scalarCount: wireCounterSchema
+}).strict().refine((turn) => countUnicodeScalars(turn.content) === turn.scalarCount, {
+  path: ['scalarCount'],
+  message: 'scalarCount must equal the Unicode scalar count of content'
+})
+
 const actionEventBaseShape = {
   sessionId: z.string().trim().min(1).max(128),
   sessionGeneration: wireCounterSchema,
@@ -702,7 +724,22 @@ const actionEventBaseShape = {
 } as const
 
 export const actionStreamEventSchema = z.discriminatedUnion('type', [
-  z.object({ ...actionEventBaseShape, type: z.literal('started') }).strict(),
+  z.object({
+    ...actionEventBaseShape,
+    type: z.literal('started'),
+    providerId: providerMetadataShape.id.optional(),
+    modelId: z.string().trim().min(1).max(256).optional(),
+    question: z.string().optional(),
+    transcript: z.array(transcriptTurnSchema).optional()
+  }).strict(),
+  z.object({
+    ...actionEventBaseShape,
+    type: z.literal('preparationFailed'),
+    code: actionNoticeSchema.shape.code,
+    message: actionNoticeSchema.shape.message,
+    retryable: z.boolean(),
+    question: z.string().optional()
+  }).strict(),
   z.object({
     ...actionEventBaseShape,
     type: z.literal('delta'),
@@ -760,6 +797,8 @@ export const resultSessionSnapshotSchema = z
     contentScalarCount: wireCounterSchema.max(AI_OUTPUT_LIMIT),
     handshakeGeneration: wireCounterSchema,
     generationNotice: actionNoticeSchema.optional(),
+    preparationFailure: preparationFailureSchema.optional(),
+    transcript: z.array(transcriptTurnSchema).optional(),
     errorMessage: z.string().max(2_000),
     retryable: z.boolean(),
     pinned: z.boolean()

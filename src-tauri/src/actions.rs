@@ -23,8 +23,9 @@ use crate::{
         ActionDefinition, ActionKind, ActionSnapshot, ActionSnapshotStatus, AppSettings,
         ConnectionTestResult, ExecuteActionRequest, Locale, Point, ProviderConfig, ProviderModel,
         RequestGeneration, ResultReadyAck, SessionGeneration, SyncModelsResult, ThinkingMode,
-        TranslationLanguage, TranslationSettings, UpdateProviderInput, AI_PROMPT_LIMIT,
-        AI_TEXT_LIMIT, OUTPUT_LANGUAGE_PLACEHOLDER, TARGET_LANGUAGE_PLACEHOLDER, TEXT_PLACEHOLDER,
+        TranscriptRole, TranscriptTurn, TranslationLanguage, TranslationSettings,
+        UpdateProviderInput, AI_PROMPT_LIMIT, AI_TEXT_LIMIT, OUTPUT_LANGUAGE_PLACEHOLDER,
+        TARGET_LANGUAGE_PLACEHOLDER, TEXT_PLACEHOLDER,
     },
     openai_protocol::provider_error_from_value,
     openai_transport::{
@@ -226,6 +227,7 @@ struct PreparedSessionData {
 
 struct ResolvedRequestConfig {
     session_data: PreparedSessionData,
+    route_only: bool,
 }
 
 #[derive(Clone)]
@@ -569,7 +571,31 @@ impl ActionServiceState {
         ticket: &RequestTicket,
         data: PreparedSessionData,
     ) -> TransitionResult {
-        let result = self.sessions.commit_prepare_success(ticket);
+        let question = if self
+            .contexts
+            .get(&ticket.session_id)
+            .is_some_and(|context| context.ask_system.is_some())
+            || !data.committed_messages.is_empty()
+        {
+            data.last_messages
+                .last()
+                .filter(|message| message.role == ChatRole::User)
+                .map(|message| message.content.clone())
+        } else {
+            None
+        };
+        let transcript = self
+            .contexts
+            .get(&ticket.session_id)
+            .filter(|context| context.ask_system.is_some())
+            .map(|_| transcript_for_messages(&data.last_messages, &ticket.session_id, "", 0, true));
+        let result = self.sessions.commit_prepare_success_with_metadata(
+            ticket,
+            Some(data.route.provider.id.clone()),
+            Some(data.route.model.clone()),
+            question,
+            transcript,
+        );
         if result == TransitionResult::Applied {
             let ask_system = self
                 .contexts
@@ -613,6 +639,10 @@ impl ActionServiceState {
             debug_assert!(content.is_some(), "Applied Completed keeps its snapshot");
             debug_assert!(context.is_some(), "Running tickets keep their context");
             if let (Some(content), Some(context)) = (content, context) {
+                // An empty Ask model switch commits a route, not a chat turn.
+                if context.last_messages.is_empty() {
+                    return Ok(transition);
+                }
                 let mut committed = context.last_messages.clone();
                 committed.push(ChatMessage::assistant(content));
                 context.committed_messages = committed;
@@ -626,7 +656,10 @@ impl ActionServiceState {
         session_id: &str,
         window_label: &str,
     ) -> Result<ActionBeginReady, SessionError> {
-        let begin = self.sessions.begin_ready(session_id, window_label)?;
+        let mut begin = self.sessions.begin_ready(session_id, window_label)?;
+        if let Some(context) = self.contexts.get(session_id) {
+            begin.snapshot.transcript = build_session_transcript(context, &begin.snapshot);
+        }
         let route = self
             .contexts
             .get(session_id)
@@ -678,28 +711,69 @@ impl ActionService {
         app: &AppHandle<R>,
         request: ExecuteActionRequest,
     ) -> Result<String, ActionServiceError> {
+        let prepared = self.prepare_initial(request)?;
+        let request_id = prepared.ticket.request_id.clone();
+        self.start_flusher_if_needed(app, &prepared.ticket.session_id);
+        let service = self.clone();
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            service.run(app, prepared).await;
+        });
+        Ok(request_id)
+    }
+
+    // Finish local configuration and one Key read before the runtime replaces
+    // any result window or takes ownership of the host selection. DNS/TLS and
+    // the model request still start asynchronously alongside window creation.
+    fn prepare_initial(
+        &self,
+        request: ExecuteActionRequest,
+    ) -> Result<PreparedRequest, ActionServiceError> {
         let action_started = tokio::time::Instant::now();
         validate_request_shape(&request)?;
-        let action_reservation = {
-            let mut state = self.inner.state.lock();
-            let reservation = state.sessions.reserve_initial(InitialReservationInput {
-                session_id: request.session_id.clone(),
-                window_label: request.window_label.clone(),
-                request_id: Uuid::new_v4().to_string(),
-                action_id: request.action_id.clone(),
-            })?;
-            ActionReservation {
-                reservation,
-                seed: FrozenPreparationSeed::Initial {
-                    request: FrozenActionRequest::from(&request),
-                },
-                action_started,
-            }
+        let request_id = Uuid::new_v4().to_string();
+        let seed = FrozenPreparationSeed::Initial {
+            request: FrozenActionRequest::from(&request),
         };
-        let request_id = action_reservation.reservation.ticket.request_id.clone();
-        self.spawn_preparation(app.clone(), action_reservation);
-        self.start_flusher_if_needed(app, &request.session_id);
-        Ok(request_id)
+        // No session is reserved until local preparation succeeds. Only the
+        // request ID is used to build the prompt's source boundary; generations
+        // are replaced by the actual reservation before this ticket can emit.
+        let ticket = RequestTicket {
+            session_id: request.session_id.clone(),
+            session_generation: SessionGeneration(1),
+            request_generation: RequestGeneration(1),
+            request_id: request_id.clone(),
+            action_id: request.action_id.clone(),
+        };
+        let settings = self.inner.settings.get_settings();
+        let resolved = resolve_request_config(&seed, &settings, &ticket)?;
+        let action_kind = prepared_action(&settings, &request.action_id)?.kind;
+        let mut prepared = self.prepare_with_runtime(
+            ticket,
+            resolved,
+            CancellationToken::new(),
+            action_started,
+            action_kind,
+        )?;
+        let mut state = self.inner.state.lock();
+        let reservation = state.sessions.reserve_initial(InitialReservationInput {
+            session_id: request.session_id,
+            window_label: request.window_label,
+            request_id,
+            action_id: request.action_id,
+        })?;
+        prepared.ticket = reservation.ticket;
+        prepared.cancellation = reservation.cancellation;
+        if state.commit_prepared(&prepared.ticket, prepared.session_data())
+            != TransitionResult::Applied
+        {
+            // A failed ownership commit must leave no open session/context.
+            state.sessions.close(&prepared.ticket.session_id);
+            state.contexts.remove(&prepared.ticket.session_id);
+            prepared.cancellation.cancel();
+            return Err(ActionServiceError::SessionEnded);
+        }
+        Ok(prepared)
     }
 
     /// Open an Ask result session without starting network generation.
@@ -869,12 +943,12 @@ impl ActionService {
     }
 
     pub fn get_snapshot(&self, session_id: &str) -> Option<ActionSnapshot> {
-        self.inner
-            .state
-            .lock()
-            .sessions
-            .authoritative_snapshot(session_id)
-            .cloned()
+        let state = self.inner.state.lock();
+        let mut snapshot = state.sessions.authoritative_snapshot(session_id)?.clone();
+        if let Some(context) = state.contexts.get(session_id) {
+            snapshot.transcript = build_session_transcript(context, &snapshot);
+        }
+        Some(snapshot)
     }
 
     pub fn clear_session(&self, session_id: &str) -> bool {
@@ -937,6 +1011,7 @@ impl ActionService {
         let ticket = action_reservation.reservation.ticket.clone();
         let cancellation = action_reservation.reservation.cancellation.clone();
         let settings_snapshot = self.inner.settings.get_settings();
+        let question = preparation_question(&action_reservation.seed, &settings_snapshot);
         let resolved =
             match resolve_request_config(&action_reservation.seed, &settings_snapshot, &ticket) {
                 Ok(resolved) => resolved,
@@ -947,6 +1022,7 @@ impl ActionService {
                             code: "PREPARATION_FAILED".to_owned(),
                             message: error.to_string(),
                             retryable: false,
+                            question,
                         },
                     );
                     self.start_flusher_if_needed(&app, &ticket.session_id);
@@ -959,6 +1035,7 @@ impl ActionService {
             .find(|action| action.id == resolved.session_data.frozen_request.action_id)
             .map(|action| action.kind)
             .unwrap_or(ActionKind::Explain);
+        let route_only = resolved.route_only;
         let prepared = match self.prepare_with_runtime(
             ticket.clone(),
             resolved,
@@ -974,6 +1051,7 @@ impl ActionService {
                         code: "PREPARATION_FAILED".to_owned(),
                         message: error.to_string(),
                         retryable: false,
+                        question,
                     },
                 );
                 self.start_flusher_if_needed(&app, &ticket.session_id);
@@ -989,6 +1067,15 @@ impl ActionService {
             return;
         }
         self.start_flusher_if_needed(&app, &ticket.session_id);
+        if route_only {
+            let _ = self
+                .inner
+                .state
+                .lock()
+                .commit_terminal_with_context(&ticket, TerminalKind::Completed);
+            self.start_flusher_if_needed(&app, &ticket.session_id);
+            return;
+        }
         let service = self.clone();
         tauri::async_runtime::spawn(async move {
             service.run(app, prepared).await;
@@ -1024,7 +1111,9 @@ impl ActionService {
         action_kind: ActionKind,
     ) -> Result<PreparedRequest, ActionServiceError> {
         let session_data = resolved.session_data;
-        validate_prepared_session_data(&session_data)?;
+        if !resolved.route_only {
+            validate_prepared_session_data(&session_data)?;
+        }
         let api_key = self
             .inner
             .settings
@@ -1854,10 +1943,9 @@ fn resolve_request_config(
             request,
             route,
             last_messages,
-            committed_messages: _,
+            committed_messages,
             options,
         } => {
-            validate_conversation_messages(last_messages)?;
             let mut request = request.clone();
             if let Some(target_language) = options.target_language {
                 request.target_language = Some(target_language);
@@ -1869,6 +1957,33 @@ fn resolve_request_config(
                 .unwrap_or(route.provider.id.as_str());
             let model_id = options.model_id.as_deref().unwrap_or(route.model.as_str());
             let route = resolve_route(settings, action, provider_id, model_id)?;
+            if action.kind == ActionKind::Ask {
+                if last_messages.is_empty() {
+                    if options.provider_id.is_some() && committed_messages.is_empty() {
+                        return Ok(ResolvedRequestConfig {
+                            session_data: PreparedSessionData {
+                                frozen_request: request,
+                                route,
+                                last_messages: Vec::new(),
+                                committed_messages: Vec::new(),
+                            },
+                            route_only: true,
+                        });
+                    }
+                    return Err(ActionServiceError::NothingToRetry);
+                }
+                validate_conversation_messages(last_messages)?;
+                return Ok(ResolvedRequestConfig {
+                    session_data: PreparedSessionData {
+                        frozen_request: request,
+                        route,
+                        last_messages: last_messages.clone(),
+                        committed_messages: committed_messages.clone(),
+                    },
+                    route_only: false,
+                });
+            }
+            validate_conversation_messages(last_messages)?;
             let prompt = build_prompt(
                 action,
                 &request.source_text,
@@ -1909,7 +2024,90 @@ fn resolve_request_config(
         }
     };
     validate_prepared_session_data(&session_data)?;
-    Ok(ResolvedRequestConfig { session_data })
+    Ok(ResolvedRequestConfig {
+        session_data,
+        route_only: false,
+    })
+}
+
+fn preparation_question(seed: &FrozenPreparationSeed, settings: &AppSettings) -> Option<String> {
+    match seed {
+        FrozenPreparationSeed::Continue { question, .. } => Some(question.trim().to_owned()),
+        FrozenPreparationSeed::Retry {
+            request,
+            last_messages,
+            ..
+        } if settings
+            .actions
+            .iter()
+            .any(|action| action.id == request.action_id && action.kind == ActionKind::Ask) =>
+        {
+            last_messages
+                .last()
+                .filter(|message| message.role == ChatRole::User)
+                .map(|message| message.content.clone())
+        }
+        _ => None,
+    }
+}
+
+fn build_session_transcript(
+    context: &ActionSessionContext,
+    snapshot: &ActionSnapshot,
+) -> Vec<TranscriptTurn> {
+    if context.ask_system.is_none() {
+        return Vec::new();
+    }
+    transcript_for_messages(
+        &context.last_messages,
+        &snapshot.session_id,
+        &snapshot.content,
+        snapshot.content_scalar_count,
+        snapshot.status == ActionSnapshotStatus::Running,
+    )
+}
+
+fn transcript_for_messages(
+    messages: &[ChatMessage],
+    session_id: &str,
+    content: &str,
+    scalar_count: u64,
+    streaming: bool,
+) -> Vec<TranscriptTurn> {
+    let mut turns: Vec<TranscriptTurn> = messages
+        .iter()
+        .filter_map(|message| {
+            let role = match message.role {
+                ChatRole::System => return None,
+                ChatRole::User => TranscriptRole::User,
+                ChatRole::Assistant => TranscriptRole::Assistant,
+            };
+            Some(TranscriptTurn {
+                id: String::new(),
+                role,
+                content: message.content.clone(),
+                streaming: false,
+                scalar_count: message.content.chars().count() as u64,
+            })
+        })
+        .collect();
+    if turns
+        .last()
+        .is_some_and(|turn| turn.role == TranscriptRole::User)
+    {
+        turns.push(TranscriptTurn {
+            id: String::new(),
+            role: TranscriptRole::Assistant,
+            content: content.to_owned(),
+            streaming,
+            scalar_count,
+        });
+    }
+    for (index, turn) in turns.iter_mut().enumerate() {
+        // IDs stay stable across retry, recovery and subsequent questions.
+        turn.id = format!("{session_id}:turn:{index}");
+    }
+    turns
 }
 
 fn validate_prepared_session_data(data: &PreparedSessionData) -> Result<(), ActionServiceError> {
@@ -2146,7 +2344,127 @@ fn detect_translation_language(text: &str) -> TranslationLanguage {
     if cyrillic * 10 >= total * 3 {
         return TranslationLanguage::RuRu;
     }
-    TranslationLanguage::EnUs
+    detect_latin_translation_language(text)
+}
+
+fn detect_latin_translation_language(text: &str) -> TranslationLanguage {
+    const DE: &[&str] = &[
+        "der",
+        "die",
+        "das",
+        "den",
+        "dem",
+        "des",
+        "ein",
+        "eine",
+        "einer",
+        "einem",
+        "einen",
+        "ist",
+        "sind",
+        "und",
+        "mit",
+        "für",
+        "von",
+        "auf",
+        "nicht",
+        "ich",
+        "sie",
+        "wir",
+        "diese",
+        "dies",
+        "dieser",
+        "dieses",
+        "über",
+        "aktuelle",
+        "auswahl",
+        "deutscher",
+        "deutsch",
+        "guten",
+        "tag",
+        "hallo",
+        "danke",
+        "bitte",
+        "übersetzen",
+    ];
+    const FR: &[&str] = &[
+        "le",
+        "la",
+        "les",
+        "des",
+        "du",
+        "un",
+        "une",
+        "est",
+        "sont",
+        "et",
+        "avec",
+        "pour",
+        "dans",
+        "pas",
+        "ce",
+        "ces",
+        "ceci",
+        "cette",
+        "vous",
+        "nous",
+        "français",
+        "texte",
+        "traduire",
+        "bonjour",
+        "merci",
+        "salut",
+        "au",
+        "aux",
+        "être",
+        "été",
+        "où",
+        "à",
+        "déjà",
+    ];
+    const EN: &[&str] = &[
+        "the", "this", "that", "is", "are", "was", "were", "and", "with", "for", "from", "have",
+        "has", "you", "your", "please", "to", "of", "in", "it", "not", "we", "a", "an", "english",
+        "hello", "good", "morning",
+    ];
+    let lowercase = text.to_lowercase();
+    let tokens: Vec<&str> = lowercase
+        .split(|character: char| !character.is_alphabetic())
+        .filter(|word| !word.is_empty())
+        .collect();
+    if tokens.len() == 1 {
+        let word = tokens[0];
+        if matches!(word, "hallo" | "danke" | "bitte") {
+            return TranslationLanguage::DeDe;
+        }
+        if matches!(word, "bonjour" | "merci" | "salut") {
+            return TranslationLanguage::FrFr;
+        }
+    }
+    let words: std::collections::HashSet<&str> = tokens.into_iter().collect();
+    let de = words
+        .iter()
+        .filter(|word| {
+            DE.contains(word) || word.chars().any(|character| "äöüß".contains(character))
+        })
+        .count();
+    let fr = words
+        .iter()
+        .filter(|word| {
+            FR.contains(word)
+                || word
+                    .chars()
+                    .any(|character| "àâæçéèêëîïôœùûÿ".contains(character))
+        })
+        .count();
+    let en = words.iter().filter(|word| EN.contains(word)).count();
+    if de >= 2 && de > fr && de > en {
+        TranslationLanguage::DeDe
+    } else if fr >= 2 && fr > de && fr > en {
+        TranslationLanguage::FrFr
+    } else {
+        TranslationLanguage::EnUs
+    }
 }
 
 /// Default translation target (mirrors TS `defaultTranslationTarget`).
@@ -2381,11 +2699,11 @@ mod tests {
     };
     use super::*;
     use crate::models::{
-        ActionSnapshotStatus, ThinkingCapability, ThinkingCapabilitySource, ThinkingDialect,
-        ThinkingLevel,
+        ActionSnapshotStatus, ActionStreamPayload, ThinkingCapability, ThinkingCapabilitySource,
+        ThinkingDialect, ThinkingLevel,
     };
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Barrier,
     };
 
@@ -2439,13 +2757,19 @@ mod tests {
             thinking_enabled: true,
             thinking_default: None,
         }];
+        for action in settings
+            .actions
+            .iter_mut()
+            .filter(|action| action.kind.is_ai())
+        {
+            action.provider_id = Some(provider_id.to_owned());
+            action.model_id = Some(model_id.to_owned());
+        }
         let action = settings
             .actions
             .iter_mut()
             .find(|action| action.id == "summary")
             .expect("summary action");
-        action.provider_id = Some(provider_id.to_owned());
-        action.model_id = Some(model_id.to_owned());
         action.thinking_mode = thinking_mode;
         settings
     }
@@ -3379,6 +3703,419 @@ mod tests {
             resolved.session_data.last_messages[1].content,
             "这句话什么意思？"
         );
+    }
+
+    #[derive(Default)]
+    struct CountingPreparationSecrets {
+        value: Mutex<Option<String>>,
+        reads: AtomicUsize,
+        fail_reads: AtomicBool,
+    }
+
+    impl crate::settings::SecretStore for CountingPreparationSecrets {
+        fn get(&self, _account: &str) -> Result<Option<String>, SettingsError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.fail_reads.load(Ordering::SeqCst) {
+                return Err(SettingsError::SecretStorage);
+            }
+            Ok(self.value.lock().clone())
+        }
+        fn set(&self, _account: &str, secret: &str) -> Result<(), SettingsError> {
+            *self.value.lock() = Some(secret.to_owned());
+            Ok(())
+        }
+        fn delete(&self, _account: &str) -> Result<(), SettingsError> {
+            *self.value.lock() = None;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn initial_local_preparation_rejects_invalid_configuration_and_key_without_session() {
+        for failure in [
+            "missing-provider",
+            "missing-model",
+            "disabled-provider",
+            "missing-key",
+            "key-storage-error",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let secrets = Arc::new(CountingPreparationSecrets::default());
+            let repository = Arc::new(
+                SettingsRepository::with_secret_store(
+                    directory.path().join("settings.json"),
+                    secrets.clone(),
+                )
+                .unwrap(),
+            );
+            let mut settings =
+                configured_settings("provider-fixture", "fixture-model", ThinkingMode::Off);
+            let action = settings
+                .actions
+                .iter_mut()
+                .find(|action| action.id == "summary")
+                .unwrap();
+            match failure {
+                "missing-provider" => {
+                    action.provider_id = Some(String::new());
+                    action.model_id = Some(String::new());
+                }
+                "missing-model" => {
+                    action.model_id = Some(String::new());
+                }
+                "disabled-provider" => {
+                    settings.providers[0].enabled = false;
+                }
+                _ => {}
+            }
+            repository
+                .update(crate::models::SettingsUpdate {
+                    providers: Some(settings.providers),
+                    actions: Some(settings.actions),
+                    ..Default::default()
+                })
+                .unwrap();
+            secrets.reads.store(0, Ordering::SeqCst);
+            secrets
+                .fail_reads
+                .store(failure == "key-storage-error", Ordering::SeqCst);
+            let service = ActionService::new(repository).unwrap();
+            let error = service
+                .prepare_initial(configured_request("summary", "source"))
+                .err()
+                .expect("invalid local preparation must reject");
+            assert!(
+                service.get_snapshot("session-fixture").is_none(),
+                "{failure}"
+            );
+            assert!(
+                service.context_for_test("session-fixture").is_none(),
+                "{failure}"
+            );
+            let expected_reads =
+                usize::from(matches!(failure, "missing-key" | "key-storage-error"));
+            assert_eq!(
+                secrets.reads.load(Ordering::SeqCst),
+                expected_reads,
+                "{failure}"
+            );
+            if failure == "key-storage-error" {
+                assert!(matches!(
+                    error,
+                    ActionServiceError::Settings(SettingsError::SecretStorage)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn initial_local_preparation_reads_key_once_and_commits_before_network_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(CountingPreparationSecrets::default());
+        let repository = Arc::new(
+            SettingsRepository::with_secret_store(
+                directory.path().join("settings.json"),
+                secrets.clone(),
+            )
+            .unwrap(),
+        );
+        let settings = configured_settings("provider-fixture", "fixture-model", ThinkingMode::Off);
+        repository
+            .update(crate::models::SettingsUpdate {
+                providers: Some(settings.providers),
+                actions: Some(settings.actions),
+                ..Default::default()
+            })
+            .unwrap();
+        repository
+            .set_provider_api_key("provider-fixture", "test-key")
+            .unwrap();
+        secrets.reads.store(0, Ordering::SeqCst);
+        let service = ActionService::new(repository).unwrap();
+        let prepared = service
+            .prepare_initial(configured_request("summary", "source"))
+            .unwrap();
+        assert_eq!(secrets.reads.load(Ordering::SeqCst), 1);
+        let ready = service
+            .begin_ready("session-fixture", "result/session-fixture")
+            .unwrap();
+        assert_eq!(ready.snapshot.request_id, prepared.ticket.request_id);
+        assert_eq!(
+            ready.snapshot.request_generation,
+            prepared.ticket.request_generation
+        );
+        assert_eq!(ready.snapshot.status, ActionSnapshotStatus::Running);
+        assert_eq!(ready.route.unwrap().model_id, "fixture-model");
+        assert_eq!(prepared.api_key, "test-key");
+        assert!(service.clear_session("session-fixture"));
+        assert!(prepared.cancellation.is_cancelled());
+        assert!(service.get_snapshot("session-fixture").is_none());
+    }
+
+    fn ask_fixture() -> (AppSettings, FrozenActionRequest, SessionRoute) {
+        let mut settings =
+            configured_settings("provider-fixture", "fixture-model", ThinkingMode::Off);
+        let ask = settings
+            .actions
+            .iter_mut()
+            .find(|action| action.kind == ActionKind::Ask)
+            .unwrap();
+        ask.enabled = true;
+        ask.provider_id = Some("provider-fixture".to_owned());
+        ask.model_id = Some("fixture-model".to_owned());
+        let mut request = initial_request();
+        request.action_id = ask.id.clone();
+        (
+            settings,
+            FrozenActionRequest::from(&request),
+            fixture_route("fixture-model"),
+        )
+    }
+
+    #[test]
+    fn ask_retry_replays_the_failed_question_and_all_committed_turns() {
+        let (settings, request, route) = ask_fixture();
+        let committed_messages = vec![
+            ChatMessage::system("selection seed".to_owned()),
+            ChatMessage::user("First question".to_owned()),
+            ChatMessage::assistant("First answer".to_owned()),
+        ];
+        let mut last_messages = committed_messages.clone();
+        last_messages.push(ChatMessage::user(
+            "Please convert this amount to RMB".to_owned(),
+        ));
+        let seed = FrozenPreparationSeed::Retry {
+            request,
+            route,
+            last_messages: last_messages.clone(),
+            committed_messages: committed_messages.clone(),
+            options: RetryPreparationOptions::default(),
+        };
+        let resolved =
+            resolve_request_config(&seed, &settings, &request_ticket("retry-ask")).unwrap();
+        assert!(!resolved.route_only);
+        assert_eq!(resolved.session_data.last_messages, last_messages);
+        assert_eq!(resolved.session_data.committed_messages, committed_messages);
+        assert_eq!(
+            preparation_question(&seed, &settings).as_deref(),
+            Some("Please convert this amount to RMB")
+        );
+        let body = protocols::build_base_body(
+            crate::models::ProviderProtocol::OpenAiChat,
+            "fixture-model",
+            &resolved.session_data.last_messages,
+        );
+        assert_eq!(
+            body["messages"][3]["content"],
+            "Please convert this amount to RMB"
+        );
+    }
+
+    #[test]
+    fn empty_ask_model_switch_commits_only_the_route_and_no_empty_chat_turn() {
+        let (settings, request, route) = ask_fixture();
+        let service = test_service();
+        let mut state = service.inner.state.lock();
+        let ticket = state
+            .sessions
+            .open_completed_without_generation(InitialReservationInput {
+                session_id: "session".to_owned(),
+                window_label: "result/session".to_owned(),
+                request_id: "ask-open".to_owned(),
+                action_id: request.action_id.clone(),
+            })
+            .unwrap();
+        state.contexts.insert(
+            "session".to_owned(),
+            ActionSessionContext {
+                session_generation: ticket.session_generation,
+                request_generation: ticket.request_generation,
+                frozen_request: request,
+                route,
+                last_messages: Vec::new(),
+                committed_messages: Vec::new(),
+                ask_system: Some("selection seed".to_owned()),
+            },
+        );
+        let reservation = state
+            .reserve_retry(
+                "session",
+                "switch".to_owned(),
+                RetryPreparationOptions {
+                    provider_id: Some("provider-fixture".to_owned()),
+                    model_id: Some("fixture-model".to_owned()),
+                    target_language: None,
+                },
+                tokio::time::Instant::now(),
+            )
+            .unwrap();
+        let resolved = resolve_request_config(
+            &reservation.seed,
+            &settings,
+            &reservation.reservation.ticket,
+        )
+        .unwrap();
+        assert!(resolved.route_only);
+        assert!(resolved.session_data.last_messages.is_empty());
+        assert_eq!(
+            state.commit_prepared(&reservation.reservation.ticket, resolved.session_data),
+            TransitionResult::Applied
+        );
+        assert_eq!(
+            state
+                .commit_terminal_with_context(
+                    &reservation.reservation.ticket,
+                    TerminalKind::Completed
+                )
+                .unwrap()
+                .result,
+            TransitionResult::Applied
+        );
+        let ready = state.begin_ready("session", "result/session").unwrap();
+        assert_eq!(ready.snapshot.status, ActionSnapshotStatus::Completed);
+        assert!(ready.snapshot.transcript.is_empty());
+        assert!(state.contexts["session"].committed_messages.is_empty());
+        assert_eq!(ready.route.unwrap().model_id, "fixture-model");
+    }
+
+    #[test]
+    fn ask_started_transcript_and_snapshot_recover_duplicate_questions_and_fast_completion() {
+        let service = completed_test_service("session", "first answer");
+        let (settings, _, _) = ask_fixture();
+        {
+            let mut state = service.inner.state.lock();
+            let context = state.contexts.get_mut("session").unwrap();
+            context.ask_system = Some("selection seed".to_owned());
+            context.last_messages = vec![
+                ChatMessage::system("selection seed".to_owned()),
+                ChatMessage::user("same question".to_owned()),
+            ];
+            context.committed_messages = vec![
+                ChatMessage::system("selection seed".to_owned()),
+                ChatMessage::user("same question".to_owned()),
+                ChatMessage::assistant("first answer".to_owned()),
+            ];
+        }
+        let first_ready = service.begin_ready_for_test("session").unwrap();
+        service
+            .inner
+            .state
+            .lock()
+            .sessions
+            .ack_ready(first_ready.ack);
+        let first = first_ready.snapshot.transcript;
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[1].content, "first answer");
+        assert!(!first[1].streaming);
+        let reservation = service
+            .inner
+            .state
+            .lock()
+            .reserve_continue(
+                "session",
+                "same-question-next".to_owned(),
+                "same question".to_owned(),
+                tokio::time::Instant::now(),
+            )
+            .unwrap();
+        let resolved = resolve_request_config(
+            &reservation.seed,
+            &settings,
+            &reservation.reservation.ticket,
+        )
+        .unwrap();
+        assert_eq!(
+            service
+                .commit_prepared_for_test(&reservation.reservation.ticket, resolved.session_data),
+            TransitionResult::Applied
+        );
+        let event_transcript = {
+            let mut state = service.inner.state.lock();
+            let lease = state.sessions.acquire_flusher("session").unwrap();
+            let emit = state.sessions.next_emit(&lease).unwrap();
+            let transcript = match &emit.event.payload {
+                ActionStreamPayload::Started {
+                    transcript: Some(transcript),
+                    question,
+                    provider_id,
+                    model_id,
+                } => {
+                    assert_eq!(question.as_deref(), Some("same question"));
+                    assert_eq!(provider_id.as_deref(), Some("provider-fixture"));
+                    assert_eq!(model_id.as_deref(), Some("fixture-model"));
+                    transcript.clone()
+                }
+                _ => panic!("Ask Started must carry the authoritative transcript"),
+            };
+            state.sessions.finish_emit(&lease, &emit, EmitOutcome::Sent);
+            transcript
+        };
+        let started = service
+            .begin_ready_for_test("session")
+            .unwrap()
+            .snapshot
+            .transcript;
+        assert_eq!(event_transcript, started);
+        assert_eq!(started.len(), 4);
+        assert_eq!(started[0].id, first[0].id);
+        assert_eq!(started[1].id, first[1].id);
+        assert_eq!(started[2].content, "same question");
+        assert_ne!(started[2].id, first[0].id);
+        assert!(started[3].streaming);
+        service.submit_delta_for_test(&reservation.reservation.ticket, "fast answer🙂");
+        service.commit_completed_for_test(&reservation.reservation.ticket);
+        let completed = service
+            .begin_ready_for_test("session")
+            .unwrap()
+            .snapshot
+            .transcript;
+        assert_eq!(completed[3].content, "fast answer🙂");
+        assert_eq!(completed[3].scalar_count, 12);
+        assert!(!completed[3].streaming);
+        let retry = service.reserve_retry_for_test("session").unwrap();
+        let context = service.context_for_test("session").unwrap();
+        let data = PreparedSessionData {
+            frozen_request: context.frozen_request,
+            route: context.route,
+            last_messages: context.last_messages,
+            committed_messages: context.committed_messages,
+        };
+        service.commit_prepared_for_test(&retry.reservation.ticket, data);
+        service.cancel_transition_for_test("session").unwrap();
+        let cancelled = service
+            .begin_ready_for_test("session")
+            .unwrap()
+            .snapshot
+            .transcript;
+        assert_eq!(cancelled.len(), 4);
+        assert!(cancelled[3].content.is_empty());
+        assert!(!cancelled[3].streaming);
+    }
+
+    #[test]
+    fn latin_translation_detection_and_reverse_routing_match_supported_languages() {
+        use TranslationLanguage::{DeDe, FrFr, ZhCn};
+        let fixtures: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../src/shared/__tests__/fixtures/language-detection.json"
+        ))
+        .unwrap();
+        for fixture in fixtures {
+            let text = fixture["text"].as_str().unwrap();
+            let expected: TranslationLanguage =
+                serde_json::from_value(fixture["language"].clone()).unwrap();
+            assert_eq!(detect_translation_language(text), expected, "{text}");
+            if matches!(expected, DeDe | FrFr) {
+                let settings = TranslationSettings {
+                    default_language: ZhCn,
+                    target_language: expected,
+                };
+                assert_eq!(
+                    default_translation_target(detect_translation_language(text), &settings),
+                    ZhCn,
+                    "{text}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -48,15 +48,29 @@ const themeBlocks = Array.from(
 )
 
 describe('appearance themes', () => {
-  it('defines a block for every selectable non-base theme', () => {
+  it('defines a block for every selectable theme, including nested warm previews', () => {
     const ids = new Set(themeBlocks.map((entry) => entry.id))
     const known = new Set<string>(THEME_OPTIONS.map((option) => option.id))
     for (const option of THEME_OPTIONS) {
-      if (option.id === 'warm') continue
       expect(ids.has(option.id), `missing theme block: ${option.id}`).toBe(true)
     }
     for (const id of ids) {
       expect(known.has(id), `unknown theme block: ${id}`).toBe(true)
+    }
+  })
+
+  it('keeps mixed custom-property values behind feature detection', () => {
+    for (const css of [resultCss, stylesCss]) {
+      const enhancement = css.indexOf('@supports (color: color-mix(')
+      expect(enhancement).toBeGreaterThan(0)
+      expect(css.slice(0, enhancement)).not.toMatch(/--[a-z0-9-]+\s*:[^;]*color-mix\(/)
+    }
+    const base = resultCss.match(/\.result-window\s*\{([^}]*)\}/s)?.[1] ?? ''
+    for (const token of [
+      '--result-header-surface', '--result-content-surface', '--result-card-surface',
+      '--result-model-control-surface', '--result-model-menu-surface'
+    ]) {
+      expect(base).toMatch(new RegExp(`${token}:\\s*var\\(--surface-`))
     }
   })
 

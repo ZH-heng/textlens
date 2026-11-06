@@ -18,6 +18,8 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WebviewWindow, WindowEvent,
 };
+#[cfg(any(target_os = "windows", test))]
+use tauri_plugin_global_shortcut::Code;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 use tokio::sync::oneshot;
 use url::{Host, Url};
@@ -31,9 +33,9 @@ use crate::{
     models::{
         ActionKind, ActionNotice, ActionSnapshotStatus, ConnectionTestResult, CreateProviderInput,
         EventSequence, ExecuteActionRequest, HandshakeGeneration, Point as ActionPoint,
-        PublicSettings, RequestGeneration, ResultDismissMode, ResultReadyAck, SessionGeneration,
-        SettingsUpdate, SyncModelsResult, TriggerMode, UpdateProviderInput,
-        WindowSize as SettingsWindowSize,
+        PreparationFailure, PublicSettings, RequestGeneration, ResultDismissMode, ResultReadyAck,
+        SessionGeneration, SettingsUpdate, SyncModelsResult, TranscriptTurn, TriggerMode,
+        UpdateProviderInput, WindowSize as SettingsWindowSize,
     },
     selection::{
         DismissEvent, SelectionBounds, SelectionDirection, SelectionEvent, SelectionEventReceiver,
@@ -205,6 +207,7 @@ pub enum RendererSelectionAnchor {
 #[serde(rename_all = "camelCase")]
 pub struct RendererSelectionPayload {
     selection_id: String,
+    toolbar_max_width: f64,
     text: String,
     source_app: RendererSourceApplication,
     anchor: RendererSelectionAnchor,
@@ -416,7 +419,7 @@ fn host_selection_clear_args(text: &str, bundle_id: Option<&str>) -> Option<Host
 }
 
 impl RendererSelectionPayload {
-    fn new(selection_id: &str, selection: &SelectionPayload) -> Self {
+    fn new(selection_id: &str, selection: &SelectionPayload, toolbar_max_width: f64) -> Self {
         let anchor = selection.bounds.map_or_else(
             || RendererSelectionAnchor::Cursor {
                 x: selection.mouse.current.x,
@@ -431,6 +434,7 @@ impl RendererSelectionPayload {
         );
         Self {
             selection_id: selection_id.to_owned(),
+            toolbar_max_width,
             text: selection.text.clone(),
             source_app: RendererSourceApplication {
                 name: selection.source_app.name.clone(),
@@ -536,6 +540,10 @@ pub struct ResultSessionSnapshot {
     handshake_generation: HandshakeGeneration,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation_notice: Option<ActionNotice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preparation_failure: Option<PreparationFailure>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    transcript: Vec<TranscriptTurn>,
     error_message: String,
     retryable: bool,
     pinned: bool,
@@ -546,6 +554,8 @@ struct ResultSessionMeta {
     selection: CurrentSelection,
     action_id: String,
     pinned: bool,
+    /// Only a successfully revealed action owns the host-clear lease.
+    action_taken_over: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -559,6 +569,7 @@ enum ResultSessionStart {
 fn compose_result_ready_snapshot(
     meta: ResultSessionMeta,
     begin: ActionBeginReady,
+    toolbar_max_width: f64,
 ) -> ResultSessionSnapshot {
     let ActionBeginReady {
         snapshot,
@@ -584,7 +595,11 @@ fn compose_result_ready_snapshot(
         action_id: meta.action_id,
         provider_id,
         model_id,
-        selection: RendererSelectionPayload::new(&meta.selection.id, &meta.selection.payload),
+        selection: RendererSelectionPayload::new(
+            &meta.selection.id,
+            &meta.selection.payload,
+            toolbar_max_width,
+        ),
         status,
         content: snapshot.content,
         thinking_content: snapshot.thinking_content,
@@ -593,6 +608,8 @@ fn compose_result_ready_snapshot(
         content_scalar_count: snapshot.content_scalar_count,
         handshake_generation: ack.handshake_generation,
         generation_notice: snapshot.generation_notice,
+        preparation_failure: snapshot.preparation_failure,
+        transcript: snapshot.transcript,
         error_message: snapshot.error_message.unwrap_or_default(),
         retryable: snapshot.retryable,
         pinned: meta.pinned,
@@ -648,10 +665,58 @@ struct ResultRevealHandshake {
     sender: Option<oneshot::Sender<Result<(), String>>>,
 }
 
+impl ResultRevealHandshake {
+    fn resolve_commit(&mut self, result: Result<(), String>) -> bool {
+        if !self.phase.finish_commit(result.is_ok()) {
+            return self.phase == ResultRevealHandshakePhase::Committed;
+        }
+        if self
+            .sender
+            .take()
+            .is_some_and(|sender| sender.send(result).is_ok())
+        {
+            return true;
+        }
+        // The launcher may have timed out before its cleanup gets this lock.
+        // Reject the commit immediately so its just-shown window is closed.
+        self.phase = ResultRevealHandshakePhase::Failed;
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PendingResultSize {
     revision: u64,
+    epoch: u64,
     size: SettingsWindowSize,
+}
+
+fn settle_pending_result_size_persist(
+    pending_sizes: &Mutex<HashMap<String, PendingResultSize>>,
+    session_id: &str,
+    revision: u64,
+    epoch: u64,
+    current: impl FnOnce() -> (u64, u64),
+    settle: impl FnOnce(),
+) {
+    {
+        let mut sizes = pending_sizes.lock();
+        // Retire this attempt even when its transaction failed or a different
+        // session superseded it, without removing a newer attempt for this one.
+        if !sizes
+            .get(session_id)
+            .is_some_and(|pending| pending.revision == revision && pending.epoch == epoch)
+        {
+            return;
+        }
+        sizes.remove(session_id);
+    }
+    let (current_epoch, latest_revision) = current();
+    // A write may have committed before a newer session resized, but its
+    // completion can arrive after that newer settings snapshot was broadcast.
+    if epoch == current_epoch && revision == latest_revision {
+        settle();
+    }
 }
 
 /// Releases the per-selection launch token on every exit path, including the
@@ -702,8 +767,8 @@ pub struct RuntimeState {
     registered_shortcut: Mutex<Option<Shortcut>>,
     runtime_diagnostics: Mutex<RuntimeDiagnostics>,
     pending_result_sizes: Mutex<HashMap<String, PendingResultSize>>,
-    resize_revision: AtomicU64,
-    latest_result_size: Mutex<Option<SettingsWindowSize>>,
+    resize_revision: Arc<AtomicU64>,
+    latest_result_size: Mutex<Option<PendingResultSize>>,
     last_permission: Mutex<bool>,
     settings_renderer_ready: AtomicBool,
     shutting_down: AtomicBool,
@@ -737,7 +802,7 @@ impl RuntimeState {
             registered_shortcut: Mutex::new(None),
             runtime_diagnostics: Mutex::new(RuntimeDiagnostics::default()),
             pending_result_sizes: Mutex::new(HashMap::new()),
-            resize_revision: AtomicU64::new(0),
+            resize_revision: Arc::new(AtomicU64::new(0)),
             latest_result_size: Mutex::new(None),
             last_permission: Mutex::new(SelectionMonitor::is_accessibility_trusted()),
             settings_renderer_ready: AtomicBool::new(false),
@@ -767,6 +832,15 @@ impl RuntimeState {
     /// over. Result-window selections live inside TextLens's own webview and have
     /// no host highlight to clear.
     fn schedule_selection_host_clear(&self, app: &AppHandle, selection: &CurrentSelection) {
+        self.schedule_selection_host_clear_with_session(app, selection, None);
+    }
+
+    fn schedule_selection_host_clear_with_session(
+        &self,
+        app: &AppHandle,
+        selection: &CurrentSelection,
+        session_id: Option<String>,
+    ) {
         // A Windows UIA provider can block after the last cancellation check
         // and later collapse a new, identical selection. Until the host range
         // can be identified and cleared through an isolated, cancellable
@@ -782,7 +856,12 @@ impl RuntimeState {
             &selection.payload.text,
             Some(selection.payload.source_app.bundle_id.as_str()),
         ) {
-            self.schedule_host_selection_clear(app.clone(), clear, selection.host_clear_generation);
+            self.schedule_host_selection_clear(
+                app.clone(),
+                clear,
+                selection.host_clear_generation,
+                session_id,
+            );
         }
     }
 
@@ -790,7 +869,13 @@ impl RuntimeState {
     /// [`HOST_SELECTION_CLEAR_DELAY_MS`], only while the selection's original
     /// lease remains current. In particular, closing an old result must not
     /// mint a new lease that supersedes a more recent selection.
-    fn schedule_host_selection_clear(&self, app: AppHandle, clear: HostSelectionClear, token: u64) {
+    fn schedule_host_selection_clear(
+        &self,
+        app: AppHandle,
+        clear: HostSelectionClear,
+        token: u64,
+        session_id: Option<String>,
+    ) {
         if !should_fire_pending_host_clear(
             token,
             self.pending_host_clear_token.load(Ordering::Acquire),
@@ -800,6 +885,18 @@ impl RuntimeState {
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_millis(HOST_SELECTION_CLEAR_DELAY_MS)).await;
             let state = app.state::<RuntimeState>();
+            if let Some(session_id) = session_id.as_deref() {
+                let taken_over = state
+                    .result_sessions
+                    .lock()
+                    .get(session_id)
+                    .is_some_and(|meta| meta.action_taken_over);
+                // Local preparation precedes the WebView. The committed route
+                // must still exist when this delayed ownership lease runs.
+                if !taken_over || state.actions.session_route(session_id).is_none() {
+                    return;
+                }
+            }
             if !should_fire_pending_host_clear(
                 token,
                 state.pending_host_clear_token.load(Ordering::Acquire),
@@ -866,7 +963,9 @@ impl RuntimeState {
                     x: dismiss.mouse.x,
                     y: dismiss.mouse.y,
                 };
-                if dismiss.reason == "mouseDown" && self.windows.point_inside_toolbar(app, point) {
+                if matches!(dismiss.reason.as_str(), "mouseDown" | "scroll")
+                    && self.windows.point_inside_toolbar(app, point)
+                {
                     return;
                 }
                 let selection_id = {
@@ -1017,7 +1116,11 @@ impl RuntimeState {
             host_clear_generation,
         };
         let toolbar_selection_id = current.id.clone();
-        let public = RendererSelectionPayload::new(&current.id, &current.payload);
+        let public = RendererSelectionPayload::new(
+            &current.id,
+            &current.payload,
+            self.windows.toolbar_max_width(app, anchor),
+        );
         // Publish before touching the native window. If the toolbar is being
         // replaced, a stage/emit failure must leave this validated selection
         // available for the replacement renderer's `toolbar_ready` replay.
@@ -1129,7 +1232,7 @@ impl RuntimeState {
             });
     }
 
-    pub fn capture_current(&self, app: &AppHandle) {
+    pub fn capture_current(&self, app: &AppHandle, shortcut_key: Option<u32>) {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
@@ -1156,7 +1259,10 @@ impl RuntimeState {
                 // provider probe instead of queueing behind it.
                 #[cfg(target_os = "windows")]
                 let captured = {
-                    let reply = state.selection_monitor.lock().capture_current_async();
+                    let reply = state
+                        .selection_monitor
+                        .lock()
+                        .capture_current_async_with_shortcut_key(shortcut_key);
                     match reply {
                         Ok(reply) => reply.recv_timeout(Duration::from_secs(5)).map_or_else(
                             |_| Err(crate::selection::SelectionError::Internal),
@@ -1166,7 +1272,10 @@ impl RuntimeState {
                     }
                 };
                 #[cfg(not(target_os = "windows"))]
-                let captured = state.selection_monitor.lock().capture_current();
+                let captured = {
+                    let _ = shortcut_key;
+                    state.selection_monitor.lock().capture_current()
+                };
                 if !current() {
                     return;
                 }
@@ -1581,6 +1690,8 @@ impl RuntimeState {
         let result = self.settings.get_settings().result;
         let size = if result.remember_size {
             (*self.latest_result_size.lock())
+                .filter(|pending| pending.epoch == self.settings.result_size_epoch())
+                .map(|pending| pending.size)
                 .or(result.last_size)
                 .unwrap_or(SettingsWindowSize {
                     width: RESULT_DEFAULT_WIDTH,
@@ -1614,6 +1725,7 @@ impl RuntimeState {
                 selection,
                 action_id: action_id.to_owned(),
                 pinned: result.default_pinned,
+                action_taken_over: false,
             },
         );
         let (reveal_sender, reveal_receiver) = oneshot::channel();
@@ -1634,8 +1746,6 @@ impl RuntimeState {
             self.result_sessions.lock().remove(&session_id);
             return Err(format!("无法创建结果窗口：{error}"));
         }
-        #[cfg(not(target_os = "windows"))]
-        self.finish_immediate_result_reveal(&session_id);
         Ok((session_id, request_id, reveal_receiver))
     }
 
@@ -1688,36 +1798,10 @@ impl RuntimeState {
     /// commit has completed. A false return means a timeout/cleanup won the
     /// race and the caller must close any window it just made visible.
     fn finish_result_reveal_commit(&self, session_id: &str, result: Result<(), String>) -> bool {
-        let succeeded = result.is_ok();
-        let sender = {
-            let mut reveals = self.result_reveals.lock();
-            let Some(handshake) = reveals.get_mut(session_id) else {
-                return false;
-            };
-            if !handshake.phase.finish_commit(succeeded) {
-                return handshake.phase == ResultRevealHandshakePhase::Committed;
-            }
-            handshake.sender.take()
-        };
-        if let Some(sender) = sender {
-            let _ = sender.send(result);
-        }
-        true
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    fn finish_immediate_result_reveal(&self, session_id: &str) {
-        let sender = {
-            let mut reveals = self.result_reveals.lock();
-            let Some(handshake) = reveals.get_mut(session_id) else {
-                return;
-            };
-            handshake.phase = ResultRevealHandshakePhase::Committed;
-            handshake.sender.take()
-        };
-        if let Some(sender) = sender {
-            let _ = sender.send(Ok(()));
-        }
+        let mut reveals = self.result_reveals.lock();
+        reveals
+            .get_mut(session_id)
+            .is_some_and(|handshake| handshake.resolve_commit(result))
     }
 
     fn fail_result_reveal_handshake(&self, session_id: &str, message: String) -> bool {
@@ -1745,17 +1829,36 @@ impl RuntimeState {
         self.cleanup_result_session(app, session_id);
     }
 
+    fn take_over_result_selection(&self, app: &AppHandle, session_id: &str) {
+        let selection = {
+            let mut sessions = self.result_sessions.lock();
+            let Some(meta) = sessions.get_mut(session_id) else {
+                return;
+            };
+            meta.action_taken_over = true;
+            meta.selection.clone()
+        };
+        self.schedule_selection_host_clear_with_session(
+            app,
+            &selection,
+            Some(session_id.to_owned()),
+        );
+    }
+
     pub fn cleanup_result_session(&self, app: &AppHandle, session_id: &str) {
         self.fail_result_reveal_handshake(
             session_id,
             "结果窗口在完成显示前被关闭，请重试".to_owned(),
         );
         self.result_reveals.lock().remove(session_id);
+        let prepared = self.actions.session_route(session_id).is_some();
         self.actions.clear_session(session_id);
         if let Some(meta) = self.result_sessions.lock().remove(session_id) {
             // Preserve the original selection's lease. This must not create a
             // fresh generation after a newer selection has been accepted.
-            self.schedule_selection_host_clear(app, &meta.selection);
+            if meta.action_taken_over && prepared {
+                self.schedule_selection_host_clear(app, &meta.selection);
+            }
         }
     }
 
@@ -1825,18 +1928,22 @@ impl RuntimeState {
                                 width: size.width as f64 / scale,
                                 height: size.height as f64 / scale,
                             };
-                            *self.latest_result_size.lock() = Some(logical_size);
+                            // Record the repository epoch with the event, not
+                            // later when the delayed write happens to run.
+                            let epoch = self.settings.result_size_epoch();
                             let revision = self
                                 .resize_revision
                                 .fetch_add(1, Ordering::AcqRel)
                                 .wrapping_add(1);
-                            self.pending_result_sizes.lock().insert(
-                                session_id.clone(),
-                                PendingResultSize {
-                                    revision,
-                                    size: logical_size,
-                                },
-                            );
+                            let pending = PendingResultSize {
+                                revision,
+                                epoch,
+                                size: logical_size,
+                            };
+                            *self.latest_result_size.lock() = Some(pending);
+                            self.pending_result_sizes
+                                .lock()
+                                .insert(session_id.clone(), pending);
                             self.schedule_resize_persist(app.clone(), session_id, revision);
                         }
                     }
@@ -1845,7 +1952,13 @@ impl RuntimeState {
             WindowEvent::ScaleFactorChanged { .. } => {
                 self.windows.ignore_resize_temporarily(label);
             }
-            WindowEvent::CloseRequested { .. } => {
+            WindowEvent::CloseRequested { api, .. } => {
+                // Tauri queues close() even on the UI thread. Revalidate an
+                // automatic close after any intervening focus/pointer/pin IPC.
+                if !self.windows.accept_result_close_request(app, label) {
+                    api.prevent_close();
+                    return;
+                }
                 self.persist_result_size_now(app, label);
             }
             WindowEvent::Destroyed => {
@@ -1909,10 +2022,14 @@ impl RuntimeState {
         let app_handle = app.clone();
         let tracked_session = session_id.to_owned();
         let tracked_revision = pending.revision;
+        let tracked_epoch = pending.epoch;
+        let latest_revision = Arc::clone(&self.resize_revision);
         tauri::async_runtime::spawn(async move {
             let result = tauri::async_runtime::spawn_blocking(move || {
                 settings
-                    .update_result_last_size(pending.size)
+                    .update_result_last_size_if_epoch_and(pending.size, pending.epoch, || {
+                        latest_revision.load(Ordering::Acquire) == pending.revision
+                    })
                     .map_err(|error| error.to_string())
             })
             .await
@@ -1926,6 +2043,7 @@ impl RuntimeState {
                         &app_for_main,
                         &settle_session,
                         tracked_revision,
+                        tracked_epoch,
                         result,
                     );
             });
@@ -1937,29 +2055,30 @@ impl RuntimeState {
         app: &AppHandle,
         session_id: &str,
         revision: u64,
-        result: Result<PublicSettings, String>,
+        epoch: u64,
+        result: Result<Option<PublicSettings>, String>,
     ) {
-        {
-            let mut sizes = self.pending_result_sizes.lock();
-            // A newer resize supersedes this write regardless of its outcome;
-            // without removal a failed transaction would leak the entry until
-            // process exit.
-            if !sizes
-                .get(session_id)
-                .is_some_and(|current| current.revision == revision)
-            {
-                return;
-            }
-            sizes.remove(session_id);
-        }
-        match result {
-            Ok(public) => {
-                let _ = app.emit(SETTINGS_CHANGED_EVENT, public);
-            }
-            Err(error) => {
-                eprintln!("[TextLens] 结果窗尺寸持久化失败：{error}");
-            }
-        }
+        settle_pending_result_size_persist(
+            &self.pending_result_sizes,
+            session_id,
+            revision,
+            epoch,
+            || {
+                (
+                    self.settings.result_size_epoch(),
+                    self.resize_revision.load(Ordering::Acquire),
+                )
+            },
+            || match result {
+                Ok(Some(public)) => {
+                    let _ = app.emit(SETTINGS_CHANGED_EVENT, public);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("[TextLens] 结果窗尺寸持久化失败：{error}");
+                }
+            },
+        );
     }
 
     fn schedule_resize_persist(&self, app: AppHandle, session_id: String, revision: u64) {
@@ -2092,8 +2211,91 @@ pub fn handle_global_shortcut(app: &AppHandle, shortcut: &Shortcut, event: Short
         settings.trigger.mode,
         settings.capture_shortcut.as_str(),
     ) {
-        state.capture_current(app);
+        #[cfg(target_os = "windows")]
+        let shortcut_key = shortcut_primary_virtual_key(shortcut.key);
+        #[cfg(not(target_os = "windows"))]
+        let shortcut_key = None;
+        state.capture_current(app, shortcut_key);
     }
+}
+
+/// Keep the tail-key exemption aligned with global-hotkey's Windows mapping.
+/// An unknown key receives no exemption; other physical input still cancels.
+#[cfg(any(target_os = "windows", test))]
+fn shortcut_primary_virtual_key(key: Code) -> Option<u32> {
+    use Code::*;
+    const LETTERS: [Code; 26] = [
+        KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO,
+        KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ,
+    ];
+    const DIGITS: [Code; 10] = [
+        Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9,
+    ];
+    const FUNCTION_KEYS: [Code; 24] = [
+        F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20,
+        F21, F22, F23, F24,
+    ];
+    const NUMPAD: [Code; 10] = [
+        Numpad0, Numpad1, Numpad2, Numpad3, Numpad4, Numpad5, Numpad6, Numpad7, Numpad8, Numpad9,
+    ];
+    for (codes, first) in [
+        (&LETTERS[..], 0x41),
+        (&DIGITS[..], 0x30),
+        (&FUNCTION_KEYS[..], 0x70),
+        (&NUMPAD[..], 0x60),
+    ] {
+        if let Some(index) = codes.iter().position(|code| *code == key) {
+            return Some(first + index as u32);
+        }
+    }
+    Some(match key {
+        Equal => 0xbb,
+        Comma => 0xbc,
+        Minus => 0xbd,
+        Period => 0xbe,
+        Semicolon => 0xba,
+        Slash => 0xbf,
+        Backquote => 0xc0,
+        BracketLeft => 0xdb,
+        Backslash => 0xdc,
+        BracketRight => 0xdd,
+        Quote => 0xde,
+        Backspace => 0x08,
+        Tab => 0x09,
+        Space => 0x20,
+        Enter | NumpadEnter => 0x0d,
+        CapsLock => 0x14,
+        Escape => 0x1b,
+        PageUp => 0x21,
+        PageDown => 0x22,
+        End => 0x23,
+        Home => 0x24,
+        ArrowLeft => 0x25,
+        ArrowUp => 0x26,
+        ArrowRight => 0x27,
+        ArrowDown => 0x28,
+        PrintScreen => 0x2c,
+        Insert => 0x2d,
+        Delete => 0x2e,
+        NumLock => 0x90,
+        ScrollLock => 0x91,
+        NumpadAdd => 0x6b,
+        NumpadDecimal => 0x6e,
+        NumpadDivide => 0x6f,
+        NumpadEqual => 0x45,
+        NumpadMultiply => 0x6a,
+        NumpadSubtract => 0x6d,
+        AudioVolumeDown => 0xae,
+        AudioVolumeUp => 0xaf,
+        AudioVolumeMute => 0xad,
+        MediaPlay => 0xfa,
+        MediaPause | Pause => 0x13,
+        MediaPlayPause => 0xb3,
+        MediaStop => 0xb2,
+        MediaTrackNext => 0xb0,
+        MediaTrackPrevious => 0xb1,
+        _ => return None,
+    })
 }
 
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -2417,13 +2619,20 @@ where
 {
     let (sender, receiver) = oneshot::channel();
     app.run_on_main_thread(move || {
-        let _ignored = sender.send(operation());
+        complete_main_thread_operation(sender, operation);
     })
     .map_err(|error| error.to_string())?;
     match tokio::time::timeout(MAIN_THREAD_HOP_TIMEOUT, receiver).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(_)) => Err("主线程调度器已退出".to_owned()),
         Err(_) => Err("主线程调度超时".to_owned()),
+    }
+}
+
+fn complete_main_thread_operation<T>(sender: oneshot::Sender<T>, operation: impl FnOnce() -> T) {
+    // A timed-out command must not mutate native state later from the queue.
+    if !sender.is_closed() {
+        let _ = sender.send(operation());
     }
 }
 
@@ -2439,6 +2648,10 @@ where
         .await
         .map_err(|error| format!("设置任务调度失败：{error}"))?
         .map_err(|error| error.to_string())
+}
+
+fn flatten_main_thread_result<T>(result: Result<Result<T, String>, String>) -> Result<T, String> {
+    result.and_then(|result| result)
 }
 
 async fn broadcast_settings_changed(
@@ -2516,13 +2729,14 @@ pub async fn update_settings(
         Err(error) => {
             if let Some(previous) = previous_shortcut {
                 let app_for_rollback = app.clone();
-                if let Err(rollback_error) = run_on_main_thread(&app, move || {
-                    app_for_rollback
-                        .state::<RuntimeState>()
-                        .switch_shortcut(&app_for_rollback, &previous)
-                })
-                .await
-                {
+                if let Err(rollback_error) = flatten_main_thread_result(
+                    run_on_main_thread(&app, move || {
+                        app_for_rollback
+                            .state::<RuntimeState>()
+                            .switch_shortcut(&app_for_rollback, &previous)
+                    })
+                    .await,
+                ) {
                     // The registration is now neither the requested nor the
                     // previous shortcut while the settings file still holds
                     // the previous value. Surface the loss instead of letting
@@ -2737,9 +2951,15 @@ pub fn toolbar_ready(
             );
         }
     }
-    Ok(current
-        .as_ref()
-        .map(|selection| RendererSelectionPayload::new(&selection.id, &selection.payload)))
+    Ok(current.as_ref().map(|selection| {
+        RendererSelectionPayload::new(
+            &selection.id,
+            &selection.payload,
+            state
+                .windows
+                .toolbar_max_width(&app, selection_toolbar_anchor(&selection.payload).0),
+        )
+    }))
 }
 
 fn toolbar_commit_matches_selection(current_id: Option<&str>, requested_id: &str) -> bool {
@@ -2939,7 +3159,6 @@ pub async fn run_action(
         }
         _ if action.kind.opens_result_without_generation() => {
             let cursor = action_result_cursor(&app, cursor, &selection.payload);
-            state.schedule_selection_host_clear(&app, &selection);
             match state.create_ask_result_session(&app, &action.id, &action.name, selection, cursor)
             {
                 Ok((session_id, request_id, reveal_receiver)) => {
@@ -2950,6 +3169,7 @@ pub async fn run_action(
                     .await
                     {
                         Ok(()) => {
+                            state.take_over_result_selection(&app, &session_id);
                             state.clear_and_hide_current_selection_if(&app, &selection_token);
                             // Do NOT restore_source_app_activation here: default
                             // result dismiss is Blur; activating the source app
@@ -2967,7 +3187,6 @@ pub async fn run_action(
         }
         _ if action.kind.is_ai() => {
             let cursor = action_result_cursor(&app, cursor, &selection.payload);
-            state.schedule_selection_host_clear(&app, &selection);
             match state.create_result_session(&app, &action.id, &action.name, selection, cursor) {
                 Ok((session_id, request_id, reveal_receiver)) => {
                     // Window creation has its own bounded error path. Start
@@ -2981,6 +3200,7 @@ pub async fn run_action(
                     .await
                     {
                         Ok(()) => {
+                            state.take_over_result_selection(&app, &session_id);
                             state.clear_and_hide_current_selection_if(&app, &selection_token);
                             // Do NOT restore_source_app_activation here: default
                             // result dismiss is Blur; activating the source app
@@ -3072,6 +3292,7 @@ pub fn report_toolbar_size(
 
 #[tauri::command]
 pub fn begin_result_ready(
+    app: AppHandle,
     window: WebviewWindow,
     state: State<'_, RuntimeState>,
     session_id: String,
@@ -3087,7 +3308,10 @@ pub fn begin_result_ready(
         .actions
         .begin_ready(&session_id, window.label())
         .map_err(|error| error.to_string())?;
-    Ok(compose_result_ready_snapshot(meta, begin))
+    let width = state
+        .windows
+        .toolbar_max_width(&app, selection_toolbar_anchor(&meta.selection.payload).0);
+    Ok(compose_result_ready_snapshot(meta, begin, width))
 }
 
 #[tauri::command]
@@ -3271,7 +3495,17 @@ pub fn show_result_selection(
         source_result_session_id: Some(session_id.clone()),
         host_clear_generation: state.cancel_pending_host_selection_clear(),
     };
-    let public = RendererSelectionPayload::new(&current.id, &current.payload);
+    let public = RendererSelectionPayload::new(
+        &current.id,
+        &current.payload,
+        state.windows.toolbar_max_width(
+            &app,
+            WindowPoint {
+                x: cursor.x,
+                y: cursor.y,
+            },
+        ),
+    );
     let toolbar_anchor = WindowPoint {
         x: cursor.x,
         y: cursor.y,
@@ -3860,6 +4094,137 @@ mod tests {
         selection::SelectionBounds,
     };
 
+    #[test]
+    fn result_size_settle_does_not_broadcast_a_delayed_older_session() {
+        let old = PendingResultSize {
+            revision: 1,
+            epoch: 7,
+            size: SettingsWindowSize {
+                width: 500.0,
+                height: 300.0,
+            },
+        };
+        let latest = PendingResultSize {
+            revision: 2,
+            epoch: 7,
+            size: SettingsWindowSize {
+                width: 700.0,
+                height: 400.0,
+            },
+        };
+        let pending = Mutex::new(HashMap::from([
+            ("session-a".to_owned(), old),
+            ("session-b".to_owned(), latest),
+        ]));
+        let latest_revision = AtomicU64::new(latest.revision);
+        let current_epoch = AtomicU64::new(latest.epoch);
+        let mut old_public =
+            PublicSettings::from_settings(&crate::models::AppSettings::default(), |_| false);
+        old_public.result.last_size = Some(old.size);
+        let mut latest_public = old_public.clone();
+        latest_public.result.last_size = Some(latest.size);
+        let mut emitted = Vec::new();
+
+        // Both writes committed in order, but session B's callback arrived first.
+        settle_pending_result_size_persist(
+            &pending,
+            "session-b",
+            latest.revision,
+            latest.epoch,
+            || {
+                (
+                    current_epoch.load(Ordering::Acquire),
+                    latest_revision.load(Ordering::Acquire),
+                )
+            },
+            || emitted.push(latest_public.clone()),
+        );
+        assert_eq!(emitted, vec![latest_public.clone()]);
+        assert_eq!(pending.lock().len(), 1);
+        assert!(pending.lock().contains_key("session-a"));
+
+        settle_pending_result_size_persist(
+            &pending,
+            "session-a",
+            old.revision,
+            old.epoch,
+            || {
+                (
+                    current_epoch.load(Ordering::Acquire),
+                    latest_revision.load(Ordering::Acquire),
+                )
+            },
+            || emitted.push(old_public),
+        );
+        assert_eq!(emitted, vec![latest_public]);
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn result_size_settle_preserves_a_newer_attempt_in_the_same_session() {
+        let latest = PendingResultSize {
+            revision: 3,
+            epoch: 7,
+            size: SettingsWindowSize {
+                width: 800.0,
+                height: 600.0,
+            },
+        };
+        let pending = Mutex::new(HashMap::from([("session-a".to_owned(), latest)]));
+        let mut emitted = Vec::new();
+
+        settle_pending_result_size_persist(
+            &pending,
+            "session-a",
+            2,
+            7,
+            || (7, 3),
+            || emitted.push(2),
+        );
+        assert!(emitted.is_empty());
+        let still_pending = pending.lock().get("session-a").copied().unwrap();
+        assert_eq!(still_pending.revision, latest.revision);
+        assert_eq!(still_pending.epoch, latest.epoch);
+        assert_eq!(still_pending.size, latest.size);
+
+        settle_pending_result_size_persist(
+            &pending,
+            "session-a",
+            latest.revision,
+            latest.epoch,
+            || (7, 3),
+            || emitted.push(3),
+        );
+        assert_eq!(emitted, vec![3]);
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn result_size_settle_retires_a_matching_attempt_after_size_reset() {
+        let pending = Mutex::new(HashMap::from([(
+            "session-a".to_owned(),
+            PendingResultSize {
+                revision: 2,
+                epoch: 7,
+                size: SettingsWindowSize {
+                    width: 800.0,
+                    height: 600.0,
+                },
+            },
+        )]));
+        let mut emitted = Vec::new();
+        settle_pending_result_size_persist(
+            &pending,
+            "session-a",
+            2,
+            7,
+            || (8, 2),
+            || emitted.push(2),
+        );
+        assert!(emitted.is_empty());
+        assert!(pending.lock().is_empty());
+    }
+
     fn result_meta() -> ResultSessionMeta {
         ResultSessionMeta {
             selection: CurrentSelection {
@@ -3893,6 +4258,7 @@ mod tests {
             },
             action_id: "translate".to_owned(),
             pinned: false,
+            action_taken_over: false,
         }
     }
 
@@ -3938,6 +4304,8 @@ mod tests {
                 error_code: None,
                 error_message: None,
                 retryable: false,
+                preparation_failure: None,
+                transcript: Vec::new(),
             },
             ack: ResultReadyAck {
                 session_id: "s".to_owned(),
@@ -3972,6 +4340,8 @@ mod tests {
                 error_code: None,
                 error_message: None,
                 retryable: false,
+                preparation_failure: None,
+                transcript: Vec::new(),
             },
             ack: ResultReadyAck {
                 session_id: "s".into(),
@@ -3986,7 +4356,7 @@ mod tests {
                 thinking_mode: crate::models::ThinkingMode::Off,
             }),
         };
-        let result = compose_result_ready_snapshot(result_meta(), begin);
+        let result = compose_result_ready_snapshot(result_meta(), begin, 900.0);
         assert_eq!(result.last_sequence, EventSequence(12));
         assert_eq!(result.last_content_sequence, EventSequence(11));
         assert_eq!(result.handshake_generation, HandshakeGeneration(4));
@@ -4003,7 +4373,7 @@ mod tests {
 
     #[test]
     fn result_ready_snapshot_before_initial_prepare_has_optional_route_fields() {
-        let result = compose_result_ready_snapshot(result_meta(), initial_preparing_begin());
+        let result = compose_result_ready_snapshot(result_meta(), initial_preparing_begin(), 900.0);
         assert_eq!(result.provider_id, None);
         assert_eq!(result.model_id, None);
     }
@@ -4042,6 +4412,8 @@ mod tests {
                 error_code: None,
                 error_message: None,
                 retryable: false,
+                preparation_failure: None,
+                transcript: Vec::new(),
             },
             ack: ResultReadyAck {
                 session_id: "session-fixture".to_owned(),
@@ -4052,7 +4424,8 @@ mod tests {
             },
             route: None,
         };
-        let actual = serde_json::to_value(compose_result_ready_snapshot(meta, begin)).unwrap();
+        let actual =
+            serde_json::to_value(compose_result_ready_snapshot(meta, begin, 900.0)).unwrap();
         let expected: serde_json::Value = serde_json::from_str(include_str!(
             "../../src/shared/__tests__/fixtures/result-session-snapshot.json"
         ))
@@ -4188,6 +4561,112 @@ mod tests {
         // Only the effective registration changes; the saved configuration is
         // retained for a later switch back to shortcut mode.
         assert_eq!(configured, "CommandOrControl+Shift+S");
+    }
+
+    #[test]
+    fn shortcut_primary_virtual_key_matches_windows_physical_key_codes() {
+        // Includes range boundaries, the default shortcut, and keys whose
+        // numpad or media identity differs from their printed character.
+        for (key, expected) in [
+            (Code::KeyA, 0x41),
+            (Code::KeyS, 0x53),
+            (Code::KeyZ, 0x5a),
+            (Code::Digit0, 0x30),
+            (Code::Digit9, 0x39),
+            (Code::F1, 0x70),
+            (Code::F12, 0x7b),
+            (Code::F24, 0x87),
+            (Code::Numpad0, 0x60),
+            (Code::Numpad9, 0x69),
+            (Code::Equal, 0xbb),
+            (Code::BracketRight, 0xdd),
+            (Code::Enter, 0x0d),
+            (Code::NumpadEnter, 0x0d),
+            (Code::ArrowLeft, 0x25),
+            (Code::Delete, 0x2e),
+            (Code::NumpadAdd, 0x6b),
+            // global-hotkey 0.8 maps NumpadEqual to VK_E on Windows.
+            (Code::NumpadEqual, 0x45),
+            (Code::AudioVolumeMute, 0xad),
+            (Code::MediaPlay, 0xfa),
+            (Code::MediaPlayPause, 0xb3),
+            (Code::MediaPause, 0x13),
+            (Code::Pause, 0x13),
+        ] {
+            assert_eq!(shortcut_primary_virtual_key(key), Some(expected), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn shortcut_primary_virtual_key_uses_configured_primary_key_and_rejects_unknowns() {
+        for configured in ["Ctrl+Shift+S", "Control+Shift+S", "Alt+S"] {
+            let shortcut = configured.parse::<Shortcut>().unwrap();
+            assert_eq!(shortcut_primary_virtual_key(shortcut.key), Some(0x53));
+        }
+        // Unsupported keys must grant no tail-key exemption to unrelated input.
+        for key in [
+            Code::ShiftLeft,
+            Code::ShiftRight,
+            Code::ControlLeft,
+            Code::AltLeft,
+            Code::MetaLeft,
+            Code::IntlBackslash,
+            Code::Unidentified,
+        ] {
+            assert_eq!(shortcut_primary_virtual_key(key), None, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn flatten_main_thread_result_preserves_operation_and_dispatch_failures() {
+        assert_eq!(flatten_main_thread_result(Ok(Ok(7))), Ok(7));
+        let rollback_error = "快捷键恢复注册失败".to_owned();
+        assert_eq!(
+            flatten_main_thread_result::<()>(Ok(Err(rollback_error.clone()))),
+            Err(rollback_error)
+        );
+        let dispatch_error = "主线程调度超时".to_owned();
+        assert_eq!(
+            flatten_main_thread_result::<()>(Err(dispatch_error.clone())),
+            Err(dispatch_error)
+        );
+    }
+
+    #[test]
+    fn complete_main_thread_operation_skips_mutation_after_receiver_is_dropped() {
+        let (sender, receiver) = oneshot::channel::<usize>();
+        let mut mutations = 0;
+        drop(receiver);
+        complete_main_thread_operation(sender, || {
+            mutations += 1;
+            mutations
+        });
+        assert_eq!(mutations, 0);
+    }
+
+    #[test]
+    fn complete_main_thread_operation_skips_mutation_after_receiver_is_closed() {
+        let (sender, mut receiver) = oneshot::channel::<usize>();
+        let mut mutations = 0;
+        receiver.close();
+        complete_main_thread_operation(sender, || {
+            mutations += 1;
+            mutations
+        });
+        assert_eq!(mutations, 0);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_main_thread_operation_executes_once_and_delivers_its_result() {
+        let (sender, receiver) = oneshot::channel();
+        let mut mutations = 0;
+        complete_main_thread_operation(sender, || {
+            mutations += 1;
+            (mutations, "registered")
+        });
+        assert_eq!(receiver.await.unwrap(), (1, "registered"));
+        assert_eq!(mutations, 1);
     }
 
     #[test]
@@ -4439,6 +4918,50 @@ mod tests {
         assert!(failed.finish_commit(false));
         assert_eq!(failed, ResultRevealHandshakePhase::Failed);
         assert_eq!(failed.begin_commit(), Err(()));
+    }
+
+    #[tokio::test]
+    async fn result_reveal_commit_resolves_the_launcher_once() {
+        let (sender, receiver) = oneshot::channel();
+        let mut handshake = ResultRevealHandshake {
+            phase: ResultRevealHandshakePhase::Pending,
+            sender: Some(sender),
+        };
+        assert_eq!(handshake.phase.begin_commit(), Ok(true));
+        assert!(handshake.resolve_commit(Ok(())));
+        assert_eq!(receiver.await.unwrap(), Ok(()));
+        assert_eq!(handshake.phase, ResultRevealHandshakePhase::Committed);
+        assert!(handshake.sender.is_none());
+        assert!(handshake.resolve_commit(Ok(())));
+    }
+
+    #[test]
+    fn result_reveal_commit_rejects_a_launcher_that_already_timed_out() {
+        let (sender, receiver) = oneshot::channel();
+        let mut handshake = ResultRevealHandshake {
+            phase: ResultRevealHandshakePhase::Committing,
+            sender: Some(sender),
+        };
+        drop(receiver);
+        assert!(!handshake.resolve_commit(Ok(())));
+        assert_eq!(handshake.phase, ResultRevealHandshakePhase::Failed);
+        assert_eq!(handshake.phase.begin_commit(), Err(()));
+        assert!(!handshake.resolve_commit(Ok(())));
+    }
+
+    #[tokio::test]
+    async fn result_reveal_commit_delivers_a_native_failure_without_committing() {
+        let (sender, receiver) = oneshot::channel();
+        let mut handshake = ResultRevealHandshake {
+            phase: ResultRevealHandshakePhase::Committing,
+            sender: Some(sender),
+        };
+        assert!(handshake.resolve_commit(Err("native reveal failed".to_owned())));
+        assert_eq!(
+            receiver.await.unwrap(),
+            Err("native reveal failed".to_owned())
+        );
+        assert_eq!(handshake.phase, ResultRevealHandshakePhase::Failed);
     }
 
     #[tokio::test]

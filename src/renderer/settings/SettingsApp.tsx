@@ -79,6 +79,7 @@ import {
   type TranslationLanguage
 } from '../../shared'
 import { ActionIcon } from '../components/ActionIcon'
+import { Dialog } from '../components/Dialog'
 import { runDetached } from '../lib/asyncEffects'
 import { getErrorMessage } from '../lib/errors'
 import { applyTheme } from '../lib/theme'
@@ -375,9 +376,50 @@ export function SettingsApp(): JSX.Element {
   const quittingRef = useRef(false)
   // Tracks in-flight lazy key reveals so re-entry is ignored and the eye can disable.
   const keyRevealInFlightRef = useRef(new Set<string>())
+  const keyRevealTokensRef = useRef(new Map<string, symbol>())
+  const draftRevisionRef = useRef(0)
+  const savingRef = useRef(false)
+  const draftRef = useRef(draft)
+  draftRef.current = draft
+  const captureRuleKeysRef = useRef<string[]>([])
+  while (captureRuleKeysRef.current.length < (draft?.selectionCapture.applications.length ?? 0)) {
+    captureRuleKeysRef.current.push(createId('capture-rule'))
+  }
   const [keyRevealInFlight, setKeyRevealInFlight] = useState<Record<string, boolean>>({})
   const keyInputsRef = useRef(keyInputs)
   keyInputsRef.current = keyInputs
+  const keyBaselinesRef = useRef(keyBaselines)
+  keyBaselinesRef.current = keyBaselines
+  const updateKeyInputs = useCallback((update: (current: Record<string, string>) => Record<string, string>): void => {
+    const next = update(keyInputsRef.current)
+    keyInputsRef.current = next
+    setKeyInputs(next)
+  }, [])
+  const updateKeyBaselines = useCallback((update: (current: Record<string, string>) => Record<string, string>): void => {
+    const next = update(keyBaselinesRef.current)
+    keyBaselinesRef.current = next
+    setKeyBaselines(next)
+  }, [])
+  const invalidateKeyReveals = useCallback((providerId?: string): void => {
+    if (providerId) {
+      keyRevealTokensRef.current.delete(providerId)
+      keyRevealInFlightRef.current.delete(providerId)
+      setKeyRevealInFlight((current) => {
+        const next = { ...current }
+        delete next[providerId]
+        return next
+      })
+    } else {
+      keyRevealTokensRef.current.clear()
+      keyRevealInFlightRef.current.clear()
+      setKeyRevealInFlight({})
+    }
+  }, [])
+  const hasUnsavedChanges = (): boolean => dirtyRef.current || [...new Set([
+    ...Object.keys(keyInputsRef.current), ...Object.keys(keyBaselinesRef.current)
+  ])].some(
+    (id) => (keyInputsRef.current[id] ?? '') !== (keyBaselinesRef.current[id] ?? '')
+  )
   const dragSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
@@ -524,10 +566,11 @@ export function SettingsApp(): JSX.Element {
   // Clear local key fields without fetching secrets. Saved keys stay in the
   // secret store; the form shows a placeholder until the user clicks show.
   const resetProviderKeyFields = useCallback((): void => {
-    setKeyInputs({})
-    setKeyBaselines({})
+    invalidateKeyReveals()
+    updateKeyInputs(() => ({}))
+    updateKeyBaselines(() => ({}))
     setKeyVisible({})
-  }, [])
+  }, [invalidateKeyReveals, updateKeyInputs, updateKeyBaselines])
 
   const revealProviderApiKey = useCallback(async (
     provider: PublicProviderSettings
@@ -547,35 +590,46 @@ export function SettingsApp(): JSX.Element {
       && provider.keyConfigured
       && window.textLens.getProviderApiKey
     ) {
+      const token = Symbol(provider.id)
+      keyRevealTokensRef.current.set(provider.id, token)
       keyRevealInFlightRef.current.add(provider.id)
       setKeyRevealInFlight((current) => ({ ...current, [provider.id]: true }))
       try {
         const key = await window.textLens.getProviderApiKey(provider.id)
+        if (keyRevealTokensRef.current.get(provider.id) !== token || !draftRef.current?.providers.some((item) => item.id === provider.id)) return
         if (typeof key === 'string' && key.length > 0) {
           // Only fill fields that are still empty — concurrent typing must not be clobbered.
-          setKeyInputs((current) => {
-            if ((current[provider.id] ?? '') !== '') return current
-            return { ...current, [provider.id]: key }
-          })
-          setKeyBaselines((current) => {
+          updateKeyBaselines((current) => {
             // Same empty-guard as keyInputs (ref mirrors latest typed value across the await).
             if ((keyInputsRef.current[provider.id] ?? '') !== '') return current
             return { ...current, [provider.id]: key }
           })
+          updateKeyInputs((current) => {
+            if ((current[provider.id] ?? '') !== '') return current
+            return { ...current, [provider.id]: key }
+          })
         }
+        setKeyVisible((current) => ({ ...current, [provider.id]: true }))
       } catch {
-        // Keep empty when a key cannot be revealed; placeholder still shows configured state.
+        // Only the still-current reveal may change the visibility affordance.
+        if (keyRevealTokensRef.current.get(provider.id) === token) {
+          setKeyVisible((current) => ({ ...current, [provider.id]: true }))
+        }
       } finally {
-        keyRevealInFlightRef.current.delete(provider.id)
-        setKeyRevealInFlight((current) => {
-          const next = { ...current }
-          delete next[provider.id]
-          return next
-        })
+        if (keyRevealTokensRef.current.get(provider.id) === token) {
+          keyRevealTokensRef.current.delete(provider.id)
+          keyRevealInFlightRef.current.delete(provider.id)
+          setKeyRevealInFlight((current) => {
+            const next = { ...current }
+            delete next[provider.id]
+            return next
+          })
+        }
       }
+      return
     }
     setKeyVisible((current) => ({ ...current, [provider.id]: true }))
-  }, [keyInputs, keyVisible])
+  }, [keyInputs, keyVisible, updateKeyInputs, updateKeyBaselines])
 
   useEffect(() => {
     let disposed = false
@@ -602,7 +656,7 @@ export function SettingsApp(): JSX.Element {
       })
 
     const unsubscribe = window.textLens.onSettingsChanged((settings) => {
-      if (!dirtyRef.current && !unsavedChangesRef.current) {
+      if (!savingRef.current && !dirtyRef.current && !unsavedChangesRef.current) {
         const normalized = normalizePublicSettings(settings)
         setDraft(normalized)
         applyTheme(normalized.appearance.theme)
@@ -628,6 +682,7 @@ export function SettingsApp(): JSX.Element {
   }, [resetProviderKeyFields, refreshRuntimeStatus])
 
   const changeDraft = useCallback((updater: (current: PublicSettings) => PublicSettings): void => {
+    draftRevisionRef.current += 1
     setDraft((current) => (current ? updater(current) : current))
     dirtyRef.current = true
     setDirty(true)
@@ -650,90 +705,119 @@ export function SettingsApp(): JSX.Element {
     () => sortAndNumberActions(draft?.actions ?? []).filter((action) => !action.enabled),
     [draft?.actions]
   )
+  const applySavedSettings = (saved: PublicSettings, revision: number): void => {
+    const normalized = normalizePublicSettings(saved)
+    const newerDraft = draftRevisionRef.current !== revision
+    setDraft((current) => {
+      if (!current || !newerDraft) return normalized
+      const configured = new Map(normalized.providers.map((provider) => [provider.id, provider.keyConfigured]))
+      return { ...current, providers: current.providers.map((provider) => configured.has(provider.id)
+        ? { ...provider, keyConfigured: configured.get(provider.id)! }
+        : provider) }
+    })
+    dirtyRef.current = newerDraft
+    setDirty(newerDraft)
+    applyTheme(saved.appearance.theme)
+    if (newerDraft && draftRef.current) applyTheme(draftRef.current.appearance.theme, false)
+  }
+
+  const acknowledgeKeyWrite = (providerId: string, submitted: string, savedKey: string): void => {
+    if (!draftRef.current?.providers.some((provider) => provider.id === providerId)) return
+    const unchanged = (keyInputsRef.current[providerId] ?? '') === submitted
+    updateKeyBaselines((current) => {
+      const next = { ...current }
+      if (unchanged) delete next[providerId]
+      else next[providerId] = savedKey
+      return next
+    })
+    if (unchanged) {
+      updateKeyInputs((current) => {
+        const next = { ...current }
+        delete next[providerId]
+        return next
+      })
+      setKeyVisible((current) => ({ ...current, [providerId]: false }))
+    }
+  }
+
+  useEffect(() => {
+    if (!fieldError) return
+    const target = document.querySelector<HTMLElement>(`[data-field-error="${fieldError.field}"]`)
+    if (target) {
+      target.focus({ preventScroll: true })
+      target.scrollIntoView?.({ block: 'center', behavior: 'auto' })
+    }
+  }, [fieldError, activeSection])
+
   const persist = async (): Promise<PublicSettings | null> => {
-    if (!draft) return null
+    if (!draft || savingRef.current) return null
     const validation = buildSettingsUpdate(draft)
     if (!validation.valid) {
       setBanner({ kind: 'error', text: validation.message })
       if (validation.field) {
         setFieldError({ field: validation.field, message: validation.message })
-        window.requestAnimationFrame(() => {
-          document
-            .querySelector<HTMLElement>(`[data-field-error="${validation.field}"]`)
-            ?.focus()
-        })
-      } else {
-        setFieldError(null)
-      }
+        const section = validation.field === 'translation' ? 'language'
+          : validation.field === 'captureShortcut' ? 'general'
+            : validation.field.startsWith('provider:') ? 'providers' : 'actions'
+        setActiveSection(section)
+      } else setFieldError(null)
       return null
     }
     setFieldError(null)
-
-    let saved: PublicSettings
+    const revision = draftRevisionRef.current
+    const submittedInputs = { ...keyInputsRef.current }
+    const submittedBaselines = { ...keyBaselinesRef.current }
+    savingRef.current = true
+    invalidateKeyReveals()
     try {
-      // The full provider list is part of the ordinary settings transaction.
-      // Rust removes orphaned secrets while committing that transaction, so a
-      // staged deletion must never run as a separate destructive command first.
-      saved = await window.textLens.updateSettings(validation.value)
-    } catch (error) {
-      await refreshRuntimeStatus().catch(() => undefined)
-      setBanner({ kind: 'error', text: getErrorMessage(error, '保存设置失败') })
-      return null
-    }
-
-    await refreshRuntimeStatus().catch(() => undefined)
-
-    applyTheme(saved.appearance.theme)
-    setDraft(normalizePublicSettings(saved))
-    setDirty(false)
-    dirtyRef.current = false
-
-    const existingProviderIds = new Set(saved.providers.map((provider) => provider.id))
-    const pendingKeyWrites = Object.entries(keyInputs).filter(([providerId, rawKey]) => {
-      if (!existingProviderIds.has(providerId)) return false
-      const next = rawKey.trim()
-      const baseline = (keyBaselines[providerId] ?? '').trim()
-      return next.length > 0 && next !== baseline
-    })
-
-    const remainingInputs = { ...keyInputs }
-    for (const [providerId, rawKey] of pendingKeyWrites) {
-      const apiKey = rawKey.trim()
+      let saved: PublicSettings
       try {
-        if (window.textLens.setProviderApiKey) {
-          saved = await window.textLens.setProviderApiKey(providerId, apiKey)
-        } else if (providerId === saved.providers[0]?.id && window.textLens.setApiKey) {
-          saved = await window.textLens.setApiKey(apiKey)
-        } else {
-          throw new Error('当前后端尚不支持为多个服务商保存密钥')
-        }
-        remainingInputs[providerId] = apiKey
+        // Keep provider metadata and orphaned secret removal in one native transaction.
+        saved = await window.textLens.updateSettings(validation.value)
       } catch (error) {
-        const refreshed = await window.textLens.getSettings().catch(() => saved)
-        const normalized = normalizePublicSettings(refreshed)
-        setDraft(normalized)
-        setKeyInputs(remainingInputs)
-        setBanner({
-          kind: 'error',
-          text: `普通设置已保存，但 API Key 保存失败：${getErrorMessage(error, '无法保存密钥')}`
-        })
+        await refreshRuntimeStatus().catch(() => undefined)
+        setBanner({ kind: 'error', text: getErrorMessage(error, '保存设置失败') })
         return null
       }
+      applySavedSettings(saved, revision)
+      runDetached(refreshRuntimeStatus(), { scope: 'settings', operation: 'refresh-runtime-status' })
+      const existingProviderIds = new Set(saved.providers.map((provider) => provider.id))
+      for (const [providerId, rawKey] of Object.entries(submittedInputs)) {
+        if (!existingProviderIds.has(providerId)) continue
+        const apiKey = rawKey.trim()
+        const baseline = (submittedBaselines[providerId] ?? '').trim()
+        if (apiKey === '' || apiKey === baseline) {
+          acknowledgeKeyWrite(providerId, rawKey, baseline)
+          continue
+        }
+        try {
+          if (window.textLens.setProviderApiKey) saved = await window.textLens.setProviderApiKey(providerId, apiKey)
+          else if (providerId === saved.providers[0]?.id && window.textLens.setApiKey) saved = await window.textLens.setApiKey(apiKey)
+          else throw new Error('当前后端尚不支持为多个服务商保存密钥')
+          acknowledgeKeyWrite(providerId, rawKey, apiKey)
+          applySavedSettings(saved, revision)
+        } catch (error) {
+          const refreshed = await window.textLens.getSettings().catch(() => saved)
+          applySavedSettings(refreshed, revision)
+          setBanner({ kind: 'error', text: `普通设置已保存，但 API Key 保存失败：${getErrorMessage(error, '无法保存密钥')}` })
+          return null
+        }
+      }
+      // Fields changed after submission remain in the form with their own baseline.
+      applySavedSettings(saved, revision)
+      return saved
+    } finally {
+      savingRef.current = false
+      unsavedChangesRef.current = hasUnsavedChanges()
     }
-
-    const normalized = normalizePublicSettings(saved)
-    setDraft(normalized)
-    // Keep keyConfigured from saved settings; do not re-fetch plaintext keys.
-    resetProviderKeyFields()
-    return saved
   }
 
-
   const save = async (): Promise<void> => {
+    if (savingRef.current) return
     setOperation('save')
     setBanner(null)
     const saved = await persist()
-    if (saved) setBanner({ kind: 'success', text: '设置已保存' })
+    if (saved) setBanner({ kind: 'success', text: hasUnsavedChanges() ? '提交的更改已保存；仍有新的修改待保存' : '设置已保存' })
     setOperation(null)
   }
 
@@ -756,7 +840,7 @@ export function SettingsApp(): JSX.Element {
   }, [])
 
   const requestQuit = useCallback((): void => {
-    if (unsavedChangesRef.current) {
+    if (unsavedChangesRef.current || savingRef.current) {
       setQuitConfirmationOpen(true)
       return
     }
@@ -764,12 +848,18 @@ export function SettingsApp(): JSX.Element {
   }, [quitNow])
 
   const saveAndQuit = async (): Promise<void> => {
+    if (savingRef.current) return
     setOperation('save-and-quit')
     setBanner(null)
     const saved = await persist()
     if (!saved) {
       setQuitConfirmationOpen(false)
       setOperation(null)
+      return
+    }
+    if (hasUnsavedChanges()) {
+      setOperation(null)
+      setBanner({ kind: 'error', text: '新的修改尚未保存，请再次确认退出' })
       return
     }
     setQuitConfirmationOpen(false)
@@ -864,13 +954,14 @@ export function SettingsApp(): JSX.Element {
   }
 
   const deleteProvider = (provider: PublicProviderSettings): void => {
+    invalidateKeyReveals(provider.id)
     changeDraft((current) => removeProviderFromSettings(current, provider.id))
-    setKeyInputs((current) => {
+    updateKeyInputs((current) => {
       const next = { ...current }
       delete next[provider.id]
       return next
     })
-    setKeyBaselines((current) => {
+    updateKeyBaselines((current) => {
       const next = { ...current }
       delete next[provider.id]
       return next
@@ -880,6 +971,8 @@ export function SettingsApp(): JSX.Element {
   }
 
   const clearProviderKey = async (provider: PublicProviderSettings): Promise<void> => {
+    const submittedInput = keyInputsRef.current[provider.id] ?? ''
+    invalidateKeyReveals(provider.id)
     setOperation(`key:${provider.id}`)
     setBanner(null)
     try {
@@ -890,6 +983,7 @@ export function SettingsApp(): JSX.Element {
       } else {
         throw new Error('当前后端尚不支持清除该服务商密钥')
       }
+      invalidateKeyReveals(provider.id)
       setDraft((current) => current
         ? {
             ...current,
@@ -900,12 +994,13 @@ export function SettingsApp(): JSX.Element {
             )
           }
         : current)
-      setKeyInputs((current) => {
+      updateKeyInputs((current) => {
+        if ((current[provider.id] ?? '') !== submittedInput) return current
         const next = { ...current }
         delete next[provider.id]
         return next
       })
-      setKeyBaselines((current) => {
+      updateKeyBaselines((current) => {
         const next = { ...current }
         delete next[provider.id]
         return next
@@ -1530,9 +1625,8 @@ export function SettingsApp(): JSX.Element {
                       placeholder={provider.keyConfigured || (keyBaselines[provider.id] ?? '') ? '已保存的 API Key' : '输入 API Key'}
                       onChange={(event) => {
                         const value = event.target.value
-                        // Keep ref in sync before re-render so in-flight reveal won't clobber baseline checks.
-                        keyInputsRef.current = { ...keyInputsRef.current, [provider.id]: value }
-                        setKeyInputs((current) => ({ ...current, [provider.id]: value }))
+                        invalidateKeyReveals(provider.id)
+                        updateKeyInputs((current) => ({ ...current, [provider.id]: value }))
                       }}
                     />
                     <button
@@ -1843,7 +1937,7 @@ export function SettingsApp(): JSX.Element {
             <div><strong>程序规则</strong><p>填写可执行文件名或完整路径。受控 Ctrl+C 仅在已完成的划词手势后运行。</p></div>
             <div className="capture-rule-list" role="list">
               {draft.selectionCapture.applications.map((rule, index) => (
-                <div className="capture-rule" key={`${rule.application}-${index}`} role="listitem">
+                <div className="capture-rule" key={captureRuleKeysRef.current[index]} role="listitem">
                   <input
                     className="control"
                     aria-label={`程序规则 ${index + 1}`}
@@ -1885,13 +1979,13 @@ export function SettingsApp(): JSX.Element {
                     type="button"
                     title="移除程序规则"
                     aria-label={`移除 ${rule.application || '程序'} 规则`}
-                    onClick={() => changeDraft((current) => ({
-                      ...current,
-                      selectionCapture: {
+                    onClick={() => {
+                      captureRuleKeysRef.current.splice(index, 1)
+                      changeDraft((current) => ({ ...current, selectionCapture: {
                         ...current.selectionCapture,
                         applications: current.selectionCapture.applications.filter((_, candidateIndex) => candidateIndex !== index)
-                      }
-                    }))}
+                      } }))
+                    }}
                   ><Trash2 size={16} /></button>
                 </div>
               ))}
@@ -2062,24 +2156,8 @@ export function QuitConfirmationDialog({ busy, onCancel, onDiscard, onSave }: {
   onDiscard: () => void
   onSave: () => void
 }): JSX.Element {
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape' && !busy) onCancel()
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [busy, onCancel])
-
   return (
-    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => {
-      if (event.target === event.currentTarget && !busy) onCancel()
-    }}>
-      <section
-        className="dialog-card quit-confirmation-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label={`退出 ${APP_NAME}？`}
-      >
+    <Dialog className="quit-confirmation-dialog" label={`退出 ${APP_NAME}？`} dismissible={!busy} onClose={onCancel}>
         <header className="dialog-header">
           <div>
             <h2>退出 {APP_NAME}？</h2>
@@ -2096,7 +2174,7 @@ export function QuitConfirmationDialog({ busy, onCancel, onDiscard, onSave }: {
           </button>
         </header>
         <footer className="dialog-actions quit-confirmation-dialog__actions">
-          <button className="button" type="button" disabled={busy} onClick={onCancel}>取消</button>
+          <button className="button" type="button" disabled={busy} data-dialog-initial-focus onClick={onCancel}>取消</button>
           <button className="button button--danger" type="button" disabled={busy} onClick={onDiscard}>
             放弃更改并退出
           </button>
@@ -2105,8 +2183,7 @@ export function QuitConfirmationDialog({ busy, onCancel, onDiscard, onSave }: {
             保存并退出
           </button>
         </footer>
-      </section>
-    </div>
+    </Dialog>
   )
 }
 
@@ -2159,24 +2236,8 @@ function DeleteConfirmationDialog({
   onCancel: () => void
   onConfirm: () => void
 }): JSX.Element {
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') onCancel()
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [onCancel])
-
   return (
-    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => {
-      if (event.target === event.currentTarget) onCancel()
-    }}>
-      <section
-        className="dialog-card provider-delete-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-      >
+    <Dialog className="provider-delete-dialog" label={title} onClose={onCancel}>
         <header className="dialog-header">
           <div>
             <h2>{title}</h2>
@@ -2187,11 +2248,10 @@ function DeleteConfirmationDialog({
           </button>
         </header>
         <footer className="dialog-actions provider-delete-dialog__actions">
-          <button className="button" type="button" autoFocus onClick={onCancel}>取消</button>
+          <button className="button" type="button" data-dialog-initial-focus onClick={onCancel}>取消</button>
           <button className="button button--danger" type="button" onClick={onConfirm}>{confirmLabel}</button>
         </footer>
-      </section>
-    </div>
+    </Dialog>
   )
 }
 
@@ -2224,8 +2284,11 @@ function ActionZone({ title, count, actions, enabled, draggingId, fieldError, on
     ref={setNodeRef}
     className={`action-zone ${enabled ? 'action-zone--enabled' : ''} ${isOver ? 'is-drag-over' : ''}`}
     data-action-zone={enabled ? 'enabled' : 'disabled'}
+    data-field-error={enabled ? 'actions' : undefined}
+    tabIndex={enabled ? -1 : undefined}
   >
     <header className="action-zone__header"><strong>{title}</strong><span>{count}</span></header>
+    {enabled && fieldError?.field === 'actions' && <p className="field-error" role="alert">{fieldError.message}</p>}
     <SortableContext items={actions.map((action) => action.id)} strategy={verticalListSortingStrategy}>
       <div className="action-zone__list">
         {actions.map((action) => <SortableActionRow
@@ -2448,14 +2511,6 @@ function ModelPickerDialog({
     )
   }, [listModels, query])
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') onCancel()
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [onCancel])
-
   const toggle = (id: string): void => {
     setCheckedIds((current) => {
       const next = new Set(current)
@@ -2466,15 +2521,7 @@ function ModelPickerDialog({
   }
 
   return (
-    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => {
-      if (event.target === event.currentTarget) onCancel()
-    }}>
-      <section
-        className="dialog-card model-picker-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="model-picker-title"
-      >
+    <Dialog className="model-picker-dialog" labelledBy="model-picker-title" onClose={onCancel}>
         <header className="dialog-header">
           <div>
             <h2 id="model-picker-title">选择模型</h2>
@@ -2495,6 +2542,7 @@ function ModelPickerDialog({
             value={query}
             placeholder="搜索模型 ID 或名称"
             aria-label="搜索模型"
+            data-dialog-initial-focus
             spellCheck={false}
             onChange={(event) => setQuery(event.target.value)}
           />
@@ -2540,8 +2588,7 @@ function ModelPickerDialog({
             应用所选（{checkedIds.size}）
           </button>
         </footer>
-      </section>
-    </div>
+    </Dialog>
   )
 }
 

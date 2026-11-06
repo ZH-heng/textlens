@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type JSX } from 'react'
+import { useMemo, useRef, useState, type FormEvent, type JSX } from 'react'
 import { Braces, RotateCcw, X } from 'lucide-react'
 
 import {
@@ -23,6 +23,7 @@ import {
 } from '../../shared'
 import { isLucideIconName } from '../components/lucideIconRegistry'
 import { ActionIconPicker } from './ActionIconPicker'
+import { Dialog } from '../components/Dialog'
 
 const ACTION_KIND_NAMES: Readonly<Record<ActionKind, string>> = {
   copy: '复制',
@@ -148,7 +149,6 @@ export function CustomActionDialog({
   const [prompt, setPrompt] = useState(initialAi?.prompt ?? DEFAULT_ACTION_PROMPTS.custom)
   const [error, setError] = useState('')
   const nameRef = useRef<HTMLInputElement>(null)
-  const dialogRef = useRef<HTMLElement>(null)
 
   const enabledProviders = useMemo(
     () => providers.filter((provider) => provider.enabled !== false),
@@ -213,42 +213,6 @@ export function CustomActionDialog({
   const showThinkingAuto = Boolean(
     selectedChoice?.thinkingEnabled && selectedChoice.thinkingDefault && thinkingLevels.length > 0
   )
-
-  useEffect(() => {
-    const bodyOverflow = document.body.style.overflow
-    const rootOverflow = document.documentElement.style.overflow
-    document.body.style.overflow = 'hidden'
-    document.documentElement.style.overflow = 'hidden'
-    return () => {
-      document.body.style.overflow = bodyOverflow
-      document.documentElement.style.overflow = rootOverflow
-    }
-  }, [])
-
-  useEffect(() => {
-    nameRef.current?.focus()
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') onCancel()
-      if (event.key !== 'Tab') return
-
-      const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
-        'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])'
-      )
-      if (!focusable?.length) return
-      const first = focusable[0]
-      const last = focusable[focusable.length - 1]
-      if (!first || !last) return
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [onCancel])
 
   const submit = (event: FormEvent): void => {
     event.preventDefault()
@@ -317,16 +281,7 @@ export function CustomActionDialog({
   }
 
   return (
-    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => {
-      if (event.target === event.currentTarget) onCancel()
-    }}>
-      <section
-        ref={dialogRef}
-        className="dialog-card dialog-card--action"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="action-dialog-title"
-      >
+    <Dialog className="dialog-card--action" labelledBy="action-dialog-title" initialFocusRef={nameRef} onClose={onCancel}>
         <header className="dialog-header">
           <div>
             <h2 id="action-dialog-title">{action ? '编辑动作' : '添加动作'}</h2>
@@ -509,7 +464,6 @@ export function CustomActionDialog({
             </button>
           </footer>
         </form>
-      </section>
-    </div>
+    </Dialog>
   )
 }

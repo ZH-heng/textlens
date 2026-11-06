@@ -56,7 +56,7 @@ import {
   appendUserTurn,
   beginAssistantTurn,
   isAskAction,
-  patchStreamingAssistant,
+  reconcileTranscriptContent,
   transcriptToPlainText,
   type TranscriptTurn
 } from './conversationTranscript'
@@ -113,7 +113,8 @@ function modelRouteValue(route: ModelRoute): string {
   return JSON.stringify([route.providerId, route.modelId])
 }
 
-function modelRouteFromSnapshot(snapshot: ResultSessionSnapshot): ModelRoute | null {
+function modelRouteFromSnapshot(snapshot: ResultSessionSnapshot | null): ModelRoute | null {
+  if (!snapshot) return null
   const { providerId, modelId } = snapshot
   if (providerId === undefined && modelId === undefined) return null
   if (providerId === undefined || modelId === undefined) {
@@ -305,7 +306,9 @@ function AskStreamBridge({
   onStream: (
     status: ResultState['status'],
     content: string,
-    scalarCount: number
+    scalarCount: number,
+    transcript: TranscriptTurn[] | null,
+    requestId: string | null
   ) => void
 }): null {
   const status = useResultField((state) => state.status)
@@ -314,6 +317,7 @@ function AskStreamBridge({
   const sessionGeneration = useResultField((state) => state.sessionGeneration)
   const requestGeneration = useResultField((state) => state.requestGeneration)
   const requestId = useResultField((state) => state.requestId)
+  const transcript = useResultField((state) => state.transcript)
   const requestKey = `${sessionGeneration ?? 'none'}:${requestGeneration ?? 'none'}:${requestId ?? 'none'}`
   const stream = useSmoothStreamText(content, status === 'streaming', requestKey)
   // Terminal states use store content and the store's authoritative scalar
@@ -325,8 +329,8 @@ function AskStreamBridge({
 
   useEffect(() => {
     if (!enabled) return
-    onStream(status, streamPatch, streamScalarCount)
-  }, [enabled, onStream, status, streamPatch, streamScalarCount])
+    onStream(status, streamPatch, streamScalarCount, transcript, requestId)
+  }, [enabled, onStream, status, streamPatch, streamScalarCount, transcript, requestId])
 
   return null
 }
@@ -405,6 +409,9 @@ function ResultSessionApp({
   const errorMessage = useResultField((state) => state.errorMessage)
   const generationNotice = useResultField((state) => state.generationNotice)
   const retryable = useResultField((state) => state.retryable)
+  const preparationFailure = useResultField((state) => state.preparationFailure)
+  const committedProviderId = useResultField((state) => state.providerId)
+  const committedModelId = useResultField((state) => state.modelId)
   const hasContent = useResultField((state) => state.content.length > 0)
   const hasThinking = useResultField((state) => state.thinkingContent.length > 0)
   const [settings, setSettings] = useState<PublicSettings>(DEFAULT_PUBLIC_SETTINGS)
@@ -424,10 +431,10 @@ function ResultSessionApp({
   const [showOriginal, setShowOriginal] = useState(false)
   const [turns, setTurns] = useState<TranscriptTurn[]>([])
   const [translationTarget, setTranslationTarget] = useState<TranslationLanguage | null>(null)
-  const [activeModelRoute, setActiveModelRoute] = useState<ModelRoute | null>(null)
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [routeSwitching, setRouteSwitching] = useState(false)
   const [retrying, setRetrying] = useState(false)
+  const [preparingRequestId, setPreparingRequestId] = useState<string | null>(null)
   const [commandMessage, setCommandMessage] = useState('')
   const [copyComplete, setCopyComplete] = useState(false)
   const [followUpQuestion, setFollowUpQuestion] = useState('')
@@ -444,11 +451,17 @@ function ResultSessionApp({
   const copyResetTimer = useRef<number | null>(null)
   const selectionFrame = useRef<number | null>(null)
   const retryInFlight = useRef(false)
+  const followUpInFlight = useRef(false)
+  const preparingRequestRef = useRef<string | null>(null)
+  const pendingTranslation = useRef<{
+    previous: TranslationLanguage | null
+    previousRequestId: string | null
+    requestId: string | null
+  } | null>(null)
   const bootstrapRetryInFlight = useRef(false)
   const disposedRef = useRef(false)
   const followUpComposing = useRef(false)
   const askOriginalDefaulted = useRef(false)
-  const askSawStreaming = useRef(false)
   const pendingFollowUp = useRef<{ question: string; requestId: string | null } | null>(null)
   const handleScroll = useAutoFollowOutput(contentRef, contentInnerRef, requestId)
   // Thinking counts as visible activity — hide the empty waiting spinner early.
@@ -470,7 +483,7 @@ function ResultSessionApp({
   const isAiAction = action !== undefined && isAiActionDefinition(action)
   const showFollowUp = isAiAction && status !== 'streaming'
   const followUpDisabled =
-    followUpSubmitting ||
+    followUpSubmitting || preparingRequestId !== null ||
     status === 'streaming' ||
     (!isAsk && status !== 'completed') ||
     (isAsk && status !== 'completed' && status !== 'idle')
@@ -480,7 +493,10 @@ function ResultSessionApp({
     return { providerId: action.providerId, modelId: action.modelId }
   }, [action])
 
-  const effectiveModelRoute = activeModelRoute ?? defaultModelRoute
+  const effectiveModelRoute = committedProviderId && committedModelId
+    ? { providerId: committedProviderId, modelId: committedModelId }
+    : modelRouteFromSnapshot(session) ?? defaultModelRoute
+  const canCopy = hasContent || (isAsk && turns.some((turn) => turn.content.trim().length > 0))
   const modelGroups = useMemo(() => (
     settings?.providers
       .filter((provider) => provider.enabled !== false && provider.models.length > 0)
@@ -512,11 +528,33 @@ function ResultSessionApp({
   const modelSummary = selectedModel
     ? `${selectedModel.providerName} · ${selectedModel.modelName}`
     : '未选择模型'
-  const modelSwitchDisabled = status === 'streaming' || routeSwitching || retrying
+  const modelSwitchDisabled = status === 'streaming' || routeSwitching || retrying || preparingRequestId !== null
+
+  const trackAcceptedRequest = useCallback((acceptedRequestId: string | undefined): void => {
+    if (!acceptedRequestId) return
+    const latest = getActionEventSnapshot()
+    const pendingId =
+      latest.requestId === acceptedRequestId || latest.preparationFailure?.requestId === acceptedRequestId
+        ? null : acceptedRequestId
+    preparingRequestRef.current = pendingId
+    setPreparingRequestId(pendingId)
+  }, [])
+
+  const rollbackFailedTranslation = useCallback((failure: ResultState['preparationFailure']): void => {
+    const pending = pendingTranslation.current
+    if (!failure || !pending || (pending.requestId && pending.requestId !== failure.requestId)) return
+    setTranslationTarget(pending.previous)
+    pendingTranslation.current = null
+  }, [])
 
   const reconcilePendingFollowUp = useCallback(
     (pending: { question: string; requestId: string | null }): void => {
       const latest = getActionEventSnapshot()
+      if (latest.preparationFailure && (!pending.requestId || latest.preparationFailure.requestId === pending.requestId)) {
+        setFollowUpQuestion((current) => current || latest.preparationFailure?.question || pending.question)
+        pendingFollowUp.current = null
+        return
+      }
       if (pending.requestId && latest.requestId !== pending.requestId) return
       if (latest.status === 'completed') {
         pendingFollowUp.current = null
@@ -532,26 +570,13 @@ function ResultSessionApp({
     (
       streamStatus: ResultState['status'],
       content: string,
-      scalarCount: number
+      scalarCount: number,
+      transcript: TranscriptTurn[] | null,
+      streamRequestId: string | null
     ): void => {
-      if (streamStatus === 'streaming') {
-        askSawStreaming.current = true
-        setTurns((current) =>
-          patchStreamingAssistant(current, content, true, scalarCount)
-        )
-        return
-      }
-      if (
-        askSawStreaming.current &&
-        (streamStatus === 'completed' ||
-          streamStatus === 'cancelled' ||
-          streamStatus === 'error')
-      ) {
-        setTurns((current) =>
-          patchStreamingAssistant(current, content, false, scalarCount)
-        )
-        askSawStreaming.current = false
-      }
+      setTurns((current) => reconcileTranscriptContent(
+        transcript ?? current, content, streamStatus === 'streaming', streamRequestId, scalarCount
+      ))
     },
     []
   )
@@ -571,7 +596,7 @@ function ResultSessionApp({
   }, [sessionId])
 
   const retry = useCallback(async (options?: ActionRetryOptions): Promise<boolean> => {
-    if (retryInFlight.current) return false
+    if (retryInFlight.current || followUpInFlight.current || preparingRequestRef.current) return false
     retryInFlight.current = true
     setRetrying(true)
     setCommandMessage('')
@@ -581,14 +606,12 @@ function ResultSessionApp({
         setCommandMessage(result.message)
         return false
       }
-      if (
-        options?.targetLanguage !== undefined ||
-        options?.providerId !== undefined ||
-        options?.modelId !== undefined
-      ) {
-        pendingFollowUp.current = null
-        setFollowUpQuestion('')
-      } else if (pendingFollowUp.current) {
+      trackAcceptedRequest(result.requestId)
+      if (options?.targetLanguage && pendingTranslation.current) {
+        pendingTranslation.current.requestId = result.requestId ?? null
+        rollbackFailedTranslation(getActionEventSnapshot().preparationFailure)
+      }
+      if (pendingFollowUp.current) {
         pendingFollowUp.current.requestId = result.requestId ?? null
         reconcilePendingFollowUp(pendingFollowUp.current)
       }
@@ -600,7 +623,7 @@ function ResultSessionApp({
       retryInFlight.current = false
       setRetrying(false)
     }
-  }, [reconcilePendingFollowUp, sessionId])
+  }, [reconcilePendingFollowUp, rollbackFailedTranslation, sessionId, trackAcceptedRequest])
 
   const switchModel = useCallback(async (value: string): Promise<void> => {
     const next = modelChoices.find((choice) => choice.value === value)
@@ -610,13 +633,10 @@ function ResultSessionApp({
         effectiveModelRoute.modelId === next.modelId)
     ) return
 
-    const previous = activeModelRoute
     setRouteSwitching(true)
-    setActiveModelRoute({ providerId: next.providerId, modelId: next.modelId })
-    const accepted = await retry({ providerId: next.providerId, modelId: next.modelId })
-    if (!accepted) setActiveModelRoute(previous)
+    await retry({ providerId: next.providerId, modelId: next.modelId })
     setRouteSwitching(false)
-  }, [activeModelRoute, effectiveModelRoute, modelChoices, retry, routeSwitching, status])
+  }, [effectiveModelRoute, modelChoices, retry, routeSwitching, status])
 
   const chooseModel = useCallback((value: string): void => {
     setModelMenuOpen(false)
@@ -625,9 +645,14 @@ function ResultSessionApp({
   }, [switchModel])
 
   const copy = useCallback(async (): Promise<void> => {
-    const content = isAsk && turns.length > 0
-      ? transcriptToPlainText(turns)
-      : getActionEventSnapshot().content
+    const latest = getActionEventSnapshot()
+    const completeTurns = reconcileTranscriptContent(
+      latest.transcript ?? turns, latest.content, latest.status === 'streaming',
+      latest.requestId, latest.contentScalarCount
+    )
+    const content = isAsk && completeTurns.length > 0
+      ? transcriptToPlainText(completeTurns)
+      : latest.content
     if (!content) return
     setCommandMessage('')
     try {
@@ -649,7 +674,8 @@ function ResultSessionApp({
       isAsk
         ? status === 'completed' || status === 'idle'
         : status === 'completed'
-    if (!question || followUpSubmitting || !canSubmit) return
+    if (!question || followUpInFlight.current || retryInFlight.current || preparingRequestRef.current || !canSubmit) return
+    followUpInFlight.current = true
     setCommandMessage('')
     setFollowUpSubmitting(true)
     try {
@@ -661,32 +687,31 @@ function ResultSessionApp({
           typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
             ? crypto.randomUUID()
             : `assistant-${Date.now()}`
-        askSawStreaming.current = false
         setTurns((current) => beginAssistantTurn(appendUserTurn(current, question), turnId))
       }
       const result = await window.textLens.continueAction(sessionId, question)
       if (!result.accepted) {
         setCommandMessage(result.message)
         if (isAsk) {
-          askSawStreaming.current = false
           setTurns((current) => (current.length < 2 ? current : current.slice(0, -2)))
         }
         return
       }
       const pending = { question, requestId: result.requestId ?? null }
       pendingFollowUp.current = pending
+      trackAcceptedRequest(result.requestId)
       setFollowUpQuestion('')
       reconcilePendingFollowUp(pending)
     } catch (error) {
       setCommandMessage(getErrorMessage(error, '无法继续提问'))
       if (isAsk) {
-        askSawStreaming.current = false
         setTurns((current) => (current.length < 2 ? current : current.slice(0, -2)))
       }
     } finally {
+      followUpInFlight.current = false
       setFollowUpSubmitting(false)
     }
-  }, [followUpQuestion, followUpSubmitting, isAsk, reconcilePendingFollowUp, sessionId, status])
+  }, [followUpQuestion, followUpSubmitting, isAsk, preparingRequestId, reconcilePendingFollowUp, sessionId, status, trackAcceptedRequest])
 
   useEffect(() => {
     let disposed = false
@@ -723,7 +748,6 @@ function ResultSessionApp({
       if (!snapshot) throw new Error('结果会话不可用')
       setSession(snapshot)
       setPinned(snapshot.pinned)
-      setActiveModelRoute(modelRouteFromSnapshot(snapshot))
       setBootstrapMessage('')
     } catch {
       if (!isDisposed()) {
@@ -734,10 +758,12 @@ function ResultSessionApp({
 
     try {
       await bootstrap.reveal(async () => {
-        if (window.textLens.prepareResultReveal) {
-          await window.textLens.prepareResultReveal(sessionId)
-        }
-        await waitForResultRevealFrames()
+        // Native layout and the first hydrated React frame are independent.
+        // Overlap them so showing the window adds no extra serial frame.
+        await Promise.all([
+          window.textLens.prepareResultReveal?.(sessionId),
+          waitForResultRevealFrames()
+        ])
         if (window.textLens.commitResultReveal) {
           await window.textLens.commitResultReveal(sessionId)
         }
@@ -785,10 +811,43 @@ function ResultSessionApp({
   }, [bootstrap, consumeBootstrap])
 
   useEffect(() => {
-    setTurns([])
+    const latest = getActionEventSnapshot()
+    setTurns(reconcileTranscriptContent(
+      latest.transcript ?? [], latest.content, latest.status === 'streaming',
+      latest.requestId, latest.contentScalarCount
+    ))
     askOriginalDefaulted.current = false
-    askSawStreaming.current = false
+    pendingFollowUp.current = null
+    pendingTranslation.current = null
+    preparingRequestRef.current = null
+    setPreparingRequestId(null)
   }, [sessionId])
+
+  useEffect(() => {
+    if (preparingRequestId === requestId || preparationFailure?.requestId === preparingRequestId) {
+      preparingRequestRef.current = null
+      setPreparingRequestId(null)
+    }
+  }, [preparingRequestId, preparationFailure, requestId])
+
+  useEffect(() => {
+    if (!preparationFailure) return
+    setCommandMessage(preparationFailure.message)
+    rollbackFailedTranslation(preparationFailure)
+    const pending = pendingFollowUp.current
+    const question = preparationFailure.question ?? pending?.question
+    if (question) setFollowUpQuestion((current) => current || question)
+    if (pending && (!pending.requestId || pending.requestId === preparationFailure.requestId)) {
+      pendingFollowUp.current = null
+    }
+    if (isAsk) {
+      const latest = getActionEventSnapshot()
+      setTurns(reconcileTranscriptContent(
+        latest.transcript ?? [], latest.content, latest.status === 'streaming',
+        latest.requestId, latest.contentScalarCount
+      ))
+    }
+  }, [isAsk, preparationFailure, rollbackFailedTranslation])
 
   useEffect(() => {
     if (!isAsk || askOriginalDefaulted.current) return
@@ -798,7 +857,10 @@ function ResultSessionApp({
 
   useEffect(() => {
     if (!requestId) return
-    setCommandMessage('')
+    if (!getActionEventSnapshot().preparationFailure) setCommandMessage('')
+    if (pendingTranslation.current && requestId !== pendingTranslation.current.previousRequestId) {
+      pendingTranslation.current = null
+    }
     setCopyComplete(false)
     if (!isAsk) setShowOriginal(false)
     if (copyResetTimer.current !== null) {
@@ -810,7 +872,7 @@ function ResultSessionApp({
   useEffect(() => {
     const pending = pendingFollowUp.current
     if (pending) reconcilePendingFollowUp(pending)
-  }, [reconcilePendingFollowUp, requestId, status])
+  }, [reconcilePendingFollowUp, requestId, status, preparationFailure])
 
   useEffect(() => {
     const onPageHide = (): void => {
@@ -895,8 +957,8 @@ function ResultSessionApp({
     if (modelMenuOpen && modelSwitchDisabled) setModelMenuOpen(false)
   }, [modelMenuOpen, modelSwitchDisabled])
 
-  const keyboardState = useRef({ status, hasContent, cancel, closeWindow, retry, copy })
-  keyboardState.current = { status, hasContent, cancel, closeWindow, retry, copy }
+  const keyboardState = useRef({ status, canCopy, cancel, closeWindow, retry, copy })
+  keyboardState.current = { status, canCopy, cancel, closeWindow, retry, copy }
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (isEditableTarget(event.target) || event.metaKey || event.ctrlKey || event.altKey) return
@@ -917,7 +979,7 @@ function ResultSessionApp({
         void current.retry()
         return
       }
-      if (key === 'c' && current.hasContent && !window.getSelection()?.toString()) {
+      if (key === 'c' && current.canCopy && !window.getSelection()?.toString()) {
         event.preventDefault()
         void current.copy()
       }
@@ -1048,13 +1110,18 @@ function ResultSessionApp({
     const defaultTarget = defaultTranslationTarget(detected, settings.translate)
     return { detected, target: translationTarget ?? defaultTarget }
   }, [action?.kind, selection, settings, translationTarget])
-  const translationSwitching = status === 'streaming' || routeSwitching || retrying
+  const translationSwitching = status === 'streaming' || routeSwitching || retrying || followUpSubmitting || preparingRequestId !== null
   const changeTranslationTarget = (target: TranslationLanguage): void => {
+    if (translationSwitching || retryInFlight.current || followUpInFlight.current || preparingRequestRef.current) return
     const previous = translationTarget
+    pendingTranslation.current = { previous, previousRequestId: requestId, requestId: null }
     setRouteSwitching(true)
     setTranslationTarget(target)
     void retry({ targetLanguage: target }).then((accepted) => {
-      if (!accepted) setTranslationTarget(previous)
+      if (!accepted) {
+        setTranslationTarget(previous)
+        pendingTranslation.current = null
+      }
     }).finally(() => setRouteSwitching(false))
   }
 
@@ -1082,6 +1149,7 @@ function ResultSessionApp({
         showFollowUp && followUpExpanded ? 'result-window--followup-expanded' : ''
       }`}
       style={style}
+      data-reveal-state={bootstrapMessage ? 'error' : revealCommitted ? 'visible' : 'preparing'}
       onPointerEnter={pointerEnter}
       onPointerLeave={pointerLeave}
       onPointerDown={handleResultPointerDown}
@@ -1308,7 +1376,7 @@ function ResultSessionApp({
                               onOpenExternal={openExternal}
                             />
                           </article>
-                        ) : !hasThinking ? (
+                        ) : turn.streaming && status === 'streaming' && !hasThinking ? (
                           <div className="result-turn__waiting">
                             <LoaderCircle className="result-spin" size={16} />
                             <span>正在等待模型响应…</span>
@@ -1430,7 +1498,7 @@ function ResultSessionApp({
             <button
               className="result-footer-button"
               type="button"
-              disabled={retrying || !requestId || (status === 'error' && !retryable)}
+              disabled={retrying || followUpSubmitting || preparingRequestId !== null || !requestId || (status === 'error' && !retryable)}
               onClick={() => void retry()}
               title="使用相同选区重新生成"
             >
@@ -1441,9 +1509,9 @@ function ResultSessionApp({
           <button
             className={`result-footer-button ${copyComplete ? 'result-footer-button--done' : ''}`}
             type="button"
-            disabled={!hasContent}
+            disabled={!canCopy}
             onClick={() => void copy()}
-            title={hasContent ? '复制结果到剪贴板' : '生成完成后可复制'}
+            title={canCopy ? '复制结果到剪贴板' : '生成完成后可复制'}
           >
             {copyComplete ? <Check size={14} /> : <Copy size={14} />}
             {copyComplete ? '已复制' : '复制'}

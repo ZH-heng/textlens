@@ -56,9 +56,11 @@ static std::atomic<bool> gCaptureRunning{false};
 static bool CaptureIsCurrent(
     const std::atomic<uint64_t> *captureGeneration,
     uint64_t expectedGeneration) {
-    return gCaptureRunning.load(std::memory_order_acquire) &&
-        (captureGeneration == nullptr ||
-         captureGeneration->load(std::memory_order_acquire) == expectedGeneration);
+    return textlens_selection_policy::CaptureRequestIsCurrent(
+        gCaptureRunning.load(std::memory_order_acquire),
+        captureGeneration == nullptr ? expectedGeneration :
+            captureGeneration->load(std::memory_order_acquire),
+        expectedGeneration);
 }
 // Bounds every AX round-trip to a single app so one slow/hung process can't
 // stall the shared single-threaded capture worker for every other app.
@@ -143,6 +145,8 @@ enum class SelectionMethod {
 };
 
 struct SelectionInfo {
+    uint64_t sequence = 0;
+    uint64_t timestampMs = 0;
     std::string text;
     std::string bundleId;
     std::string appName;
@@ -178,6 +182,8 @@ enum class TaskKind {
 };
 
 struct Task {
+    uint64_t sequence = 0;
+    uint64_t timestampMs = 0;
     TaskKind kind = TaskKind::Dismiss;
     Trigger trigger = Trigger::Manual;
     std::string dismissReason;
@@ -218,11 +224,13 @@ struct AccessibilityReadContext {
     uint64_t expectedGeneration = 0;
     uint64_t deadlineMs = 0;
 
+    bool RequestIsCurrent() const {
+        return CaptureIsCurrent(generation, expectedGeneration);
+    }
+
     bool IsCurrent() const {
-        return gCaptureRunning.load(std::memory_order_acquire) &&
-            (generation == nullptr ||
-                generation->load(std::memory_order_acquire) == expectedGeneration) &&
-            MonotonicMilliseconds() < deadlineMs;
+        return textlens_selection_policy::CaptureStageIsCurrent(
+            RequestIsCurrent(), MonotonicMilliseconds(), deadlineMs);
     }
 };
 
@@ -306,8 +314,8 @@ static void TraceHostClear(const char *decision) {
 }
 
 // Total order for selection/dismiss arbitration. Wall-clock timestamps can
-// repeat or step backwards; the sequence is assigned once per emitted event and
-// only ever grows.
+// repeat or step backwards. Assign at input enqueue time so independent AX,
+// fallback and dismiss workers cannot reorder the originating input events.
 static uint64_t NextEventSequence() {
     static std::atomic<uint64_t> sequence{0};
     return sequence.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -972,7 +980,8 @@ static bool ReadFullscreen(
 
 static bool ElementIsProtected(
     AXUIElementRef element,
-    const AccessibilityReadContext &context) {
+    const AccessibilityReadContext &context,
+    bool *explicitProtection = nullptr) {
     if (element == nullptr || !context.IsCurrent()) {
         return true;
     }
@@ -989,6 +998,7 @@ static bool ElementIsProtected(
                 0) == kCFCompareEqualTo;
         CFRelease(subrole);
     }
+    if (isProtected && explicitProtection != nullptr) *explicitProtection = true;
     if (isProtected || !context.IsCurrent()) {
         return true;
     }
@@ -1001,6 +1011,7 @@ static bool ElementIsProtected(
             CFBooleanGetValue(static_cast<CFBooleanRef>(protectedContent));
         CFRelease(protectedContent);
     }
+    if (isProtected && explicitProtection != nullptr) *explicitProtection = true;
     return isProtected || !context.IsCurrent();
 }
 
@@ -1170,6 +1181,7 @@ static bool ReadViaAccessibility(
     SelectionInfo &info,
     uint8_t appliedAttributes,
     uint8_t &compatibilityAttributesJustApplied,
+    bool &protectedFocusDetected,
     const AccessibilityReadContext &context) {
     compatibilityAttributesJustApplied = 0;
     if (application == nil || !context.IsCurrent()) {
@@ -1188,7 +1200,8 @@ static bool ReadViaAccessibility(
     }
     AXUIElementRef focusedWindow = CopyFocusedWindow(applicationElement);
 
-    const bool protectedFocus = focused != nullptr && ElementIsProtected(focused, context);
+    const bool protectedFocus = focused != nullptr &&
+        ElementIsProtected(focused, context, &protectedFocusDetected);
     bool found = false;
     if (focused != nullptr && !protectedFocus) {
         found = FindSelectionFromFocusedContext(focused, info, context);
@@ -1221,27 +1234,23 @@ static bool ReadViaAccessibility(
         }
     }
 
-    if (found && context.IsCurrent()) {
+    if (found) {
         // The title only matters to the "selected text is the window chrome"
         // filter, so read it after a candidate exists instead of paying an AX
         // round trip on every mouse-up.
-        if (info.text.size() <= 2048) {
+        if (context.IsCurrent() && info.text.size() <= 2048) {
             ReadWindowTitle(focusedWindow, info.windowTitle, context);
-            if (SelectionTextMatchesSourceIdentity(info)) {
-                found = false;
-            }
         }
-    } else if (!context.IsCurrent()) {
-        found = false;
+        if (SelectionTextMatchesSourceIdentity(info)) found = false;
     }
     if (found && context.IsCurrent()) {
         info.fullscreen = ReadFullscreen(applicationElement, context);
-        if (context.IsCurrent()) {
-            info.method = SelectionMethod::Accessibility;
-        } else {
-            found = false;
-        }
     }
+    // Optional geometry/title/fullscreen queries may exhaust the AX budget
+    // after the text was read successfully. Keep that text while the input is
+    // current; a genuinely newer input still invalidates it.
+    found = found && context.RequestIsCurrent();
+    if (found) info.method = SelectionMethod::Accessibility;
     if (focused != nullptr) CFRelease(focused);
     if (focusedWindow != nullptr) CFRelease(focusedWindow);
     CFRelease(applicationElement);
@@ -1407,7 +1416,8 @@ static bool RestorePasteboard(
     return wrote == YES;
 }
 
-static bool PostCopyShortcut(pid_t processIdentifier, bool toSession) {
+template <typename InjectionGate>
+static bool PostCopyShortcut(pid_t processIdentifier, bool toSession, InjectionGate canInject) {
     CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
     CGEventRef keyDown = CGEventCreateKeyboardEvent(source, kVK_ANSI_C, true);
     CGEventRef keyUp = CGEventCreateKeyboardEvent(source, kVK_ANSI_C, false);
@@ -1424,6 +1434,13 @@ static bool PostCopyShortcut(pid_t processIdentifier, bool toSession) {
     // the user had typed.
     CGEventSetIntegerValueField(keyDown, kCGEventSourceUserData, kSyntheticEventMarker);
     CGEventSetIntegerValueField(keyUp, kCGEventSourceUserData, kSyntheticEventMarker);
+    // Event/source allocation can also yield. The final request/focus/clipboard
+    // gate belongs immediately before key-down reaches the target process.
+    if (!canInject()) {
+        CFRelease(keyDown);
+        CFRelease(keyUp);
+        return false;
+    }
     if (toSession) {
         CGEventPost(kCGSessionEventTap, keyDown);
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -2322,6 +2339,7 @@ static bool CaptureViaClipboard(
 
     std::lock_guard<std::mutex> processGuard(gPasteboardFallbackMutex);
     @autoreleasepool {
+        if (!generationCurrent() || MonotonicMilliseconds() >= deadlineMs) return false;
         NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
         if (pasteboard == nil) {
             return false;
@@ -2331,7 +2349,22 @@ static bool CaptureViaClipboard(
         if (!snapshot.valid) {
             return false;
         }
-        if (!PostCopyShortcut(application.processIdentifier, false)) {
+        auto copyInjectionAllowed = [&]() {
+            NSRunningApplication *frontmost = FrontmostApplication();
+            return textlens_selection_policy::CopyInjectionIsAllowed(
+                generationCurrent(),
+                frontmost != nil && frontmost.active && application.active &&
+                    frontmost.processIdentifier == application.processIdentifier,
+                originalChangeCount,
+                pasteboard.changeCount,
+                MonotonicMilliseconds(),
+                deadlineMs) && !IsSecureEventInputEnabled();
+        };
+        if (!copyInjectionAllowed()) {
+            TraceClipboardGateFor(info, "skip: copy-invalidated-during-snapshot");
+            return false;
+        }
+        if (!PostCopyShortcut(application.processIdentifier, false, copyInjectionAllowed)) {
             return false;
         }
 
@@ -2345,16 +2378,18 @@ static bool CaptureViaClipboard(
         uint64_t pollIntervalMs = kClipboardPollIntervalInitialMs;
         while (generationCurrent() && MonotonicMilliseconds() < fallbackDeadlineMs) {
             std::this_thread::sleep_for(std::chrono::milliseconds(pollIntervalMs));
+            if (!generationCurrent()) break;
             pollIntervalMs = std::min(pollIntervalMs * 2, kClipboardPollIntervalMaxMs);
             const NSInteger changeCount = pasteboard.changeCount;
             if (changeCount == originalChangeCount) {
                 if (!postedSessionRetry &&
                     MonotonicMilliseconds() - startedAt >= kClipboardSessionRetryAfterMs) {
-                    // Some apps ignore pid-targeted events. The generation
-                    // check above still guarantees no user input happened,
-                    // so the session-level chord reaches the same app.
+                    // Sleep and pasteboard reads can race new input or a
+                    // focus change. Recheck immediately before the retry.
                     postedSessionRetry = true;
-                    PostCopyShortcut(application.processIdentifier, true);
+                    if (copyInjectionAllowed()) {
+                        PostCopyShortcut(application.processIdentifier, true, copyInjectionAllowed);
+                    }
                 }
                 continue;
             }
@@ -2644,13 +2679,15 @@ static bool CaptureViaAccessibilityPipeline(
     };
     if (!context.IsCurrent()) return false;
 
+    bool protectedFocusDetected = false;
     bool found = ReadViaAccessibility(
         application,
         info,
         appliedAttributes,
         compatibilityAttributesJustApplied,
+        protectedFocusDetected,
         context);
-    if (!found && context.IsCurrent()) {
+    if (!found && !protectedFocusDetected && context.IsCurrent()) {
         // One cancellable retry for every provider: the first read can land
         // before the app has committed the selection, Chromium/Electron needs
         // a short turn after its compatibility attributes are set, and
@@ -2674,6 +2711,7 @@ static bool CaptureViaAccessibilityPipeline(
                 info,
                 static_cast<uint8_t>(appliedAttributes | compatibilityAttributesJustApplied),
                 retryJustApplied,
+                protectedFocusDetected,
                 context);
             compatibilityAttributesJustApplied |= retryJustApplied;
         }
@@ -2698,7 +2736,7 @@ static bool CaptureViaAccessibilityPipeline(
         TraceClipboardGate(okLine);
         return true;
     }
-    if (!context.IsCurrent()) {
+    if (!context.RequestIsCurrent() || protectedFocusDetected) {
         return false;
     }
     const auto policy = ClipboardFallbackPolicyForApplication(
@@ -2723,8 +2761,9 @@ static bool CaptureViaFallbackChain(
     const std::atomic<uint64_t> *captureGeneration,
     uint64_t expectedGeneration,
     bool clipboardAllowed) {
+    if (!CaptureIsCurrent(captureGeneration, expectedGeneration)) return false;
     if (CaptureViaAppleScript(application, info)) {
-        return true;
+        return CaptureIsCurrent(captureGeneration, expectedGeneration);
     }
     if (!clipboardAllowed) {
         return false;
@@ -2899,8 +2938,8 @@ static std::string SelectionJSON(const SelectionInfo &info) {
         @"isFullscreen": @(info.fullscreen),
         @"method": MethodName(info.method),
         @"trigger": TriggerName(info.trigger),
-        @"timestampMs": @(TimestampMilliseconds()),
-        @"sequence": @(NextEventSequence()),
+        @"timestampMs": @(info.timestampMs),
+        @"sequence": @(info.sequence),
     };
     return SerializeJSONObject(object);
 }
@@ -2915,8 +2954,8 @@ static std::string DismissJSON(const Task &task) {
         @"reason": reason,
         @"mouse": PointObject(task.mouseCurrent),
         @"targetPid": @(task.targetPid),
-        @"timestampMs": @(TimestampMilliseconds()),
-        @"sequence": @(NextEventSequence()),
+        @"timestampMs": @(task.timestampMs),
+        @"sequence": @(task.sequence),
     });
 }
 
@@ -3207,6 +3246,8 @@ struct TextLensSelectionMonitor {
     }
 
     bool captureCurrent(SelectionInfo &info) {
+        info.sequence = NextEventSequence();
+        info.timestampMs = TimestampMilliseconds();
         CGPoint mouse = CurrentMousePosition();
         const uint64_t generation =
             captureGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -3386,6 +3427,8 @@ struct TextLensSelectionMonitor {
         CGPoint current) {
         Task task;
         task.kind = TaskKind::Capture;
+        task.sequence = NextEventSequence();
+        task.timestampMs = TimestampMilliseconds();
         task.trigger = trigger;
         task.mouseStart = start;
         task.mouseEnd = end;
@@ -3400,6 +3443,8 @@ struct TextLensSelectionMonitor {
     void enqueueDismiss(const char *reason, CGPoint point, int64_t targetPid) {
         Task task;
         task.kind = TaskKind::Dismiss;
+        task.sequence = NextEventSequence();
+        task.timestampMs = TimestampMilliseconds();
         task.dismissReason = reason;
         task.mouseCurrent = point;
         task.targetPid = targetPid;
@@ -3469,6 +3514,8 @@ struct TextLensSelectionMonitor {
 
                 const uint64_t captureStartedAt = MonotonicMilliseconds();
                 SelectionInfo info;
+                info.sequence = task.sequence;
+                info.timestampMs = task.timestampMs;
                 info.mouseStart = task.mouseStart;
                 info.mouseEnd = task.mouseEnd;
                 info.mouseCurrent = task.mouseCurrent;

@@ -1,4 +1,5 @@
-import { countUnicodeScalars, type ActionStreamEvent, type ResultSessionSnapshot } from '../../shared'
+import { countUnicodeScalars, type ActionStreamEvent, type PreparationFailure, type ResultSessionSnapshot } from '../../shared'
+import type { TranscriptTurn } from './conversationTranscript'
 
 export type ResultStatus = 'idle' | 'streaming' | 'completed' | 'cancelled' | 'error'
 
@@ -7,6 +8,11 @@ export interface ResultState {
   requestGeneration: number | null
   requestId: string | null
   actionId: string | null
+  providerId: string | null
+  modelId: string | null
+  preparationFailure: PreparationFailure | null
+  /** Authoritative turns at the last hydration/Started, patched by the Ask view. */
+  transcript: TranscriptTurn[] | null
   status: ResultStatus
   content: string
   /** Live chain-of-thought for the current request (not answer history). */
@@ -38,6 +44,10 @@ export const INITIAL_RESULT_STATE: ResultState = {
   requestGeneration: null,
   requestId: null,
   actionId: null,
+  providerId: null,
+  modelId: null,
+  preparationFailure: null,
+  transcript: null,
   status: 'idle',
   content: '',
   thinkingContent: '',
@@ -54,6 +64,10 @@ export function resultStateFromSnapshot(snapshot: ResultSessionSnapshot): Result
     requestGeneration: snapshot.requestGeneration,
     requestId: snapshot.requestId,
     actionId: snapshot.actionId,
+    providerId: snapshot.providerId ?? null,
+    modelId: snapshot.modelId ?? null,
+    preparationFailure: snapshot.preparationFailure ?? null,
+    transcript: snapshot.transcript ?? null,
     status: snapshot.status,
     content: snapshot.content,
     thinkingContent: snapshot.thinkingContent ?? '',
@@ -65,12 +79,16 @@ export function resultStateFromSnapshot(snapshot: ResultSessionSnapshot): Result
   }
 }
 
-function startedStateFrom(event: Extract<ActionStreamEvent, { type: 'started' }>): ResultState {
+function startedStateFrom(event: Extract<ActionStreamEvent, { type: 'started' }>, previous: ResultState): ResultState {
   return {
     sessionGeneration: event.sessionGeneration,
     requestGeneration: event.requestGeneration,
     requestId: event.requestId,
     actionId: event.actionId,
+    providerId: event.providerId ?? previous.providerId,
+    modelId: event.modelId ?? previous.modelId,
+    preparationFailure: null,
+    transcript: event.transcript ?? previous.transcript,
     status: 'streaming',
     content: '',
     thinkingContent: '',
@@ -127,7 +145,26 @@ export function reduceActionEvent(state: ResultState, event: ActionStreamEvent):
     const newerRequest = state.requestGeneration === null ||
       event.requestGeneration > state.requestGeneration
     if (!firstRequest && (!sameSession || !newerRequest)) return state
-    return startedStateFrom(event)
+    return startedStateFrom(event, state)
+  }
+
+  if (event.type === 'preparationFailed') {
+    if (
+      state.sessionGeneration !== event.sessionGeneration ||
+      (state.requestGeneration !== null && event.requestGeneration <= state.requestGeneration) ||
+      (state.preparationFailure && event.requestGeneration < state.preparationFailure.requestGeneration)
+    ) return state
+    return {
+      ...state,
+      preparationFailure: {
+        requestId: event.requestId,
+        requestGeneration: event.requestGeneration,
+        code: event.code,
+        message: event.message,
+        retryable: event.retryable,
+        question: event.question
+      }
+    }
   }
 
   if (

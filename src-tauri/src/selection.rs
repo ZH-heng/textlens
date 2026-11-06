@@ -627,6 +627,15 @@ impl SelectionMonitor {
         self.windows.capture_current_async()
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn capture_current_async_with_shortcut_key(
+        &self,
+        shortcut_key: Option<u32>,
+    ) -> Result<Receiver<Result<Option<SelectionPayload>, SelectionError>>, SelectionError> {
+        self.windows
+            .capture_current_async_with_shortcut_key(shortcut_key)
+    }
+
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub fn capture_current(&self) -> Result<Option<SelectionPayload>, SelectionError> {
         Err(SelectionError::UnsupportedPlatform)

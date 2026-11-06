@@ -9,6 +9,54 @@ using namespace textlens_app_profiles;
 
 namespace {
 
+void ExpectCaptureCancellationAndStageBudgets() {
+    uint64_t now = 100;
+    const uint64_t axDeadline = 260;
+    const uint64_t clipboardDeadline = 740;
+    uint64_t generation = 7;
+    auto current = [&] { return CaptureRequestIsCurrent(true, generation, 7); };
+    assert(CaptureStageIsCurrent(current(), now, axDeadline));
+    now = axDeadline;
+    assert(!CaptureStageIsCurrent(current(), now, axDeadline));
+    // AX exhaustion leaves a valid request eligible for its separate fallback.
+    assert(current());
+    assert(CaptureStageIsCurrent(current(), now, clipboardDeadline));
+    generation = 8;
+    assert(!current());
+    assert(!CaptureStageIsCurrent(current(), now, clipboardDeadline));
+    assert(!CaptureRequestIsCurrent(false, 7, 7));
+}
+
+void ExpectCopyInjectionRechecksSnapshot() {
+    uint64_t now = 100;
+    uint64_t generation = 7;
+    int64_t clipboardCount = 10;
+    bool active = true;
+    auto allowed = [&] {
+        return CopyInjectionIsAllowed(
+            CaptureRequestIsCurrent(true, generation, 7), active,
+            10, clipboardCount, now, 580);
+    };
+    assert(allowed());
+    // Model a lazy snapshot / lock wait yielding to newer real input.
+    generation = 8;
+    assert(!allowed());
+    generation = 7;
+    clipboardCount = 11;
+    assert(!allowed());
+    clipboardCount = 10;
+    active = false;
+    assert(!allowed());
+    active = true;
+    now = 580;
+    assert(!allowed());
+    // Same final gate is required for the session-level retry after sleep.
+    now = 400;
+    assert(allowed());
+    generation = 9;
+    assert(!allowed());
+}
+
 void ExpectDegenerateFragment() {
     assert(IsDegenerateFragment(""));
     assert(IsDegenerateFragment("   \n\t"));
@@ -141,6 +189,8 @@ void ExpectAppProfiles() {
 }  // namespace
 
 int main() {
+    ExpectCaptureCancellationAndStageBudgets();
+    ExpectCopyInjectionRechecksSnapshot();
     ExpectDegenerateFragment();
     ExpectPointNearBounds();
     ExpectOpaqueWindowDecision();

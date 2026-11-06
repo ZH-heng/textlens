@@ -365,12 +365,27 @@ impl WindowsSelectionMonitor {
     pub(super) fn capture_current_async(
         &self,
     ) -> Result<Receiver<Result<Option<SelectionPayload>, SelectionError>>, SelectionError> {
+        self.capture_current_async_with_shortcut_key(None)
+    }
+
+    pub(super) fn capture_current_async_with_shortcut_key(
+        &self,
+        shortcut_key: Option<u32>,
+    ) -> Result<Receiver<Result<Option<SelectionPayload>, SelectionError>>, SelectionError> {
         if self.shutdown_requested.load(Ordering::Acquire) {
             return Err(SelectionError::Internal);
         }
         let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
         self.inbox
-            .send(WorkerMessage::Capture(reply_sender))
+            .send(WorkerMessage::Capture {
+                reply: reply_sender,
+                keyboard_guard: ManualCaptureKeyboardGuard::new(
+                    raw_input_sequence().load(Ordering::Acquire),
+                    shortcut_key,
+                    current_modifiers(),
+                    Instant::now(),
+                ),
+            })
             .map_err(|_| SelectionError::Internal)?;
         Ok(reply_receiver)
     }
@@ -447,7 +462,10 @@ enum WorkerMessage {
         settings: SelectionCaptureSettings,
         reply: UnitReply,
     },
-    Capture(CaptureReply),
+    Capture {
+        reply: CaptureReply,
+        keyboard_guard: ManualCaptureKeyboardGuard,
+    },
     /// Wakes the worker as soon as the isolated capture lane publishes a
     /// completion. The completion payload remains on its own channel so raw
     /// input and capture results cannot overtake one another.
@@ -492,6 +510,63 @@ struct ModifierSnapshot {
     control: bool,
     alt: bool,
     windows: bool,
+}
+
+#[path = "manual_capture_policy.rs"]
+mod manual_capture_policy;
+use manual_capture_policy::ShortcutReleaseGuard;
+#[cfg(test)]
+use manual_capture_policy::MANUAL_SHORTCUT_RELEASE_GRACE;
+
+#[derive(Debug, Clone, Copy)]
+struct ManualCaptureKeyboardGuard {
+    inner: ShortcutReleaseGuard,
+}
+
+impl ManualCaptureKeyboardGuard {
+    fn new(
+        input_sequence: u64,
+        shortcut_key: Option<u32>,
+        modifiers: ModifierSnapshot,
+        now: Instant,
+    ) -> Self {
+        Self {
+            inner: ShortcutReleaseGuard::new(
+                input_sequence,
+                shortcut_key.filter(|key| !is_modifier_virtual_key(*key as u16)),
+                [
+                    modifiers.shift,
+                    modifiers.control,
+                    modifiers.alt,
+                    modifiers.windows,
+                ],
+                now,
+            ),
+        }
+    }
+
+    fn consume_shortcut_event(
+        &mut self,
+        sequence: u64,
+        message: u32,
+        virtual_key: u32,
+        now: Instant,
+    ) -> bool {
+        let modifier_group = match virtual_key as u16 {
+            key if key == VK_SHIFT.0 || key == VK_LSHIFT.0 || key == VK_RSHIFT.0 => Some(0),
+            key if key == VK_CONTROL.0 || key == VK_LCONTROL.0 || key == VK_RCONTROL.0 => Some(1),
+            key if key == VK_MENU.0 || key == VK_LMENU.0 || key == VK_RMENU.0 => Some(2),
+            key if key == VK_LWIN.0 || key == VK_RWIN.0 => Some(3),
+            _ => None,
+        };
+        self.inner.consume(
+            sequence,
+            matches!(message, WM_KEYUP | WM_SYSKEYUP),
+            virtual_key,
+            modifier_group,
+            now,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -649,6 +724,10 @@ impl CaptureCoordinator {
         self.active
             .as_ref()
             .is_some_and(|active| active.request.trigger == SelectionTrigger::Manual)
+            || self
+                .queued
+                .as_ref()
+                .is_some_and(|(job, _)| job.request.trigger == SelectionTrigger::Manual)
     }
 
     fn submit(
@@ -693,12 +772,19 @@ impl CaptureCoordinator {
         if let Some(active) = self.active.as_ref() {
             active.cancelled.store(true, Ordering::Release);
         }
+        if let Some((job, _)) = self.queued.as_ref() {
+            job.cancelled.store(true, Ordering::Release);
+        }
     }
 
     fn cancel_active_for_user_keyboard(&self) {
         if let Some(active) = self.active.as_ref() {
             active.user_keyboard.store(true, Ordering::Release);
             active.cancelled.store(true, Ordering::Release);
+        }
+        if let Some((job, _)) = self.queued.as_ref() {
+            job.user_keyboard.store(true, Ordering::Release);
+            job.cancelled.store(true, Ordering::Release);
         }
     }
 
@@ -922,6 +1008,12 @@ fn capture_with_timeout_on_lane(
     user_keyboard: &AtomicBool,
     superseded: &AtomicBool,
 ) -> (Result<Option<SelectionPayload>, SelectionError>, bool) {
+    if cancelled.load(Ordering::Acquire)
+        || user_keyboard.load(Ordering::Acquire)
+        || superseded.load(Ordering::Acquire)
+    {
+        return (Ok(None), false);
+    }
     if executor.is_none() {
         *executor = CaptureExecutor::spawn(own_process_id).ok();
     }
@@ -1113,6 +1205,7 @@ fn selection_worker_main(
         last_mouse_up: None,
         last_click: None,
         keyboard_selection_key: None,
+        manual_keyboard_guard: None,
         pending_capture: None,
         last_automatic_fingerprint: None,
         recent_capture: None,
@@ -1160,6 +1253,7 @@ struct SelectionWorker {
     last_mouse_up: Option<RawPoint>,
     last_click: Option<(u32, RawPoint, isize, u64)>,
     keyboard_selection_key: Option<u32>,
+    manual_keyboard_guard: Option<ManualCaptureKeyboardGuard>,
     pending_capture: Option<PendingCapture>,
     last_automatic_fingerprint: Option<(u64, u64, Instant)>,
     recent_capture: Option<RecentCaptureContext>,
@@ -1241,7 +1335,11 @@ impl SelectionWorker {
                 self.capture_settings = settings;
                 let _ = reply.send(Ok(()));
             }
-            WorkerMessage::Capture(reply) => {
+            WorkerMessage::Capture {
+                reply,
+                keyboard_guard,
+            } => {
+                self.manual_keyboard_guard = Some(keyboard_guard);
                 let current = current_cursor_position();
                 let foreground = unsafe { GetForegroundWindow() };
                 let source_process_id = window_process_id(foreground);
@@ -1510,6 +1608,7 @@ impl SelectionWorker {
         // shutdown/stop still uses the default path and cancels every request.
         if !preserve_manual || !self.manual_capture_active() {
             self.cancel_active_capture();
+            self.manual_keyboard_guard = None;
         }
         self.pending_capture = None;
         self.mouse_down = None;
@@ -1752,17 +1851,24 @@ impl SelectionWorker {
         modifiers: ModifierSnapshot,
         timestamp_ms: u64,
     ) {
-        // The configured global shortcut also reaches the low-level hook. Once
-        // its Manual capture has been queued, consuming the remaining key
-        // events prevents the shortcut from dismissing or cancelling itself.
-        // A new mouse gesture remains an explicit superseding input.
-        if self.manual_capture_active() && !is_modifier_virtual_key(virtual_key as u16) {
-            return;
+        let manual_active = self.manual_capture_active();
+        if manual_active {
+            if self.manual_keyboard_guard.as_mut().is_some_and(|guard| {
+                guard.consume_shortcut_event(
+                    self.last_raw_sequence,
+                    message,
+                    virtual_key,
+                    Instant::now(),
+                )
+            }) {
+                return;
+            }
+            self.manual_keyboard_guard = None;
         }
-        if !is_modifier_virtual_key(virtual_key as u16) {
+        if manual_active || !is_modifier_virtual_key(virtual_key as u16) {
             // Synthetic TextLens keys are filtered in the hook callback. Any
-            // remaining non-modifier key is genuine newer input and must
-            // invalidate a capture which has not started yet.
+            // remaining Manual input (or automatic non-modifier input) must
+            // invalidate active and queued captures.
             self.cancel_active_capture_for_user_keyboard();
             self.pending_capture = None;
             self.recent_capture = None;
@@ -2543,6 +2649,12 @@ impl SelectionHelperProcess {
         if source_window.0 == ptr::null_mut()
             || source_process_id == 0
             || source_process_id == own_process_id
+        {
+            return Ok(Ok(None));
+        }
+        if cancelled.load(Ordering::Acquire)
+            || user_keyboard.load(Ordering::Acquire)
+            || superseded.load(Ordering::Acquire)
         {
             return Ok(Ok(None));
         }
@@ -8273,8 +8385,14 @@ fn trace_selection_line(line: String) {
 }
 
 fn next_raw_input_sequence() -> u64 {
+    raw_input_sequence()
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1)
+}
+
+fn raw_input_sequence() -> &'static AtomicU64 {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    SEQUENCE.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    &SEQUENCE
 }
 
 fn rectangles_from_values(values: &[f64]) -> Vec<SelectionBounds> {
@@ -9365,6 +9483,130 @@ mod tests {
     use super::*;
 
     #[test]
+    fn manual_shortcut_only_consumes_its_exact_release_once() {
+        let now = Instant::now();
+        let mut guard = ManualCaptureKeyboardGuard::new(
+            10,
+            Some(u32::from(VK_C.0)),
+            ModifierSnapshot::default(),
+            now,
+        );
+        // The original key-down may arrive after the separate shortcut queue.
+        assert!(guard.consume_shortcut_event(10, WM_KEYDOWN, u32::from(VK_C.0), now));
+        assert!(!guard.consume_shortcut_event(11, WM_KEYDOWN, u32::from(VK_C.0), now));
+        assert!(!guard.consume_shortcut_event(11, WM_KEYUP, u32::from(VK_V.0), now));
+        assert!(guard.consume_shortcut_event(11, WM_KEYUP, u32::from(VK_C.0), now));
+        assert!(!guard.consume_shortcut_event(12, WM_KEYUP, u32::from(VK_C.0), now));
+    }
+
+    #[test]
+    fn manual_shortcut_modifier_releases_and_deadline_are_bounded() {
+        let now = Instant::now();
+        let mut guard = ManualCaptureKeyboardGuard::new(
+            10,
+            Some(u32::from(VK_C.0)),
+            ModifierSnapshot {
+                control: true,
+                ..ModifierSnapshot::default()
+            },
+            now,
+        );
+        assert!(!guard.consume_shortcut_event(11, WM_KEYDOWN, u32::from(VK_CONTROL.0), now));
+        assert!(guard.consume_shortcut_event(11, WM_KEYUP, u32::from(VK_CONTROL.0), now));
+        assert!(!guard.consume_shortcut_event(12, WM_KEYUP, u32::from(VK_CONTROL.0), now));
+        assert!(!guard.consume_shortcut_event(12, WM_KEYUP, u32::from(VK_SHIFT.0), now));
+        assert!(!guard.consume_shortcut_event(
+            12,
+            WM_KEYUP,
+            u32::from(VK_C.0),
+            now + MANUAL_SHORTCUT_RELEASE_GRACE
+        ));
+        let mut command_guard =
+            ManualCaptureKeyboardGuard::new(10, None, ModifierSnapshot::default(), now);
+        assert!(!command_guard.consume_shortcut_event(11, WM_KEYUP, u32::from(VK_C.0), now));
+    }
+
+    fn manual_request() -> CaptureRequest {
+        CaptureRequest {
+            observation_generation: None,
+            observation_only: false,
+            trigger: SelectionTrigger::Manual,
+            start: None,
+            end: None,
+            current: RawPoint { x: 0, y: 0 },
+            generation: None,
+            clipboard_sequence_at_start: None,
+            press_duration_ms: 0,
+            capture_strategy: SelectionCaptureStrategy::SelectionHook,
+        }
+    }
+
+    #[test]
+    fn user_keyboard_cancels_manual_capture_waiting_behind_active_job() {
+        let (command_sender, _command_receiver) = mpsc::channel();
+        let (_completion_sender, completion_receiver) = mpsc::channel();
+        let (completion_waker, _wake_receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let user_keyboard = Arc::new(AtomicBool::new(false));
+        let coordinator = CaptureCoordinator {
+            own_process_id: 1,
+            command_sender,
+            completion_receiver,
+            completion_waker,
+            lane: None,
+            next_id: 2,
+            active: Some(ActiveCapture {
+                id: 2,
+                request: CaptureRequest {
+                    trigger: SelectionTrigger::Drag,
+                    ..manual_request()
+                },
+                source_root_window: 0,
+                source_process_id: 2,
+                process_parents: None,
+                empty_attempt: 0,
+                reply: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                user_keyboard: Arc::new(AtomicBool::new(false)),
+                superseded: Arc::new(AtomicBool::new(false)),
+            }),
+            queued: Some((
+                CaptureJob {
+                    id: 1,
+                    request: manual_request(),
+                    source_root_window: 0,
+                    source_process_id: 2,
+                    process_parents: None,
+                    empty_attempt: 0,
+                    cancelled: cancelled.clone(),
+                    user_keyboard: user_keyboard.clone(),
+                    superseded: Arc::new(AtomicBool::new(false)),
+                    scheduled_at: Instant::now(),
+                },
+                None,
+            )),
+        };
+        assert!(coordinator.active_is_manual());
+        coordinator.cancel_active_for_user_keyboard();
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(user_keyboard.load(Ordering::Acquire));
+        let mut executor = None;
+        let (result, _) = capture_with_timeout_on_lane(
+            &mut executor,
+            1,
+            manual_request(),
+            0,
+            2,
+            &cancelled,
+            &user_keyboard,
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(result, Ok(None)));
+        // Cancellation must be checked before spawning or sending to a helper.
+        assert!(executor.is_none());
+    }
+
+    #[test]
     fn double_click_tries_other_patterns_after_preferred_document_misses() {
         let candidates = vec![("child", false), ("document", true)];
         let ordered = order_text_pattern_candidates(candidates.clone(), true);
@@ -9442,6 +9684,7 @@ mod tests {
             last_mouse_up: None,
             last_click: None,
             keyboard_selection_key: None,
+            manual_keyboard_guard: None,
             pending_capture: None,
             last_automatic_fingerprint: None,
             recent_capture: None,

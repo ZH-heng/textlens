@@ -1,8 +1,10 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    collections::{HashMap, VecDeque},
+    sync::{
+        atomic::{AtomicU64, AtomicU8, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
@@ -54,7 +56,6 @@ const RESULT_BLUR_VERIFY_ATTEMPTS: usize = 2;
 #[cfg(target_os = "windows")]
 const WINDOWS_TOOLBAR_HIT_TOLERANCE: f64 = 8.0;
 
-#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResultForegroundScope {
     Internal,
@@ -274,6 +275,7 @@ struct ResultRuntime {
     dismiss_mode: DismissMode,
     dismiss_delay_ms: u64,
     hide_generation: u64,
+    pending_auto_close: Option<AutoCloseOrigin>,
     remember_size: bool,
     ignore_resize_until: Instant,
 }
@@ -285,28 +287,19 @@ enum ResultRevealPhase {
     Committed,
 }
 
-#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoCloseOrigin {
+    PointerLeave(u64),
+    Blur(u64),
+}
+
 fn initial_result_reveal_phase() -> ResultRevealPhase {
     ResultRevealPhase::Hidden
 }
 
-#[cfg(not(target_os = "windows"))]
-fn initial_result_reveal_phase() -> ResultRevealPhase {
-    ResultRevealPhase::Committed
-}
-
 fn initial_result_resize_ignore_until() -> Instant {
-    #[cfg(target_os = "windows")]
-    {
-        // The result is not user-resizable until reveal commit. Ignore every
-        // WebView/native initialization resize, then enable persistence at
-        // the exact commit boundary.
-        Instant::now() + std::time::Duration::from_millis(3_500)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Instant::now() + std::time::Duration::from_millis(180)
-    }
+    // Enable persistence at the exact hydrated reveal commit boundary.
+    Instant::now() + std::time::Duration::from_millis(3_500)
 }
 
 fn result_reveal_error(message: &'static str) -> tauri::Error {
@@ -332,6 +325,49 @@ fn trace_toolbar_timing(stage: &str, started: Instant) {
 }
 
 impl ResultRuntime {
+    fn pointer_leave_armed(&self) -> bool {
+        self.reveal_phase == ResultRevealPhase::Committed
+            && self.pointer_seen
+            && !self.pointer_inside
+            && !self.pinned
+            && self.dismiss_mode == DismissMode::PointerLeave
+    }
+
+    fn note_pointer_change(&mut self, inside: bool) -> bool {
+        self.pointer_inside = inside;
+        if self.reveal_phase != ResultRevealPhase::Committed {
+            self.pointer_seen = false;
+        } else if inside {
+            self.pointer_seen = true;
+        }
+        self.hide_generation = self.hide_generation.wrapping_add(1);
+        self.pointer_leave_armed()
+    }
+
+    fn pointer_leave_is_current(&self, generation: u64) -> bool {
+        self.hide_generation == generation && self.pointer_leave_armed()
+    }
+
+    fn auto_close_is_current(&self, origin: AutoCloseOrigin) -> bool {
+        match origin {
+            AutoCloseOrigin::PointerLeave(generation) => self.pointer_leave_is_current(generation),
+            AutoCloseOrigin::Blur(generation) => self.blur_is_current(generation),
+        }
+    }
+
+    fn prepare_auto_close_request(&mut self, origin: AutoCloseOrigin) -> bool {
+        if !self.auto_close_is_current(origin) {
+            return false;
+        }
+        // A queued close can represent the newest independently eligible
+        // dismissal. Never enqueue a second event that would lack a token.
+        self.pending_auto_close.replace(origin).is_none()
+    }
+
+    fn cancel_auto_close_request(&mut self) {
+        self.pending_auto_close = None;
+    }
+
     /// Returns a generation token for a blur that is eligible for dismissal.
     ///
     /// Windows must not close synchronously from the raw Tauri focus event:
@@ -355,7 +391,6 @@ impl ResultRuntime {
             .then_some(self.blur_generation)
     }
 
-    #[cfg(any(test, target_os = "windows"))]
     fn blur_is_current(&self, generation: u64) -> bool {
         self.reveal_phase == ResultRevealPhase::Committed
             && self.focus_seen
@@ -366,6 +401,10 @@ impl ResultRuntime {
 }
 
 struct WindowState {
+    toolbar_revision: u64,
+    toolbar_hide_pending: bool,
+    toolbar_reveal_requested: bool,
+    toolbar_present_pending: bool,
     toolbar_size: WindowSize,
     toolbar_anchor: Option<Point>,
     toolbar_placement: Option<ToolbarPlacement>,
@@ -379,10 +418,79 @@ struct WindowState {
 impl WindowState {
     fn begin_toolbar_selection(&mut self, selection_id: &str) {
         if self.toolbar_recovery_selection_id.as_deref() != Some(selection_id) {
+            self.invalidate_toolbar_operations();
             self.toolbar_recovery_selection_id = Some(selection_id.to_owned());
             self.toolbar_recovery_attempts = 0;
             self.toolbar_recovery_pending_selection_id = None;
         }
+    }
+
+    fn invalidate_toolbar_operations(&mut self) -> u64 {
+        self.toolbar_revision = self.toolbar_revision.wrapping_add(1);
+        self.toolbar_revision
+    }
+
+    fn request_toolbar_reveal(&mut self) -> u64 {
+        self.toolbar_reveal_requested = true;
+        self.toolbar_present_pending = true;
+        self.invalidate_toolbar_operations()
+    }
+
+    fn toolbar_operation_is_current(&self, revision: u64) -> bool {
+        self.toolbar_revision == revision
+    }
+
+    fn toolbar_selection_is_current(&self, selection_id: &str) -> bool {
+        !self.toolbar_hide_pending
+            && self.toolbar_selection_id.as_deref() == Some(selection_id)
+            && self
+                .toolbar_recovery_selection_id
+                .as_deref()
+                .is_none_or(|id| id == selection_id)
+    }
+
+    fn reserve_toolbar_stage(
+        &mut self,
+        selection_id: &str,
+        anchor: Point,
+        placement: ToolbarPlacement,
+    ) -> Option<(u64, WindowSize)> {
+        // A late replay/stage may not steal ownership from a newer selection
+        // already accepted by the selection-event consumer.
+        if self
+            .toolbar_recovery_selection_id
+            .as_deref()
+            .is_some_and(|id| id != selection_id)
+        {
+            return None;
+        }
+        let size = self.commit_toolbar_selection_with_placement(selection_id, anchor, placement);
+        Some((self.invalidate_toolbar_operations(), size))
+    }
+
+    fn reserve_toolbar_operation(&mut self, selection_id: Option<&str>) -> Option<u64> {
+        if selection_id.is_some() && self.toolbar_selection_id.as_deref() != selection_id {
+            return None;
+        }
+        // Keep ownership for a failed-hide retry, but prevent a late renderer
+        // present/resize from superseding this pending dismiss.
+        self.toolbar_hide_pending = true;
+        self.toolbar_reveal_requested = false;
+        self.toolbar_present_pending = false;
+        Some(self.invalidate_toolbar_operations())
+    }
+
+    fn clear_toolbar_if_current(&mut self, revision: u64) -> bool {
+        if !self.toolbar_operation_is_current(revision) {
+            return false;
+        }
+        self.toolbar_anchor = None;
+        self.toolbar_placement = None;
+        self.toolbar_selection_id = None;
+        self.toolbar_hide_pending = false;
+        self.toolbar_reveal_requested = false;
+        self.toolbar_present_pending = false;
+        true
     }
 
     #[cfg(test)]
@@ -406,6 +514,9 @@ impl WindowState {
         self.toolbar_anchor = Some(anchor);
         self.toolbar_placement = Some(placement);
         self.toolbar_selection_id = Some(selection_id.to_owned());
+        self.toolbar_hide_pending = false;
+        self.toolbar_reveal_requested = false;
+        self.toolbar_present_pending = false;
         self.toolbar_size
     }
 
@@ -417,6 +528,7 @@ impl WindowState {
             return false;
         }
         self.toolbar_recovery_attempts += 1;
+        self.invalidate_toolbar_operations();
         self.toolbar_recovery_pending_selection_id = Some(selection_id.to_owned());
         true
     }
@@ -437,13 +549,63 @@ impl WindowState {
     }
 }
 
+type ToolbarNativeJob = Box<dyn FnOnce() + Send>;
+
+#[derive(Default)]
+struct ToolbarNativeQueue {
+    running: bool,
+    pending: VecDeque<ToolbarNativeJob>,
+}
+
+fn enqueue_toolbar_native_job(queue: &Arc<Mutex<ToolbarNativeQueue>>, job: ToolbarNativeJob) {
+    {
+        let mut queue = queue.lock();
+        queue.pending.push_back(job);
+        if queue.running {
+            return;
+        }
+        queue.running = true;
+    }
+    loop {
+        let next = {
+            let mut queue = queue.lock();
+            match queue.pending.pop_front() {
+                Some(job) => job,
+                None => {
+                    queue.running = false;
+                    return;
+                }
+            }
+        };
+        // A native call can synchronously invoke another window-event
+        // callback. That callback only enqueues its transaction; the outer
+        // drain executes it after the current native transaction completes.
+        next();
+    }
+}
+
+fn toolbar_is_ui_thread() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        objc2::MainThreadMarker::new().is_some()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        is_windows_ui_thread()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        true
+    }
+}
+
 #[derive(Clone)]
 pub struct WindowCoordinator {
     state: Arc<Mutex<WindowState>>,
-    /// Serializes the native toolbar transaction across stage, layout, reveal
-    /// and hide. State rechecks alone cannot protect the gap between AppKit
-    /// calls where a stale reveal could otherwise resurrect the toolbar.
-    toolbar_operation: Arc<Mutex<()>>,
+    /// Serializes native commits on the UI thread, including callbacks that
+    /// reenter from SetWindowPos/AppKit. This mutex protects only the queue;
+    /// native work, monitor getters and dispatcher waits never hold it.
+    toolbar_operation: Arc<Mutex<ToolbarNativeQueue>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     toolbar_tracking_generation: Arc<AtomicU64>,
 }
@@ -452,6 +614,10 @@ impl Default for WindowCoordinator {
     fn default() -> Self {
         Self {
             state: Arc::new(Mutex::new(WindowState {
+                toolbar_revision: 0,
+                toolbar_hide_pending: false,
+                toolbar_reveal_requested: false,
+                toolbar_present_pending: false,
                 toolbar_size: WindowSize {
                     width: 480.0,
                     height: 40.0,
@@ -464,7 +630,7 @@ impl Default for WindowCoordinator {
                 toolbar_recovery_pending_selection_id: None,
                 results: HashMap::new(),
             })),
-            toolbar_operation: Arc::new(Mutex::new(())),
+            toolbar_operation: Arc::new(Mutex::new(ToolbarNativeQueue::default())),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             toolbar_tracking_generation: Arc::new(AtomicU64::new(0)),
         }
@@ -472,6 +638,79 @@ impl Default for WindowCoordinator {
 }
 
 impl WindowCoordinator {
+    fn run_toolbar_operation_async(
+        &self,
+        window: &WebviewWindow,
+        operation: impl FnOnce(&WebviewWindow) -> tauri::Result<bool> + Send + 'static,
+    ) -> tauri::Result<()> {
+        let queue = Arc::clone(&self.toolbar_operation);
+        let native_window = window.clone();
+        window.app_handle().run_on_main_thread(move || {
+            enqueue_toolbar_native_job(
+                &queue,
+                Box::new(move || {
+                    let _ = operation(&native_window);
+                }),
+            );
+        })
+    }
+
+    fn run_toolbar_operation(
+        &self,
+        window: &WebviewWindow,
+        operation: impl FnOnce(&WebviewWindow) -> tauri::Result<bool> + Send + 'static,
+    ) -> tauri::Result<Option<bool>> {
+        let on_ui_thread = toolbar_is_ui_thread();
+        let native_window = window.clone();
+        let queue = Arc::clone(&self.toolbar_operation);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        // 0 = pending, 1 = running, 2 = cancelled before start.
+        let dispatch = Arc::new(AtomicU8::new(0));
+        let callback_dispatch = Arc::clone(&dispatch);
+        let callback = move || {
+            enqueue_toolbar_native_job(
+                &queue,
+                Box::new(move || {
+                    if callback_dispatch
+                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let _ = sender.send(operation(&native_window));
+                }),
+            );
+        };
+        if on_ui_thread {
+            callback();
+            // A reentrant main-thread handler must never wait for the native
+            // transaction it interrupted. Its queued operation commits when
+            // the outer drain resumes; callers treat None as accepted.
+            return match receiver.try_recv() {
+                Ok(result) => result.map(Some),
+                Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err(tauri::Error::FailedToReceiveMessage)
+                }
+            };
+        }
+        window.app_handle().run_on_main_thread(callback)?;
+        match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result.map(Some),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(tauri::Error::FailedToReceiveMessage)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = dispatch.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "toolbar native operation timed out",
+                )
+                .into())
+            }
+        }
+    }
+
     pub fn begin_toolbar_selection(&self, selection_id: &str) {
         self.state.lock().begin_toolbar_selection(selection_id);
     }
@@ -603,273 +842,223 @@ impl WindowCoordinator {
         anchor: Point,
         placement: ToolbarPlacement,
     ) -> tauri::Result<()> {
-        let window = self.ensure_toolbar(app)?;
-        let _toolbar_operation = self.toolbar_operation.lock();
-        // Never hold WindowState across UI-thread hops. On macOS,
-        // order_front_without_focus (and often set_position/set_size) blocks
-        // until the AppKit main thread runs the work. Holding the coordinator
-        // lock while waiting deadlocks with main-thread handlers such as
-        // WindowEvent::Destroyed → remove_result, which freezes the tray icon.
-        let size = {
+        let reserved = {
             let mut state = self.state.lock();
-            state.commit_toolbar_selection_with_placement(selection_id, anchor, placement)
+            state
+                .reserve_toolbar_stage(selection_id, anchor, placement)
+                .map(|(_, size)| (state.request_toolbar_reveal(), size))
         };
-        let layout = toolbar_layout_with_placement(&window, anchor, size, placement)?;
-        // A concurrent hide/rebuild may have replaced this selection while we
-        // computed layout off-lock. Do not resurrect a stale toolbar.
-        if self.state.lock().toolbar_selection_id.as_deref() != Some(selection_id) {
+        let Some((revision, size)) = reserved else {
             return Ok(());
-        }
-        // On Windows keep all monitor/scale queries outside the event-loop
-        // callback. Calling Tauri window getters from a `run_on_main_thread`
-        // closure can wait on the same dispatcher and leave the toolbar
-        // permanently hidden after the first stalled presentation.
-        #[cfg(target_os = "windows")]
-        apply_toolbar_layout(&window, layout, true)?;
-        #[cfg(not(target_os = "windows"))]
-        {
-            apply_window_layout(&window, layout)?;
-            order_front_without_focus(&window)?;
-        }
+        };
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        self.start_toolbar_pointer_tracking(app, &window);
-        Ok(())
-    }
-
-    /// Stages a Windows toolbar update while keeping the singleton WebView
-    /// ready for the renderer update. The native frame remains hidden until
-    /// the renderer commits the new selection and measured size, so a reused
-    /// WebView can never expose an old clickable frame for a new selection.
-    #[cfg(target_os = "windows")]
-    pub fn stage_toolbar(
-        &self,
-        app: &AppHandle,
-        selection_id: &str,
-        anchor: Point,
-    ) -> tauri::Result<()> {
-        self.stage_toolbar_with_placement(app, selection_id, anchor, ToolbarPlacement::BottomMiddle)
-    }
-
-    #[cfg(target_os = "windows")]
-    pub fn stage_toolbar_with_placement(
-        &self,
-        app: &AppHandle,
-        selection_id: &str,
-        anchor: Point,
-        placement: ToolbarPlacement,
-    ) -> tauri::Result<()> {
-        let window = self.ensure_toolbar(app)?;
-        let _toolbar_operation = self.toolbar_operation.lock();
-        // Move the hidden native frame before publishing the next selection.
-        // Renderer updates remain generation-checked, and no cold WebView2
-        // frame can receive a click before the matching selection is rendered.
-        stage_windows_toolbar_with_placement(
-            &window,
-            Arc::clone(&self.state),
-            selection_id.to_owned(),
-            anchor,
-            placement,
-        )?;
-        Ok(())
-    }
-
-    /// Atomically positions, sizes and reveals the prepared Windows toolbar.
-    /// Keeping this as one `SetWindowPos` prevents a stale frame or intermediate
-    /// size from becoming visible on cold start and after an action error.
-    #[cfg(target_os = "windows")]
-    pub fn present_toolbar(
-        &self,
-        app: &AppHandle,
-        selection_id: &str,
-        size: WindowSize,
-    ) -> tauri::Result<bool> {
-        let window = self.ensure_toolbar(app)?;
-        let _toolbar_operation = self.toolbar_operation.lock();
-        let native_started = Instant::now();
-        let size = toolbar_size(size);
-        let presented = present_windows_toolbar(
-            &window,
-            Arc::clone(&self.state),
-            selection_id.to_owned(),
-            size,
-        )?;
-        if !presented {
-            return Ok(false);
-        }
-        trace_toolbar_timing("native-visible", native_started);
-        self.start_toolbar_pointer_tracking(app, &window);
-        Ok(true)
-    }
-
-    /// Stages a macOS toolbar update while keeping the singleton WebView fully
-    /// transparent. AppKit's `order_front_without_focus` is idempotent, so
-    /// unlike Windows this does not need a paired native hide — dropping
-    /// alpha to 0 is enough to guarantee the next `present_toolbar` is the
-    /// first visible frame at the new selection's position/size.
-    #[cfg(target_os = "macos")]
-    pub fn stage_toolbar(
-        &self,
-        app: &AppHandle,
-        selection_id: &str,
-        anchor: Point,
-    ) -> tauri::Result<()> {
-        self.stage_toolbar_with_placement(app, selection_id, anchor, ToolbarPlacement::BottomMiddle)
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn stage_toolbar_with_placement(
-        &self,
-        app: &AppHandle,
-        selection_id: &str,
-        anchor: Point,
-        placement: ToolbarPlacement,
-    ) -> tauri::Result<()> {
-        let window = self.ensure_toolbar(app)?;
-        let _toolbar_operation = self.toolbar_operation.lock();
-        // The alpha hop only matters when a previous toolbar frame could
-        // still be visible. Every hide path clears `toolbar_selection_id`,
-        // so None means the singleton window is already invisible and the
-        // cross-thread hop can be skipped for the most common case: a fresh
-        // selection arriving while the toolbar is hidden.
-        let was_hidden = self.state.lock().toolbar_selection_id.is_none();
-        if !was_hidden {
-            // Never hold WindowState across the AppKit main-thread hop (see
-            // show_toolbar's invariant above): perform the alpha change
-            // first, then take the lock only for plain in-memory bookkeeping.
-            set_native_alpha_raw(&window, 0.0)?;
-        }
-        {
-            let mut state = self.state.lock();
-            state.toolbar_anchor = Some(anchor);
-            state.toolbar_placement = Some(placement);
-            state.toolbar_selection_id = Some(selection_id.to_owned());
-        }
         self.stop_toolbar_pointer_tracking();
-        Ok(())
-    }
-
-    /// Positions, sizes and reveals the prepared macOS toolbar. AppKit has no
-    /// single-call equivalent of Windows' atomic `SetWindowPos`, so position
-    /// and size are applied while alpha is still 0 and only the final alpha
-    /// flip to 1 is ever visible — matching Windows' one-visible-frame commit.
-    #[cfg(target_os = "macos")]
-    pub fn present_toolbar(
-        &self,
-        app: &AppHandle,
-        selection_id: &str,
-        size: WindowSize,
-    ) -> tauri::Result<bool> {
         let window = self.ensure_toolbar(app)?;
-        let _toolbar_operation = self.toolbar_operation.lock();
-        let native_started = Instant::now();
-        let size = toolbar_size(size);
-        let (anchor, placement) = {
-            let mut state = self.state.lock();
-            if state.toolbar_selection_id.as_deref() != Some(selection_id) {
+        let layout = toolbar_layout_with_placement(&window, anchor, size, placement)?;
+        let coordinator = self.clone();
+        let callback_app = app.clone();
+        self.run_toolbar_operation(&window, move |window| {
+            if !coordinator
+                .state
+                .lock()
+                .toolbar_operation_is_current(revision)
+            {
                 return Ok(false);
             }
-            state.toolbar_size = size;
-            (
-                state.toolbar_anchor,
-                state.toolbar_placement.unwrap_or_default(),
-            )
+            #[cfg(not(target_os = "windows"))]
+            stage_toolbar_window_raw(window, layout)?;
+            if !coordinator
+                .state
+                .lock()
+                .toolbar_operation_is_current(revision)
+            {
+                return Ok(false);
+            }
+            present_toolbar_window_raw(window, layout)?;
+            {
+                let mut state = coordinator.state.lock();
+                if !state.toolbar_operation_is_current(revision) {
+                    return Ok(false);
+                }
+                state.toolbar_present_pending = false;
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            coordinator.start_toolbar_pointer_tracking(&callback_app, window);
+            Ok(true)
+        })?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub fn stage_toolbar(
+        &self,
+        app: &AppHandle,
+        selection_id: &str,
+        anchor: Point,
+    ) -> tauri::Result<()> {
+        self.stage_toolbar_with_placement(app, selection_id, anchor, ToolbarPlacement::BottomMiddle)
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub fn stage_toolbar_with_placement(
+        &self,
+        app: &AppHandle,
+        selection_id: &str,
+        anchor: Point,
+        placement: ToolbarPlacement,
+    ) -> tauri::Result<()> {
+        // Reserve ownership before potentially blocking monitor reads. A later
+        // input/hide/rebuild invalidates this revision while layout is computed.
+        let reserved = self
+            .state
+            .lock()
+            .reserve_toolbar_stage(selection_id, anchor, placement);
+        let Some((revision, size)) = reserved else {
+            return Ok(());
         };
-        let Some(anchor) = anchor else {
-            return Ok(false);
-        };
+        self.stop_toolbar_pointer_tracking();
+        let window = self.ensure_toolbar(app)?;
         let layout = toolbar_layout_with_placement(&window, anchor, size, placement)?;
-        // A concurrent hide/newer selection may have replaced this one while
-        // layout was computed off-lock (mirrors show_toolbar's existing
-        // recheck).
-        if self.state.lock().toolbar_selection_id.as_deref() != Some(selection_id) {
-            return Ok(false);
-        }
-        commit_toolbar_presentation(&window, layout)?;
-        trace_toolbar_timing("native-visible", native_started);
-        // NSTrackingArea helps WKWebView receive mouse-move while non-key, but
-        // it is not reliable enough alone for continuous hover across action
-        // buttons. Keep the same 60 Hz pointer sampler Windows uses so
-        // `data-hovered` (background / soft shadow) updates on every move.
-        self.start_toolbar_pointer_tracking(app, &window);
-        Ok(true)
+        let state = Arc::clone(&self.state);
+        self.run_toolbar_operation(&window, move |window| {
+            if !state.lock().toolbar_operation_is_current(revision) {
+                return Ok(false);
+            }
+            stage_toolbar_window_raw(window, layout)?;
+            Ok(state.lock().toolbar_operation_is_current(revision))
+        })?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub fn present_toolbar(
+        &self,
+        app: &AppHandle,
+        selection_id: &str,
+        size: WindowSize,
+    ) -> tauri::Result<bool> {
+        let size = toolbar_size(size);
+        let reserved = {
+            let mut state = self.state.lock();
+            if !state.toolbar_selection_is_current(selection_id) {
+                return Ok(false);
+            }
+            let Some(anchor) = state.toolbar_anchor else {
+                return Ok(false);
+            };
+            let placement = state.toolbar_placement.unwrap_or_default();
+            let revision = state.request_toolbar_reveal();
+            (revision, anchor, placement)
+        };
+        let (revision, anchor, placement) = reserved;
+        let window = self.ensure_toolbar(app)?;
+        let layout = toolbar_layout_with_placement(&window, anchor, size, placement)?;
+        let coordinator = self.clone();
+        let callback_app = app.clone();
+        let native_started = Instant::now();
+        self.run_toolbar_operation(&window, move |window| {
+            if !coordinator
+                .state
+                .lock()
+                .toolbar_operation_is_current(revision)
+            {
+                return Ok(false);
+            }
+            // macOS lays out behind alpha 0, including timeout retries.
+            // Windows commits position, size and visibility in one SetWindowPos.
+            #[cfg(not(target_os = "windows"))]
+            stage_toolbar_window_raw(window, layout)?;
+            if !coordinator
+                .state
+                .lock()
+                .toolbar_operation_is_current(revision)
+            {
+                return Ok(false);
+            }
+            present_toolbar_window_raw(window, layout)?;
+            {
+                let mut state = coordinator.state.lock();
+                if !state.toolbar_operation_is_current(revision) {
+                    return Ok(false);
+                }
+                state.toolbar_size = size;
+                state.toolbar_present_pending = false;
+            }
+            trace_toolbar_timing("native-visible", native_started);
+            coordinator.start_toolbar_pointer_tracking(&callback_app, window);
+            Ok(true)
+        })
+        .map(|result| result.unwrap_or(true))
     }
 
     pub fn hide_toolbar(&self, app: &AppHandle) {
-        let selection_id = self.state.lock().toolbar_selection_id.clone();
-        if let Some(selection_id) = selection_id {
-            let _ = self.hide_toolbar_if_selection(app, &selection_id);
-            return;
-        }
-        let _toolbar_operation = self.toolbar_operation.lock();
-        let hidden = if let Some(window) = app.get_webview_window(TOOLBAR_LABEL) {
-            hide_toolbar_window(&window).is_ok()
-        } else {
-            true
-        };
-        if hidden {
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            self.stop_toolbar_pointer_tracking();
-            let mut state = self.state.lock();
-            state.toolbar_anchor = None;
-            state.toolbar_placement = None;
-            state.toolbar_selection_id = None;
-        }
+        let _ = self.hide_toolbar_for_owner(app, None);
     }
 
-    /// Hides a toolbar without making the selection event consumer wait for
-    /// the Windows UI dispatcher. The native operation rechecks the expected
-    /// selection id before mutating the singleton window, so a newer staged
-    /// selection cannot be hidden by an older dismiss request.
     pub fn hide_toolbar_if_selection_async(&self, app: &AppHandle, selection_id: &str) {
-        let coordinator = self.clone();
-        let app = app.clone();
-        let selection_id = selection_id.to_owned();
-        let _ = std::thread::Builder::new()
-            .name("textlens-toolbar-hide".to_owned())
-            .spawn(move || {
-                let _ = coordinator.hide_toolbar_if_selection(&app, &selection_id);
-            });
+        let Some(revision) = self
+            .state
+            .lock()
+            .reserve_toolbar_operation(Some(selection_id))
+        else {
+            return;
+        };
+        let _ = self.hide_toolbar_revision(app, revision, true);
     }
 
     pub fn hide_toolbar_if_selection(&self, app: &AppHandle, selection_id: &str) -> bool {
-        let Some(window) = app.get_webview_window(TOOLBAR_LABEL) else {
+        self.hide_toolbar_for_owner(app, Some(selection_id))
+    }
+
+    fn hide_toolbar_for_owner(&self, app: &AppHandle, selection_id: Option<&str>) -> bool {
+        let Some(revision) = self.state.lock().reserve_toolbar_operation(selection_id) else {
             return false;
         };
-        let _toolbar_operation = self.toolbar_operation.lock();
-        #[cfg(target_os = "windows")]
-        let hidden = hide_windows_toolbar_if_selection(
-            &window,
-            Arc::clone(&self.state),
-            selection_id.to_owned(),
-        )
-        .unwrap_or(false);
-        #[cfg(not(target_os = "windows"))]
-        let hidden = {
-            if self.state.lock().toolbar_selection_id.as_deref() != Some(selection_id) {
-                return false;
-            }
-            // On Windows `WebviewWindow::hide()` from a command thread only
-            // enqueues a runtime message. Waiting for a native UI-thread hide here
-            // keeps the visual window and its selection owner in sync and leaves
-            // the owner intact when hiding fails so the renderer can retry.
-            if hide_toolbar_window(&window).is_err() {
-                return false;
-            }
-            let mut state = self.state.lock();
-            if state.toolbar_selection_id.as_deref() != Some(selection_id) {
-                false
-            } else {
-                state.toolbar_anchor = None;
-                state.toolbar_placement = None;
-                state.toolbar_selection_id = None;
-                true
-            }
-        };
-        if hidden {
+        self.hide_toolbar_revision(app, revision, false)
+    }
+
+    fn hide_toolbar_revision(&self, app: &AppHandle, revision: u64, asynchronous: bool) -> bool {
+        let Some(window) = app.get_webview_window(TOOLBAR_LABEL) else {
+            let hidden = self.state.lock().clear_toolbar_if_current(revision);
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            self.stop_toolbar_pointer_tracking();
+            if hidden {
+                self.stop_toolbar_pointer_tracking();
+            }
+            return hidden;
+        };
+        let coordinator = self.clone();
+        let operation = move |window: &WebviewWindow| {
+            if !coordinator
+                .state
+                .lock()
+                .toolbar_operation_is_current(revision)
+            {
+                return Ok(false);
+            }
+            hide_toolbar_window_raw(window)?;
+            let hidden = coordinator.state.lock().clear_toolbar_if_current(revision);
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if hidden {
+                coordinator.stop_toolbar_pointer_tracking();
+            }
+            Ok(hidden)
+        };
+        if asynchronous {
+            self.run_toolbar_operation_async(&window, operation).is_ok()
+        } else {
+            self.run_toolbar_operation(&window, operation)
+                .map(|result| result.unwrap_or(true))
+                .unwrap_or(false)
         }
-        hidden
+    }
+
+    /// Available renderer CSS width on the display containing this anchor.
+    /// Called while building/replaying the selection payload, with no extra IPC.
+    pub fn toolbar_max_width(&self, app: &AppHandle, anchor: Point) -> f64 {
+        app.get_webview_window(TOOLBAR_LABEL)
+            .and_then(|window| monitor_geometry_for_point(&window, anchor).ok().flatten())
+            .map(toolbar_max_width_for_geometry)
+            .unwrap_or(900.0)
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -969,55 +1158,76 @@ impl WindowCoordinator {
         size: WindowSize,
     ) -> tauri::Result<bool> {
         let size = toolbar_size(size);
-        let window = app.get_webview_window(TOOLBAR_LABEL);
-        let _toolbar_operation = self.toolbar_operation.lock();
-        #[cfg(target_os = "windows")]
-        if let Some(window) = window {
-            return update_windows_toolbar_size(
-                &window,
-                Arc::clone(&self.state),
-                selection_id.map(str::to_owned),
-                size,
-            );
-        }
-        #[cfg(target_os = "windows")]
-        {
+        let reserved = {
             let mut state = self.state.lock();
-            if selection_id.is_some() && state.toolbar_selection_id.as_deref() != selection_id {
+            if state.toolbar_hide_pending {
                 return Ok(false);
             }
-            state.toolbar_size = size;
-            return Ok(true);
-        }
-        #[cfg(not(target_os = "windows"))]
-        let (anchor, placement) = {
-            let mut state = self.state.lock();
-            if selection_id.is_some() && state.toolbar_selection_id.as_deref() != selection_id {
+            if selection_id.is_some_and(|id| !state.toolbar_selection_is_current(id)) {
                 return Ok(false);
             }
-            if state.toolbar_size == size {
+            if state.toolbar_size == size && !state.toolbar_present_pending {
                 return Ok(true);
             }
-            state.toolbar_size = size;
+            let revision = state.invalidate_toolbar_operations();
+            let Some(anchor) = state.toolbar_anchor else {
+                state.toolbar_size = size;
+                return Ok(true);
+            };
             (
-                state.toolbar_anchor,
+                revision,
+                anchor,
                 state.toolbar_placement.unwrap_or_default(),
+                state.toolbar_reveal_requested,
             )
         };
-        #[cfg(not(target_os = "windows"))]
-        if let Some(window) = window {
-            if let (true, Some(anchor)) = (window.is_visible().unwrap_or(false), anchor) {
-                let layout = toolbar_layout_with_placement(&window, anchor, size, placement)?;
-                #[cfg(target_os = "windows")]
-                apply_toolbar_layout(&window, layout, false)?;
-                #[cfg(not(target_os = "windows"))]
-                apply_window_layout(&window, layout)?;
-            } else {
-                set_window_size_for_current_monitor(&window, size)?;
+        let Some(window) = app.get_webview_window(TOOLBAR_LABEL) else {
+            return Ok(false);
+        };
+        let (revision, anchor, placement, reveal) = reserved;
+        let layout = toolbar_layout_with_placement(&window, anchor, size, placement)?;
+        let coordinator = self.clone();
+        let callback_app = app.clone();
+        self.run_toolbar_operation(&window, move |window| {
+            if !coordinator
+                .state
+                .lock()
+                .toolbar_operation_is_current(revision)
+            {
+                return Ok(false);
             }
-        }
-        #[cfg(not(target_os = "windows"))]
-        Ok(true)
+            // A measured resize may overtake a pending presentation's monitor
+            // read. Carry its reveal intent so the newest size still becomes
+            // visible rather than cancelling the only show operation.
+            if reveal {
+                #[cfg(not(target_os = "windows"))]
+                stage_toolbar_window_raw(window, layout)?;
+                if !coordinator
+                    .state
+                    .lock()
+                    .toolbar_operation_is_current(revision)
+                {
+                    return Ok(false);
+                }
+                present_toolbar_window_raw(window, layout)?;
+            } else {
+                resize_toolbar_window_raw(window, layout)?;
+            }
+            {
+                let mut state = coordinator.state.lock();
+                if !state.toolbar_operation_is_current(revision) {
+                    return Ok(false);
+                }
+                state.toolbar_size = size;
+                state.toolbar_present_pending = false;
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if reveal {
+                coordinator.start_toolbar_pointer_tracking(&callback_app, window);
+            }
+            Ok(true)
+        })
+        .map(|result| result.unwrap_or(true))
     }
 
     pub fn point_inside_toolbar(&self, app: &AppHandle, point: Point) -> bool {
@@ -1080,6 +1290,7 @@ impl WindowCoordinator {
                 dismiss_mode: options.dismiss_mode,
                 dismiss_delay_ms: options.dismiss_delay_ms.clamp(100, 5_000),
                 hide_generation: 0,
+                pending_auto_close: None,
                 remember_size: options.remember_size,
                 ignore_resize_until: initial_result_resize_ignore_until(),
             },
@@ -1123,43 +1334,12 @@ impl WindowCoordinator {
         // `FailedToReceiveMessage`. The result renderer's prepare IPC is the
         // first deterministic proof that both the native window and WebView
         // exist, so all Windows native work is deliberately deferred there.
-        #[cfg(not(target_os = "windows"))]
-        {
-            let layout = match (|| -> tauri::Result<WindowLayout> {
-                configure_result_native(&window, options.pinned)
-                    .map_err(|error| result_window_step_error("native configuration", error))?;
-                prime_result_window_opacity(&window, options.opacity)
-                    .map_err(|error| result_window_step_error("opacity preparation", error))?;
-                let size = fit_size_to_monitor(&window, options.cursor, size)
-                    .map_err(|error| result_window_step_error("monitor sizing", error))?;
-                if options.follow_cursor {
-                    result_layout(&window, options.cursor, size)
-                        .map_err(|error| result_window_step_error("cursor layout", error))
-                } else {
-                    centered_layout(&window, options.cursor, size)
-                        .map_err(|error| result_window_step_error("centered layout", error))
-                }
-            })() {
-                Ok(layout) => layout,
-                Err(error) => {
-                    self.state.lock().results.remove(&label);
-                    let _ = window.close();
-                    return Err(error);
-                }
-            };
-            let show_result = apply_window_layout(&window, layout)
-                .map_err(|error| result_window_step_error("layout application", error))
-                .and_then(|_| show_result_window(&window, options.pinned, options.opacity));
-            if let Err(error) = show_result {
-                self.state.lock().results.remove(&label);
-                let _ = window.close();
-                return Err(error);
-            }
-        }
+        // Both platforms reveal the first hydrated frame. Native preparation
+        // remains transparent and never focuses an empty WebView.
         Ok(window)
     }
 
-    /// Makes a fully hydrated Windows result WebView participate in native
+    /// Makes a fully hydrated result WebView participate in native
     /// composition while it is still completely transparent and inactive.
     /// Repeated calls are harmless and never move a committed window back to
     /// the transparent state.
@@ -1262,6 +1442,10 @@ impl WindowCoordinator {
         if next == ResultRevealPhase::Committed {
             // Only focus events observed after commit may arm blur dismissal.
             runtime.focus_seen = false;
+            // Preserve a pointer currently inside the revealed surface, while
+            // invalidating every timer and historical enter from preparation.
+            runtime.pointer_seen = runtime.pointer_inside;
+            runtime.hide_generation = runtime.hide_generation.wrapping_add(1);
             runtime.ignore_resize_until = Instant::now();
         }
         Ok(())
@@ -1302,10 +1486,7 @@ impl WindowCoordinator {
                 .ok_or_else(|| result_reveal_error("result session no longer exists"))?;
             runtime.pinned = pinned;
             runtime.hide_generation = runtime.hide_generation.wrapping_add(1);
-            !pinned
-                && runtime.pointer_seen
-                && !runtime.pointer_inside
-                && runtime.dismiss_mode == DismissMode::PointerLeave
+            runtime.pointer_leave_armed()
         };
         if should_schedule {
             self.schedule_hide(app.clone(), label.to_owned());
@@ -1352,11 +1533,7 @@ impl WindowCoordinator {
                 runtime.dismiss_delay_ms = dismiss_delay_ms.clamp(100, 5_000);
                 runtime.remember_size = remember_size;
                 runtime.hide_generation = runtime.hide_generation.wrapping_add(1);
-                if dismiss_mode == DismissMode::PointerLeave
-                    && !runtime.pinned
-                    && runtime.pointer_seen
-                    && !runtime.pointer_inside
-                {
+                if runtime.pointer_leave_armed() {
                     schedule.push(label.clone());
                 }
             }
@@ -1372,15 +1549,7 @@ impl WindowCoordinator {
             let Some(runtime) = state.results.get_mut(label) else {
                 return;
             };
-            runtime.pointer_inside = inside;
-            if inside {
-                runtime.pointer_seen = true;
-            }
-            runtime.hide_generation = runtime.hide_generation.wrapping_add(1);
-            !inside
-                && runtime.pointer_seen
-                && !runtime.pinned
-                && runtime.dismiss_mode == DismissMode::PointerLeave
+            runtime.note_pointer_change(inside)
         };
         if should_schedule {
             self.schedule_hide(app.clone(), label.to_owned());
@@ -1395,10 +1564,9 @@ impl WindowCoordinator {
             .get_mut(label)
             .and_then(|runtime| runtime.note_focus_change(focused));
         #[cfg(not(target_os = "windows"))]
-        if blur_generation.is_some() {
-            if let Some(window) = app.get_webview_window(label) {
-                let _ = window.close();
-            }
+        if let Some(blur_generation) = blur_generation {
+            let _ =
+                self.request_result_auto_close(app, label, AutoCloseOrigin::Blur(blur_generation));
         }
         #[cfg(target_os = "windows")]
         if let Some(blur_generation) = blur_generation {
@@ -1409,6 +1577,7 @@ impl WindowCoordinator {
     #[cfg(target_os = "windows")]
     fn schedule_verified_result_blur(&self, app: AppHandle, label: String, blur_generation: u64) {
         let state = Arc::clone(&self.state);
+        let coordinator = self.clone();
         std::thread::spawn(move || {
             for _ in 0..RESULT_BLUR_VERIFY_ATTEMPTS {
                 std::thread::sleep(RESULT_BLUR_VERIFY_DELAY);
@@ -1427,14 +1596,11 @@ impl WindowCoordinator {
                     ResultForegroundScope::Internal => return,
                     ResultForegroundScope::Unknown => continue,
                     ResultForegroundScope::External => {
-                        let still_current = state
-                            .lock()
-                            .results
-                            .get(&label)
-                            .is_some_and(|runtime| runtime.blur_is_current(blur_generation));
-                        if still_current {
-                            let _ = window.close();
-                        }
+                        let _ = coordinator.request_result_auto_close(
+                            &app,
+                            &label,
+                            AutoCloseOrigin::Blur(blur_generation),
+                        );
                         return;
                     }
                 }
@@ -1443,12 +1609,85 @@ impl WindowCoordinator {
     }
 
     pub fn close_result(&self, app: &AppHandle, label: &str) -> tauri::Result<()> {
+        if let Some(runtime) = self.state.lock().results.get_mut(label) {
+            // Explicit closes retain their ordinary close semantics.
+            runtime.cancel_auto_close_request();
+        }
         if let Some(window) = app.get_webview_window(label) {
             window.close()?;
         } else {
             self.state.lock().results.remove(label);
         }
         Ok(())
+    }
+
+    fn request_result_auto_close(
+        &self,
+        app: &AppHandle,
+        label: &str,
+        origin: AutoCloseOrigin,
+    ) -> tauri::Result<()> {
+        let Some(window) = app.get_webview_window(label) else {
+            return Ok(());
+        };
+        let request = self
+            .state
+            .lock()
+            .results
+            .get_mut(label)
+            .is_some_and(|runtime| runtime.prepare_auto_close_request(origin));
+        if !request {
+            return Ok(());
+        }
+        if let Err(error) = window.close() {
+            if let Some(runtime) = self.state.lock().results.get_mut(label) {
+                if runtime.pending_auto_close == Some(origin) {
+                    runtime.cancel_auto_close_request();
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Revalidates a queued automatic dismissal at Tauri's final CloseRequested
+    /// boundary. Requests with no automatic token are ordinary/manual closes.
+    pub fn accept_result_close_request(&self, app: &AppHandle, label: &str) -> bool {
+        let decision = verified_result_close_request_decision(
+            &self.state,
+            label,
+            || {
+                (
+                    cursor_is_outside(app, label),
+                    cursor_is_inside_visible_window(app, TOOLBAR_LABEL),
+                )
+            },
+            || {
+                let Some(window) = app.get_webview_window(label) else {
+                    return ResultForegroundScope::Unknown;
+                };
+                #[cfg(target_os = "windows")]
+                {
+                    result_foreground_scope(app, &window)
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    match window.is_focused() {
+                        Ok(true) => ResultForegroundScope::Internal,
+                        Ok(false) => ResultForegroundScope::External,
+                        Err(_) => ResultForegroundScope::Unknown,
+                    }
+                }
+            },
+        );
+        match decision {
+            PointerLeaveTimeoutDecision::Close => true,
+            PointerLeaveTimeoutDecision::Retry => {
+                self.schedule_hide(app.clone(), label.to_owned());
+                false
+            }
+            PointerLeaveTimeoutDecision::Ignore => false,
+        }
     }
 
     pub fn remove_result(&self, label: &str) -> Option<String> {
@@ -1472,7 +1711,9 @@ impl WindowCoordinator {
         let Some(runtime) = state.results.get_mut(label) else {
             return false;
         };
-        runtime.remember_size && Instant::now() >= runtime.ignore_resize_until
+        runtime.reveal_phase == ResultRevealPhase::Committed
+            && runtime.remember_size
+            && Instant::now() >= runtime.ignore_resize_until
     }
 
     pub fn ignore_resize_temporarily(&self, label: &str) {
@@ -1492,30 +1733,41 @@ impl WindowCoordinator {
         let coordinator = self.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            let should_hide = coordinator
-                .state
-                .lock()
-                .results
-                .get(&label)
-                .is_some_and(|runtime| {
-                    runtime.hide_generation == generation
-                        && !runtime.pointer_inside
-                        && !runtime.pinned
-                        && runtime.dismiss_mode == DismissMode::PointerLeave
-                });
-            let cursor_outside_result = cursor_is_outside(&app, &label);
-            let cursor_inside_toolbar = cursor_is_inside_visible_window(&app, TOOLBAR_LABEL);
-            if pointer_leave_should_close(should_hide, cursor_outside_result, cursor_inside_toolbar)
-            {
-                if let Some(window) = app.get_webview_window(&label) {
-                    let _ = window.close();
+            let callback_app = app.clone();
+            // Geometry getters and the close must share the UI task. A worker
+            // must not close using a snapshot taken before queued input/pin IPC.
+            let _ = app.run_on_main_thread(move || {
+                if callback_app.get_webview_window(&label).is_none() {
+                    return;
                 }
-            } else if should_hide && cursor_outside_result && cursor_inside_toolbar {
-                // Treat the selection toolbar as a temporary extension of the
-                // result window. Keep checking so the source result still
-                // closes after the toolbar disappears or the pointer leaves it.
-                coordinator.schedule_hide(app, label);
-            }
+                let decision = verified_pointer_leave_timeout_decision(
+                    &coordinator.state,
+                    &label,
+                    generation,
+                    || {
+                        (
+                            cursor_is_outside(&callback_app, &label),
+                            cursor_is_inside_visible_window(&callback_app, TOOLBAR_LABEL),
+                        )
+                    },
+                );
+                match decision {
+                    PointerLeaveTimeoutDecision::Close => {
+                        // The helper rechecked the token after all native reads;
+                        // no state lock remains held across Destroyed callbacks.
+                        let _ = coordinator.request_result_auto_close(
+                            &callback_app,
+                            &label,
+                            AutoCloseOrigin::PointerLeave(generation),
+                        );
+                    }
+                    PointerLeaveTimeoutDecision::Retry => {
+                        // The toolbar temporarily extends the result's surface.
+                        coordinator.schedule_hide(callback_app, label);
+                    }
+                    PointerLeaveTimeoutDecision::Ignore => {}
+                }
+            });
         });
     }
 }
@@ -1848,6 +2100,16 @@ fn toolbar_native_frame_size(size: WindowSize, coordinate_scale: f64) -> WindowS
     }
 }
 
+fn toolbar_max_width_for_geometry(geometry: MonitorGeometry) -> f64 {
+    let available = geometry.work_area.width / normalized_scale(geometry.coordinate_scale)
+        - TOOLBAR_SCREEN_MARGIN * 2.0;
+    if available.is_finite() {
+        available.clamp(44.0, 900.0)
+    } else {
+        900.0
+    }
+}
+
 fn normalized_scale(scale: f64) -> f64 {
     if scale.is_finite() && scale > 0.0 {
         scale
@@ -1914,17 +2176,6 @@ fn apply_window_layout(window: &WebviewWindow, layout: WindowLayout) -> tauri::R
 }
 
 #[cfg(target_os = "windows")]
-fn apply_toolbar_layout(
-    window: &WebviewWindow,
-    layout: WindowLayout,
-    show: bool,
-) -> tauri::Result<()> {
-    run_windows_window_operation(window, move |window| {
-        apply_toolbar_layout_raw(window, layout, show)
-    })
-}
-
-#[cfg(target_os = "windows")]
 fn apply_toolbar_layout_raw(
     window: &WebviewWindow,
     layout: WindowLayout,
@@ -1957,11 +2208,6 @@ fn apply_toolbar_layout_raw(
 }
 
 #[cfg(target_os = "windows")]
-fn hide_toolbar_window(window: &WebviewWindow) -> tauri::Result<()> {
-    run_windows_window_operation(window, hide_toolbar_window_raw)
-}
-
-#[cfg(target_os = "windows")]
 fn hide_toolbar_window_raw(window: &WebviewWindow) -> tauri::Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::{
         SetWindowPos, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
@@ -1983,180 +2229,67 @@ fn hide_toolbar_window_raw(window: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-fn stage_windows_toolbar(
-    window: &WebviewWindow,
-    state: Arc<Mutex<WindowState>>,
-    selection_id: String,
-    anchor: Point,
-) -> tauri::Result<()> {
-    stage_windows_toolbar_with_placement(
-        window,
-        state,
-        selection_id,
-        anchor,
-        ToolbarPlacement::BottomMiddle,
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn stage_windows_toolbar_with_placement(
-    window: &WebviewWindow,
-    state: Arc<Mutex<WindowState>>,
-    selection_id: String,
-    anchor: Point,
-    placement: ToolbarPlacement,
-) -> tauri::Result<()> {
-    // Resolve monitor geometry before entering the event-loop callback. WRY's
-    // monitor and scale getters may synchronously dispatch work; using them
-    // from the UI callback itself can deadlock that dispatcher on Windows.
-    let size = {
-        let mut state = state.lock();
-        state.toolbar_anchor = Some(anchor);
-        state.toolbar_placement = Some(placement);
-        state.toolbar_selection_id = Some(selection_id.clone());
-        state.toolbar_size
-    };
-    let layout = toolbar_layout_with_placement(window, anchor, size, placement)?;
-    run_windows_window_operation(window, move |window| {
-        // Do not let a delayed native callback resurrect an older selection.
-        if state.lock().toolbar_selection_id.as_deref() != Some(selection_id.as_str()) {
-            return Ok(());
-        }
-        // Hide the old frame before moving it. The renderer will reveal this
-        // generation through present_toolbar after React has received the new
-        // selection and measured the actual DOM size.
-        hide_toolbar_window_raw(window)?;
-        apply_toolbar_layout_raw(window, layout, false)?;
-        Ok(())
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn present_windows_toolbar(
-    window: &WebviewWindow,
-    state: Arc<Mutex<WindowState>>,
-    selection_id: String,
-    size: WindowSize,
-) -> tauri::Result<bool> {
-    let presented = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let committed = Arc::clone(&presented);
-    let (anchor, placement) = {
-        let state = state.lock();
-        if state.toolbar_selection_id.as_deref() != Some(selection_id.as_str()) {
-            return Ok(false);
-        }
-        let anchor = state
-            .toolbar_anchor
-            .ok_or_else(|| std::io::Error::other("toolbar anchor is unavailable"))?;
-        let placement = state.toolbar_placement.unwrap_or_default();
-        (anchor, placement)
-    };
-    // See `stage_windows_toolbar_with_placement`: this must stay outside the
-    // UI operation to avoid re-entering the Windows event dispatcher.
-    let layout = toolbar_layout_with_placement(window, anchor, size, placement)?;
-    run_windows_window_operation(window, move |window| {
-        if state.lock().toolbar_selection_id.as_deref() != Some(selection_id.as_str()) {
-            return Ok(());
-        }
-        apply_toolbar_layout_raw(window, layout, true)?;
-        // Publish the measured size only after the native visible commit has
-        // succeeded. A stale or timed-out operation must not poison the next
-        // selection's initial layout with an unpresented size.
-        state.lock().toolbar_size = size;
-        committed.store(true, Ordering::Release);
-        Ok(())
-    })?;
-    Ok(presented.load(Ordering::Acquire))
-}
-
-#[cfg(target_os = "windows")]
-fn hide_windows_toolbar_if_selection(
-    window: &WebviewWindow,
-    state: Arc<Mutex<WindowState>>,
-    selection_id: String,
-) -> tauri::Result<bool> {
-    let hidden = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let committed = Arc::clone(&hidden);
-    run_windows_window_operation(window, move |window| {
-        let mut state = state.lock();
-        if state.toolbar_selection_id.as_deref() != Some(selection_id.as_str()) {
-            return Ok(());
-        }
-        hide_toolbar_window_raw(window)?;
-        state.toolbar_anchor = None;
-        state.toolbar_placement = None;
-        state.toolbar_selection_id = None;
-        committed.store(true, Ordering::Release);
-        Ok(())
-    })?;
-    Ok(hidden.load(Ordering::Acquire))
-}
-
-#[cfg(target_os = "windows")]
-fn update_windows_toolbar_size(
-    window: &WebviewWindow,
-    state: Arc<Mutex<WindowState>>,
-    selection_id: Option<String>,
-    size: WindowSize,
-) -> tauri::Result<bool> {
-    let anchor_and_placement = {
-        let state = state.lock();
-        if selection_id.is_some()
-            && state.toolbar_selection_id.as_deref() != selection_id.as_deref()
-        {
-            return Ok(false);
-        }
-        if state.toolbar_size == size {
-            return Ok(true);
-        }
-        state
-            .toolbar_anchor
-            .map(|anchor| (anchor, state.toolbar_placement.unwrap_or_default()))
-    };
-
-    let Some((anchor, placement)) = anchor_and_placement else {
-        // There is no staged selection yet. Scale lookup is safe here because
-        // this call is outside the native UI operation.
-        set_window_size_for_current_monitor(window, size)?;
-        let mut state = state.lock();
-        if selection_id.is_some()
-            && state.toolbar_selection_id.as_deref() != selection_id.as_deref()
-        {
-            return Ok(false);
-        }
-        state.toolbar_size = size;
-        return Ok(true);
-    };
-    let layout = toolbar_layout_with_placement(window, anchor, size, placement)?;
-    let updated = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let committed = Arc::clone(&updated);
-    run_windows_window_operation(window, move |window| {
-        {
-            let state = state.lock();
-            if selection_id.is_some()
-                && state.toolbar_selection_id.as_deref() != selection_id.as_deref()
-            {
-                return Ok(());
-            }
-        }
-        apply_toolbar_layout_raw(window, layout, false)?;
-        let mut state = state.lock();
-        if selection_id.is_some()
-            && state.toolbar_selection_id.as_deref() != selection_id.as_deref()
-        {
-            return Ok(());
-        }
-        state.toolbar_size = size;
-        committed.store(true, Ordering::Release);
-        Ok(())
-    })?;
-    Ok(updated.load(Ordering::Acquire))
-}
-
 #[cfg(not(target_os = "windows"))]
-fn hide_toolbar_window(window: &WebviewWindow) -> tauri::Result<()> {
+fn hide_toolbar_window_raw(window: &WebviewWindow) -> tauri::Result<()> {
     window.hide()
+}
+
+fn stage_toolbar_window_raw(window: &WebviewWindow, layout: WindowLayout) -> tauri::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        hide_toolbar_window_raw(window)?;
+        apply_toolbar_layout_raw(window, layout, false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::NSWindow;
+        let pointer = window.ns_window()?;
+        unsafe {
+            (&*(pointer as *const NSWindow)).setAlphaValue(0.0);
+        }
+        apply_window_layout(window, layout)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        window.hide()?;
+        apply_window_layout(window, layout)
+    }
+}
+
+fn present_toolbar_window_raw(window: &WebviewWindow, layout: WindowLayout) -> tauri::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        apply_toolbar_layout_raw(window, layout, true)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::NSWindow;
+        // The same UI transaction already applied the hidden layout.
+        let _ = layout;
+        let pointer = window.ns_window()?;
+        unsafe {
+            let window = &*(pointer as *const NSWindow);
+            window.orderFrontRegardless();
+            window.setAlphaValue(1.0);
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = layout;
+        window.show()
+    }
+}
+
+fn resize_toolbar_window_raw(window: &WebviewWindow, layout: WindowLayout) -> tauri::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        apply_toolbar_layout_raw(window, layout, false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        apply_window_layout(window, layout)
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2166,26 +2299,6 @@ fn apply_window_layout(window: &WebviewWindow, layout: WindowLayout) -> tauri::R
         layout.coordinate_size.width,
         layout.coordinate_size.height,
     ))
-}
-
-#[cfg(target_os = "windows")]
-fn set_window_size_for_current_monitor(
-    window: &WebviewWindow,
-    logical_size: WindowSize,
-) -> tauri::Result<()> {
-    let size = logical_size_to_coordinates(logical_size, current_window_coordinate_scale(window));
-    window.set_size(PhysicalSize::new(
-        physical_dimension(size.width),
-        physical_dimension(size.height),
-    ))
-}
-
-#[cfg(not(target_os = "windows"))]
-fn set_window_size_for_current_monitor(
-    window: &WebviewWindow,
-    logical_size: WindowSize,
-) -> tauri::Result<()> {
-    window.set_size(LogicalSize::new(logical_size.width, logical_size.height))
 }
 
 #[cfg(target_os = "windows")]
@@ -2490,6 +2603,85 @@ fn pointer_leave_should_close(
     timer_is_current && cursor_outside_result && !cursor_inside_toolbar
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerLeaveTimeoutDecision {
+    Ignore,
+    Close,
+    Retry,
+}
+
+fn verified_pointer_leave_timeout_decision(
+    state: &Mutex<WindowState>,
+    label: &str,
+    generation: u64,
+    read_cursor_scope: impl FnOnce() -> (bool, bool),
+) -> PointerLeaveTimeoutDecision {
+    let timer_is_current = || {
+        state
+            .lock()
+            .results
+            .get(label)
+            .is_some_and(|runtime| runtime.pointer_leave_is_current(generation))
+    };
+    if !timer_is_current() {
+        return PointerLeaveTimeoutDecision::Ignore;
+    }
+    let (cursor_outside_result, cursor_inside_toolbar) = read_cursor_scope();
+    // Native reads may reenter handlers or overlap a settings/input update.
+    // Validate again immediately before the caller performs native close.
+    let current = timer_is_current();
+    if pointer_leave_should_close(current, cursor_outside_result, cursor_inside_toolbar) {
+        PointerLeaveTimeoutDecision::Close
+    } else if current && cursor_outside_result && cursor_inside_toolbar {
+        PointerLeaveTimeoutDecision::Retry
+    } else {
+        PointerLeaveTimeoutDecision::Ignore
+    }
+}
+
+fn verified_result_close_request_decision(
+    state: &Mutex<WindowState>,
+    label: &str,
+    read_cursor_scope: impl FnOnce() -> (bool, bool),
+    read_blur_scope: impl FnOnce() -> ResultForegroundScope,
+) -> PointerLeaveTimeoutDecision {
+    let origin = state
+        .lock()
+        .results
+        .get_mut(label)
+        .and_then(|runtime| runtime.pending_auto_close.take());
+    let Some(origin) = origin else {
+        // No automatic provenance: honor ordinary manual close requests.
+        return PointerLeaveTimeoutDecision::Close;
+    };
+    match origin {
+        AutoCloseOrigin::PointerLeave(generation) => {
+            verified_pointer_leave_timeout_decision(state, label, generation, read_cursor_scope)
+        }
+        AutoCloseOrigin::Blur(generation) => {
+            let blur_is_current = || {
+                state
+                    .lock()
+                    .results
+                    .get(label)
+                    .is_some_and(|runtime| runtime.blur_is_current(generation))
+            };
+            if !blur_is_current() {
+                return PointerLeaveTimeoutDecision::Ignore;
+            }
+            // macOS drains proxy Close events before pending Focused(true)
+            // events. Native key/foreground state closes that delivery gap.
+            let scope = read_blur_scope();
+            let current = blur_is_current();
+            if scope == ResultForegroundScope::External && current {
+                PointerLeaveTimeoutDecision::Close
+            } else {
+                PointerLeaveTimeoutDecision::Ignore
+            }
+        }
+    }
+}
+
 /// Quietly return key-focus to the selection source after a toolbar action.
 ///
 /// Prefer cooperative yield + a soft activate (no `ActivateAllWindows`) so the
@@ -2614,29 +2806,45 @@ fn install_toolbar_mouse_tracking(window: &WebviewWindow) -> tauri::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn configure_result_native(window: &WebviewWindow, pinned: bool) -> tauri::Result<()> {
-    use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+    run_macos_window_operation(window, move |window| {
+        configure_result_native_raw(window, pinned)
+    })
+}
 
+#[cfg(target_os = "macos")]
+fn run_macos_window_operation<T: Send + 'static>(
+    window: &WebviewWindow,
+    operation: impl FnOnce(&WebviewWindow) -> tauri::Result<T> + Send + 'static,
+) -> tauri::Result<T> {
+    if objc2::MainThreadMarker::new().is_some() {
+        return operation(window);
+    }
     let app = window.app_handle().clone();
     let window = window.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     app.run_on_main_thread(move || {
-        let result = window.ns_window().map(|pointer| unsafe {
-            let window = &*(pointer as *const NSWindow);
-            let behavior = if pinned {
-                NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | NSWindowCollectionBehavior::FullScreenAuxiliary
-            } else {
-                NSWindowCollectionBehavior::MoveToActiveSpace
-                    | NSWindowCollectionBehavior::FullScreenAuxiliary
-            };
-            window.setCollectionBehavior(behavior);
-        });
-        let _ = sender.send(result);
+        let _ = sender.send(operation(&window));
     })?;
     receiver
         .recv_timeout(MACOS_MAIN_THREAD_HOP_TIMEOUT)
-        .map_err(|_| tauri::Error::FailedToReceiveMessage)??;
-    Ok(())
+        .map_err(|_| tauri::Error::FailedToReceiveMessage)?
+}
+
+#[cfg(target_os = "macos")]
+fn configure_result_native_raw(window: &WebviewWindow, pinned: bool) -> tauri::Result<()> {
+    use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+
+    window.ns_window().map(|pointer| unsafe {
+        let window = &*(pointer as *const NSWindow);
+        let behavior = if pinned {
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+        } else {
+            NSWindowCollectionBehavior::MoveToActiveSpace
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+        };
+        window.setCollectionBehavior(behavior);
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -2746,52 +2954,6 @@ fn configure_toolbar_native(_window: &WebviewWindow) -> tauri::Result<()> {
 /// one dispatch. Tauri's `set_position`/`set_size` execute inline when the
 /// caller is already on the main thread, so one hop replaces the three
 /// cross-thread round trips this commit path previously paid.
-#[cfg(target_os = "macos")]
-fn commit_toolbar_presentation(window: &WebviewWindow, layout: WindowLayout) -> tauri::Result<()> {
-    use objc2_app_kit::NSWindow;
-
-    let app = window.app_handle().clone();
-    let window = window.clone();
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    app.run_on_main_thread(move || {
-        let result = (|| -> tauri::Result<()> {
-            apply_window_layout(&window, layout)?;
-            let pointer = window.ns_window()?;
-            unsafe {
-                let ns_window = &*(pointer as *const NSWindow);
-                ns_window.orderFrontRegardless();
-                ns_window.setAlphaValue(1.0);
-            }
-            Ok(())
-        })();
-        let _ = sender.send(result);
-    })?;
-    receiver
-        .recv_timeout(MACOS_MAIN_THREAD_HOP_TIMEOUT)
-        .map_err(|_| tauri::Error::FailedToReceiveMessage)??;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn order_front_without_focus(window: &WebviewWindow) -> tauri::Result<()> {
-    use objc2_app_kit::NSWindow;
-
-    let app = window.app_handle().clone();
-    let window = window.clone();
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    app.run_on_main_thread(move || {
-        let result = window.ns_window().map(|pointer| unsafe {
-            let window = &*(pointer as *const NSWindow);
-            window.orderFrontRegardless();
-        });
-        let _ = sender.send(result);
-    })?;
-    receiver
-        .recv_timeout(MACOS_MAIN_THREAD_HOP_TIMEOUT)
-        .map_err(|_| tauri::Error::FailedToReceiveMessage)??;
-    Ok(())
-}
-
 #[cfg(target_os = "windows")]
 fn order_front_without_focus(window: &WebviewWindow) -> tauri::Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -2827,20 +2989,12 @@ fn order_front_without_focus(window: &WebviewWindow) -> tauri::Result<()> {
 fn set_native_alpha_raw(window: &WebviewWindow, alpha: f64) -> tauri::Result<()> {
     use objc2_app_kit::NSWindow;
 
-    let app = window.app_handle().clone();
-    let window = window.clone();
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    app.run_on_main_thread(move || {
-        let result = window.ns_window().map(|pointer| unsafe {
+    run_macos_window_operation(window, move |window| {
+        window.ns_window().map(|pointer| unsafe {
             let window = &*(pointer as *const NSWindow);
             window.setAlphaValue(alpha);
-        });
-        let _ = sender.send(result);
-    })?;
-    receiver
-        .recv_timeout(MACOS_MAIN_THREAD_HOP_TIMEOUT)
-        .map_err(|_| tauri::Error::FailedToReceiveMessage)??;
-    Ok(())
+        })
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2888,11 +3042,6 @@ fn set_native_alpha_raw(window: &WebviewWindow, alpha: u8) -> tauri::Result<()> 
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
-fn prime_result_window_opacity(window: &WebviewWindow, opacity: f64) -> tauri::Result<()> {
-    set_native_opacity(window, opacity)
-}
-
 #[cfg(target_os = "windows")]
 fn prepare_result_window(
     window: &WebviewWindow,
@@ -2934,13 +3083,39 @@ fn prepare_result_window(
     })
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 fn prepare_result_window(
-    _window: &WebviewWindow,
-    _pinned: bool,
-    _placement: ResultPlacement,
+    window: &WebviewWindow,
+    pinned: bool,
+    placement: ResultPlacement,
 ) -> tauri::Result<()> {
-    Ok(())
+    run_macos_window_operation(window, move |window| {
+        use objc2_app_kit::NSWindow;
+        configure_result_native_raw(window, pinned)?;
+        let size = fit_size_to_monitor(window, placement.cursor, placement.size)?;
+        let layout = if placement.follow_cursor {
+            result_layout(window, placement.cursor, size)?
+        } else {
+            centered_layout(window, placement.cursor, size)?
+        };
+        let pointer = window.ns_window()?;
+        let native = unsafe { &*(pointer as *const NSWindow) };
+        native.setAlphaValue(0.0);
+        apply_window_layout(window, layout)?;
+        // Let WebKit composite the hydrated frame without activating TextLens.
+        native.orderFrontRegardless();
+        Ok(())
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn prepare_result_window(
+    window: &WebviewWindow,
+    _pinned: bool,
+    placement: ResultPlacement,
+) -> tauri::Result<()> {
+    let layout = result_layout(window, placement.cursor, placement.size)?;
+    apply_window_layout(window, layout)
 }
 
 #[cfg(target_os = "windows")]
@@ -2953,7 +3128,16 @@ fn show_result_window(window: &WebviewWindow, pinned: bool, opacity: f64) -> tau
     })
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn show_result_window(window: &WebviewWindow, _pinned: bool, opacity: f64) -> tauri::Result<()> {
+    run_macos_window_operation(window, move |window| {
+        set_native_opacity(window, opacity)?;
+        window.show()?;
+        window.set_focus()
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn show_result_window(window: &WebviewWindow, _pinned: bool, _opacity: f64) -> tauri::Result<()> {
     window.show()?;
     window.set_focus()
@@ -3190,6 +3374,7 @@ mod tests {
             dismiss_mode: DismissMode::Blur,
             dismiss_delay_ms: 450,
             hide_generation: 0,
+            pending_auto_close: None,
             remember_size: true,
             ignore_resize_until: Instant::now(),
         }
@@ -3218,11 +3403,8 @@ mod tests {
     }
 
     #[test]
-    fn result_reveal_starts_hidden_only_on_windows() {
-        #[cfg(target_os = "windows")]
+    fn result_reveal_starts_hidden_until_the_hydrated_frame_on_every_platform() {
         assert_eq!(initial_result_reveal_phase(), ResultRevealPhase::Hidden);
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(initial_result_reveal_phase(), ResultRevealPhase::Committed);
     }
 
     #[test]
@@ -3296,6 +3478,459 @@ mod tests {
     }
 
     #[test]
+    fn queued_pointer_close_revalidates_state_and_deduplicates_requests() {
+        let transitions: [fn(&mut ResultRuntime); 4] = [
+            |runtime| {
+                runtime.note_pointer_change(true);
+            },
+            |runtime| {
+                runtime.pinned = true;
+            },
+            |runtime| {
+                runtime.reveal_phase = ResultRevealPhase::Prepared;
+            },
+            |runtime| {
+                runtime.dismiss_mode = DismissMode::Manual;
+            },
+        ];
+        for transition in transitions {
+            let coordinator = WindowCoordinator::default();
+            let label = "selection-result-queued-pointer";
+            let mut runtime = blur_result_runtime(ResultRevealPhase::Committed);
+            runtime.dismiss_mode = DismissMode::PointerLeave;
+            runtime.note_pointer_change(true);
+            assert!(runtime.note_pointer_change(false));
+            let origin = AutoCloseOrigin::PointerLeave(runtime.hide_generation);
+            assert!(runtime.prepare_auto_close_request(origin));
+            assert!(!runtime.prepare_auto_close_request(origin));
+            transition(&mut runtime);
+            coordinator
+                .state
+                .lock()
+                .results
+                .insert(label.to_owned(), runtime);
+            assert_eq!(
+                verified_result_close_request_decision(
+                    &coordinator.state,
+                    label,
+                    || { panic!("stale automatic close must skip native reads") },
+                    || panic!("pointer close does not read native focus")
+                ),
+                PointerLeaveTimeoutDecision::Ignore
+            );
+            assert!(coordinator
+                .state
+                .lock()
+                .results
+                .get(label)
+                .unwrap()
+                .pending_auto_close
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn queued_pointer_close_checks_physical_reentry_and_toolbar_before_frontend_ipc() {
+        for (outside, toolbar, expected) in [
+            (false, false, PointerLeaveTimeoutDecision::Ignore),
+            (true, true, PointerLeaveTimeoutDecision::Retry),
+            (true, false, PointerLeaveTimeoutDecision::Close),
+        ] {
+            let coordinator = WindowCoordinator::default();
+            let label = "selection-result-queued-physical-pointer";
+            let mut runtime = blur_result_runtime(ResultRevealPhase::Committed);
+            runtime.dismiss_mode = DismissMode::PointerLeave;
+            runtime.note_pointer_change(true);
+            assert!(runtime.note_pointer_change(false));
+            assert!(
+                runtime.prepare_auto_close_request(AutoCloseOrigin::PointerLeave(
+                    runtime.hide_generation
+                ))
+            );
+            coordinator
+                .state
+                .lock()
+                .results
+                .insert(label.to_owned(), runtime);
+            // Cached pointerInside still says outside. Fresh physical geometry
+            // must veto a queued close before the enter IPC reaches the backend.
+            assert_eq!(
+                verified_result_close_request_decision(
+                    &coordinator.state,
+                    label,
+                    || (outside, toolbar),
+                    || panic!("pointer close does not read native focus")
+                ),
+                expected
+            );
+            assert!(
+                !coordinator
+                    .state
+                    .lock()
+                    .results
+                    .get(label)
+                    .unwrap()
+                    .pointer_inside
+            );
+            assert!(coordinator
+                .state
+                .lock()
+                .results
+                .get(label)
+                .unwrap()
+                .pending_auto_close
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn queued_blur_close_checks_native_focus_before_pending_focus_event() {
+        for (scope, expected) in [
+            (
+                ResultForegroundScope::Internal,
+                PointerLeaveTimeoutDecision::Ignore,
+            ),
+            (
+                ResultForegroundScope::Unknown,
+                PointerLeaveTimeoutDecision::Ignore,
+            ),
+            (
+                ResultForegroundScope::External,
+                PointerLeaveTimeoutDecision::Close,
+            ),
+        ] {
+            let coordinator = WindowCoordinator::default();
+            let label = "selection-result-pending-native-focus";
+            let mut runtime = blur_result_runtime(ResultRevealPhase::Committed);
+            runtime.note_focus_change(true);
+            let generation = runtime.note_focus_change(false).unwrap();
+            assert!(runtime.prepare_auto_close_request(AutoCloseOrigin::Blur(generation)));
+            coordinator
+                .state
+                .lock()
+                .results
+                .insert(label.to_owned(), runtime);
+            let mut native_read = false;
+            assert_eq!(
+                verified_result_close_request_decision(
+                    &coordinator.state,
+                    label,
+                    || panic!("blur close must not read pointer geometry"),
+                    || {
+                        native_read = true;
+                        // Native focus may have changed while Focused(true)
+                        // remains pending behind the proxy Close event.
+                        assert_eq!(
+                            coordinator
+                                .state
+                                .lock()
+                                .results
+                                .get(label)
+                                .unwrap()
+                                .blur_generation,
+                            generation
+                        );
+                        scope
+                    },
+                ),
+                expected
+            );
+            assert!(native_read);
+            assert_eq!(
+                coordinator
+                    .state
+                    .lock()
+                    .results
+                    .get(label)
+                    .unwrap()
+                    .blur_generation,
+                generation
+            );
+        }
+    }
+
+    #[test]
+    fn queued_blur_close_revalidates_generation_and_pin_after_native_focus_read() {
+        let transitions: [fn(&mut ResultRuntime); 2] = [
+            |runtime| {
+                runtime.note_focus_change(true);
+            },
+            |runtime| {
+                runtime.pinned = true;
+            },
+        ];
+        for transition in transitions {
+            let coordinator = WindowCoordinator::default();
+            let label = "selection-result-native-focus-read-race";
+            let mut runtime = blur_result_runtime(ResultRevealPhase::Committed);
+            runtime.note_focus_change(true);
+            let generation = runtime.note_focus_change(false).unwrap();
+            assert!(runtime.prepare_auto_close_request(AutoCloseOrigin::Blur(generation)));
+            coordinator
+                .state
+                .lock()
+                .results
+                .insert(label.to_owned(), runtime);
+            assert_eq!(
+                verified_result_close_request_decision(
+                    &coordinator.state,
+                    label,
+                    || panic!("blur close must not read pointer geometry"),
+                    || {
+                        let mut state = coordinator
+                            .state
+                            .try_lock()
+                            .expect("no state lock across native focus read");
+                        transition(state.results.get_mut(label).unwrap());
+                        // An old native sample alone must not authorize close
+                        // after the runtime generation or pin state changes.
+                        ResultForegroundScope::External
+                    },
+                ),
+                PointerLeaveTimeoutDecision::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn queued_blur_close_is_cancelled_by_focus_pin_or_reveal_changes() {
+        let transitions: [fn(&mut ResultRuntime); 5] = [
+            |runtime| {
+                runtime.note_focus_change(true);
+            },
+            |runtime| {
+                runtime.pinned = true;
+            },
+            |runtime| {
+                runtime.reveal_phase = ResultRevealPhase::Prepared;
+            },
+            |runtime| {
+                runtime.focus_seen = false;
+            },
+            |runtime| {
+                runtime.dismiss_mode = DismissMode::Manual;
+            },
+        ];
+        for transition in transitions {
+            let coordinator = WindowCoordinator::default();
+            let label = "selection-result-queued-blur";
+            let mut runtime = blur_result_runtime(ResultRevealPhase::Committed);
+            runtime.note_focus_change(true);
+            let generation = runtime.note_focus_change(false).unwrap();
+            assert!(runtime.prepare_auto_close_request(AutoCloseOrigin::Blur(generation)));
+            transition(&mut runtime);
+            coordinator
+                .state
+                .lock()
+                .results
+                .insert(label.to_owned(), runtime);
+            assert_eq!(
+                verified_result_close_request_decision(
+                    &coordinator.state,
+                    label,
+                    || { panic!("blur close does not depend on pointer geometry") },
+                    || panic!("stale blur skips native focus reads")
+                ),
+                PointerLeaveTimeoutDecision::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn queued_auto_close_reuses_latest_valid_origin_and_honors_explicit_close() {
+        let coordinator = WindowCoordinator::default();
+        let label = "selection-result-queued-close-origin";
+        let mut runtime = blur_result_runtime(ResultRevealPhase::Committed);
+        runtime.note_focus_change(true);
+        let old_blur = runtime.note_focus_change(false).unwrap();
+        assert!(runtime.prepare_auto_close_request(AutoCloseOrigin::Blur(old_blur)));
+        runtime.note_focus_change(true);
+        let new_blur = runtime.note_focus_change(false).unwrap();
+        assert!(!runtime.prepare_auto_close_request(AutoCloseOrigin::Blur(new_blur)));
+        assert_eq!(
+            runtime.pending_auto_close,
+            Some(AutoCloseOrigin::Blur(new_blur))
+        );
+        coordinator
+            .state
+            .lock()
+            .results
+            .insert(label.to_owned(), runtime);
+        assert_eq!(
+            verified_result_close_request_decision(
+                &coordinator.state,
+                label,
+                || { panic!("eligible blur close does not read cursor") },
+                || ResultForegroundScope::External
+            ),
+            PointerLeaveTimeoutDecision::Close
+        );
+        {
+            let mut state = coordinator.state.lock();
+            let runtime = state.results.get_mut(label).unwrap();
+            runtime.dismiss_mode = DismissMode::PointerLeave;
+            runtime.note_pointer_change(true);
+            runtime.note_pointer_change(false);
+            assert!(
+                runtime.prepare_auto_close_request(AutoCloseOrigin::PointerLeave(
+                    runtime.hide_generation
+                ))
+            );
+            // Explicit close_result cancels automatic provenance before its
+            // queued event, so a pinned result can still be manually closed.
+            runtime.cancel_auto_close_request();
+            runtime.pinned = true;
+        }
+        assert_eq!(
+            verified_result_close_request_decision(
+                &coordinator.state,
+                label,
+                || { panic!("explicit close does not require cursor reads") },
+                || panic!("explicit close does not require focus reads")
+            ),
+            PointerLeaveTimeoutDecision::Close
+        );
+    }
+
+    #[test]
+    fn result_pointer_timeout_ignores_reentry_during_cursor_reads() {
+        let coordinator = WindowCoordinator::default();
+        let label = "selection-result-pointer-reentry";
+        let mut runtime = blur_result_runtime(ResultRevealPhase::Committed);
+        runtime.dismiss_mode = DismissMode::PointerLeave;
+        assert!(!runtime.note_pointer_change(true));
+        assert!(runtime.note_pointer_change(false));
+        let generation = runtime.hide_generation;
+        coordinator
+            .state
+            .lock()
+            .results
+            .insert(label.to_owned(), runtime);
+
+        let decision =
+            verified_pointer_leave_timeout_decision(&coordinator.state, label, generation, || {
+                // Geometry reads run without the state lock. An enter can
+                // invalidate the leave while an old physical sample is read.
+                let mut state = coordinator
+                    .state
+                    .try_lock()
+                    .expect("unlocked during native read");
+                let runtime = state.results.get_mut(label).unwrap();
+                assert!(!runtime.note_pointer_change(true));
+                (true, false)
+            });
+        assert_eq!(decision, PointerLeaveTimeoutDecision::Ignore);
+    }
+
+    #[test]
+    fn result_pointer_timeout_ignores_pinning_during_cursor_reads() {
+        let coordinator = WindowCoordinator::default();
+        let label = "selection-result-pointer-pin";
+        let mut runtime = blur_result_runtime(ResultRevealPhase::Committed);
+        runtime.dismiss_mode = DismissMode::PointerLeave;
+        assert!(!runtime.note_pointer_change(true));
+        assert!(runtime.note_pointer_change(false));
+        let generation = runtime.hide_generation;
+        coordinator
+            .state
+            .lock()
+            .results
+            .insert(label.to_owned(), runtime);
+
+        // With no intervening input, the same timeout remains eligible.
+        assert_eq!(
+            verified_pointer_leave_timeout_decision(&coordinator.state, label, generation, || (
+                true, false
+            ),),
+            PointerLeaveTimeoutDecision::Close
+        );
+        let decision =
+            verified_pointer_leave_timeout_decision(&coordinator.state, label, generation, || {
+                coordinator
+                    .state
+                    .lock()
+                    .results
+                    .get_mut(label)
+                    .unwrap()
+                    .pinned = true;
+                // Check pin state independently of generation invalidation.
+                (true, false)
+            });
+        assert_eq!(decision, PointerLeaveTimeoutDecision::Ignore);
+    }
+
+    #[test]
+    fn result_pointer_leave_ignores_pre_reveal_enter_and_leave() {
+        for phase in [ResultRevealPhase::Hidden, ResultRevealPhase::Prepared] {
+            let mut runtime = blur_result_runtime(phase);
+            runtime.dismiss_mode = DismissMode::PointerLeave;
+            assert!(!runtime.note_pointer_change(true));
+            assert!(!runtime.pointer_seen);
+            assert!(!runtime.note_pointer_change(false));
+            assert!(!runtime.pointer_leave_is_current(runtime.hide_generation));
+            // A historical enter or settings change must not arm preparation.
+            runtime.pointer_seen = true;
+            assert!(!runtime.pointer_leave_is_current(runtime.hide_generation));
+        }
+    }
+
+    #[test]
+    fn result_pointer_leave_commit_preserves_current_entry_and_cancels_old_timer() {
+        let coordinator = WindowCoordinator::default();
+        let label = "selection-result-pointer-reveal";
+        for inside_at_commit in [false, true] {
+            let mut runtime = blur_result_runtime(ResultRevealPhase::Prepared);
+            runtime.dismiss_mode = DismissMode::PointerLeave;
+            assert!(!runtime.note_pointer_change(true));
+            if !inside_at_commit {
+                assert!(!runtime.note_pointer_change(false));
+            }
+            let old_generation = runtime.hide_generation;
+            coordinator
+                .state
+                .lock()
+                .results
+                .insert(label.to_owned(), runtime);
+            coordinator
+                .set_result_reveal_phase(
+                    label,
+                    ResultRevealPhase::Prepared,
+                    ResultRevealPhase::Committed,
+                )
+                .unwrap();
+
+            let mut state = coordinator.state.lock();
+            let runtime = state.results.get_mut(label).unwrap();
+            assert_eq!(runtime.pointer_seen, inside_at_commit);
+            assert_ne!(runtime.hide_generation, old_generation);
+            assert!(!runtime.pointer_leave_is_current(old_generation));
+            if !inside_at_commit {
+                assert!(!runtime.note_pointer_change(false));
+                assert!(!runtime.note_pointer_change(true));
+            }
+            assert!(runtime.note_pointer_change(false));
+            assert!(runtime.pointer_leave_is_current(runtime.hide_generation));
+        }
+    }
+
+    #[test]
+    fn result_resize_persistence_ignores_uncommitted_windows_after_deadline() {
+        let coordinator = WindowCoordinator::default();
+        let label = "selection-result-delayed-initialization";
+        for phase in [ResultRevealPhase::Hidden, ResultRevealPhase::Prepared] {
+            let mut runtime = blur_result_runtime(phase);
+            runtime.remember_size = true;
+            runtime.ignore_resize_until = Instant::now() - std::time::Duration::from_secs(1);
+            coordinator
+                .state
+                .lock()
+                .results
+                .insert(label.to_owned(), runtime);
+            assert!(!coordinator.note_result_resize(label), "phase: {phase:?}");
+        }
+    }
+
+    #[test]
     fn result_resize_persistence_begins_at_reveal_commit() {
         let coordinator = WindowCoordinator::default();
         let label = "selection-result-test";
@@ -3322,6 +3957,7 @@ mod tests {
                 dismiss_mode: DismissMode::Manual,
                 dismiss_delay_ms: 450,
                 hide_generation: 0,
+                pending_auto_close: None,
                 remember_size: true,
                 ignore_resize_until: Instant::now() + std::time::Duration::from_secs(5),
             },
@@ -3370,6 +4006,7 @@ mod tests {
                 dismiss_mode: DismissMode::Manual,
                 dismiss_delay_ms: 450,
                 hide_generation: 0,
+                pending_auto_close: None,
                 remember_size: true,
                 ignore_resize_until: Instant::now() + std::time::Duration::from_secs(5),
             },
@@ -3870,6 +4507,7 @@ mod tests {
             dismiss_mode: DismissMode::Blur,
             dismiss_delay_ms: 450,
             hide_generation: 0,
+            pending_auto_close: None,
             remember_size: true,
             ignore_resize_until: Instant::now(),
         };
@@ -3888,6 +4526,220 @@ mod tests {
         assert!(pointer_leave_should_close(true, true, false));
         assert!(!pointer_leave_should_close(false, true, false));
         assert!(!pointer_leave_should_close(true, false, false));
+    }
+
+    #[test]
+    fn toolbar_native_queue_defers_reentrant_hide_without_holding_a_mutex() {
+        let queue = Arc::new(Mutex::new(ToolbarNativeQueue::default()));
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let nested_queue = Arc::clone(&queue);
+        let nested_steps = Arc::clone(&steps);
+        enqueue_toolbar_native_job(
+            &queue,
+            Box::new(move || {
+                assert!(
+                    nested_queue.try_lock().is_some(),
+                    "native work must release the queue mutex"
+                );
+                nested_steps.lock().push("present-start");
+                let hide_steps = Arc::clone(&nested_steps);
+                enqueue_toolbar_native_job(
+                    &nested_queue,
+                    Box::new(move || {
+                        hide_steps.lock().push("hide");
+                    }),
+                );
+                // The native event handler returned instead of blocking on the
+                // presentation transaction it synchronously interrupted.
+                nested_steps.lock().push("present-end");
+            }),
+        );
+        assert_eq!(*steps.lock(), vec!["present-start", "present-end", "hide"]);
+        assert!(!queue.lock().running);
+        assert!(queue.lock().pending.is_empty());
+    }
+
+    #[test]
+    fn monitor_wait_cannot_block_main_thread_hide_or_restore_old_toolbar_owner() {
+        use std::sync::{mpsc, Barrier};
+        let coordinator = WindowCoordinator::default();
+        coordinator.begin_toolbar_selection("old");
+        let state = Arc::clone(&coordinator.state);
+        let (reserved_sender, reserved_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let worker = std::thread::spawn(move || {
+            let (revision, _) = state
+                .lock()
+                .reserve_toolbar_stage(
+                    "old",
+                    Point { x: 1.0, y: 2.0 },
+                    ToolbarPlacement::BottomMiddle,
+                )
+                .unwrap();
+            reserved_sender.send(revision).unwrap();
+            worker_barrier.wait();
+            // Represents a synchronous available_monitors dispatcher wait.
+            let _ = release_receiver.recv();
+            revision
+        });
+        let old_revision = reserved_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        barrier.wait();
+        assert!(coordinator.state.try_lock().is_some());
+        assert!(coordinator.toolbar_operation.try_lock().is_some());
+        let hide_revision = coordinator
+            .state
+            .lock()
+            .reserve_toolbar_operation(Some("old"))
+            .unwrap();
+        let hide_state = Arc::clone(&coordinator.state);
+        enqueue_toolbar_native_job(
+            &coordinator.toolbar_operation,
+            Box::new(move || {
+                assert!(hide_state.lock().clear_toolbar_if_current(hide_revision));
+            }),
+        );
+        assert_eq!(coordinator.state.lock().toolbar_selection_id, None);
+        release_sender.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), old_revision);
+        assert!(!coordinator
+            .state
+            .lock()
+            .toolbar_operation_is_current(old_revision));
+    }
+
+    #[test]
+    fn toolbar_revision_rejects_old_stage_and_hide_even_when_selection_id_is_reused() {
+        let coordinator = WindowCoordinator::default();
+        let mut state = coordinator.state.lock();
+        state.begin_toolbar_selection("a");
+        let (old_stage, _) = state
+            .reserve_toolbar_stage(
+                "a",
+                Point { x: 10.0, y: 20.0 },
+                ToolbarPlacement::BottomMiddle,
+            )
+            .unwrap();
+        let old_hide = state.reserve_toolbar_operation(Some("a")).unwrap();
+        assert!(
+            !state.toolbar_selection_is_current("a"),
+            "late present must not supersede a pending hide"
+        );
+        let (new_stage, _) = state
+            .reserve_toolbar_stage(
+                "a",
+                Point { x: 20.0, y: 30.0 },
+                ToolbarPlacement::BottomRight,
+            )
+            .unwrap();
+        assert!(!state.toolbar_operation_is_current(old_stage));
+        assert!(!state.clear_toolbar_if_current(old_hide));
+        assert!(state.toolbar_operation_is_current(new_stage));
+        assert!(
+            state.toolbar_selection_is_current("a"),
+            "explicit restaging can reopen the selection"
+        );
+        assert_eq!(state.toolbar_anchor, Some(Point { x: 20.0, y: 30.0 }));
+        state.begin_toolbar_selection("b");
+        assert!(!state.toolbar_selection_is_current("a"));
+        assert!(state
+            .reserve_toolbar_stage(
+                "a",
+                Point { x: 10.0, y: 20.0 },
+                ToolbarPlacement::BottomMiddle,
+            )
+            .is_none());
+        let (newer_stage, _) = state
+            .reserve_toolbar_stage(
+                "b",
+                Point { x: 40.0, y: 50.0 },
+                ToolbarPlacement::BottomMiddle,
+            )
+            .unwrap();
+        assert!(!state.clear_toolbar_if_current(new_stage));
+        assert!(state.toolbar_operation_is_current(newer_stage));
+        assert_eq!(state.toolbar_selection_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn measured_resize_inherits_pending_reveal_and_dismiss_revokes_it() {
+        let coordinator = WindowCoordinator::default();
+        let mut state = coordinator.state.lock();
+        state.begin_toolbar_selection("a");
+        state
+            .reserve_toolbar_stage(
+                "a",
+                Point { x: 10.0, y: 20.0 },
+                ToolbarPlacement::BottomMiddle,
+            )
+            .unwrap();
+        assert!(!state.toolbar_reveal_requested);
+        let present_revision = state.request_toolbar_reveal();
+        let resize_revision = state.invalidate_toolbar_operations();
+        assert!(!state.toolbar_operation_is_current(present_revision));
+        assert!(state.toolbar_operation_is_current(resize_revision));
+        assert!(state.toolbar_reveal_requested);
+        assert!(state.toolbar_present_pending);
+        // The resize callback must perform the latest reveal. A later dismiss
+        // changes both the revision and visibility intent before it can run.
+        state.reserve_toolbar_operation(Some("a")).unwrap();
+        assert!(!state.toolbar_operation_is_current(resize_revision));
+        assert!(!state.toolbar_reveal_requested);
+        assert!(!state.toolbar_present_pending);
+        assert!(!state.toolbar_selection_is_current("a"));
+    }
+
+    #[test]
+    fn failed_toolbar_hide_keeps_owner_and_rebuild_invalidates_pending_native_work() {
+        let coordinator = WindowCoordinator::default();
+        let mut state = coordinator.state.lock();
+        state.begin_toolbar_selection("a");
+        state
+            .reserve_toolbar_stage(
+                "a",
+                Point { x: 10.0, y: 20.0 },
+                ToolbarPlacement::BottomMiddle,
+            )
+            .unwrap();
+        let hide_revision = state.reserve_toolbar_operation(Some("a")).unwrap();
+        // A failed native hide never calls clear_toolbar_if_current.
+        assert_eq!(state.toolbar_selection_id.as_deref(), Some("a"));
+        assert!(state.toolbar_operation_is_current(hide_revision));
+        assert!(!state.toolbar_selection_is_current("a"));
+        assert!(state.reserve_toolbar_recovery("a"));
+        assert!(!state.toolbar_operation_is_current(hide_revision));
+        assert_eq!(state.toolbar_selection_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn toolbar_width_budget_uses_target_work_area_in_renderer_css_units() {
+        let mut geometry = MonitorGeometry {
+            bounds: WorkArea {
+                x: -1_280.0,
+                y: 0.0,
+                width: 1_280.0,
+                height: 720.0,
+            },
+            work_area: WorkArea {
+                x: -1_280.0,
+                y: 0.0,
+                width: 1_280.0,
+                height: 680.0,
+            },
+            coordinate_scale: 1.0,
+        };
+        assert_eq!(toolbar_max_width_for_geometry(geometry), 900.0);
+        geometry.work_area.width = 800.0;
+        assert_eq!(toolbar_max_width_for_geometry(geometry), 760.0);
+        geometry.coordinate_scale = 2.0;
+        assert_eq!(toolbar_max_width_for_geometry(geometry), 360.0);
+        geometry.coordinate_scale = 1.25;
+        assert_eq!(toolbar_max_width_for_geometry(geometry), 600.0);
+        geometry.work_area.width = 50.0;
+        assert_eq!(toolbar_max_width_for_geometry(geometry), 44.0);
     }
 
     #[test]

@@ -5,6 +5,7 @@ import {
   countUnicodeScalars,
   DEFAULT_PUBLIC_SETTINGS,
   type PublicSettings,
+  type ActionStreamEvent,
   type ResultSessionSnapshot,
   type WindowTextLensApi
 } from '../../shared'
@@ -79,6 +80,27 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
     resolve = resolver
   })
   return { promise, resolve }
+}
+
+function askTranscript(pairs: Array<[string, string]>, streaming = false): NonNullable<ResultSessionSnapshot['transcript']> {
+  return pairs.flatMap(([question, answer], index) => [
+    { id: `session-1:turn:${index * 2}`, role: 'user' as const, content: question, streaming: false, scalarCount: countUnicodeScalars(question) },
+    { id: `session-1:turn:${index * 2 + 1}`, role: 'assistant' as const, content: answer, streaming: streaming && index === pairs.length - 1, scalarCount: countUnicodeScalars(answer) }
+  ])
+}
+
+function actionEventBridge() {
+  let listener: ((event: ActionStreamEvent) => void) | null = null
+  return {
+    onActionEvent: vi.fn((next: (event: ActionStreamEvent) => void) => {
+      listener = next
+      return () => { listener = null }
+    }),
+    emit(event: ActionStreamEvent): void {
+      if (!listener) throw new Error('Missing event listener')
+      listener(event)
+    }
+  }
 }
 
 async function waitForAnimationFrame(): Promise<void> {
@@ -508,6 +530,14 @@ describe('ResultApp window interactions', () => {
       expect(continueAction).toHaveBeenCalledWith('session-1', '继续解释这一段')
     })
 
+    // An accepted follow-up stays busy until the committed request arrives.
+    const store = await import('./actionEventStore')
+    act(() => store.hydrateActionEventStore(resultSnapshot({
+      requestId: 'request-followup', requestGeneration: 2,
+      content: '继续解释的答案', lastSequence: 6, lastContentSequence: 5
+    })))
+    await waitFor(() => expect(screen.getByRole('button', { name: '重试' })).not.toBeDisabled())
+
     fireEvent.click(screen.getByRole('button', { name: '重试' }))
     await waitFor(() => {
       expect(api.retryAction).toHaveBeenCalledWith('session-1', undefined)
@@ -825,6 +855,13 @@ describe('ResultApp window interactions', () => {
         modelId: 'model-deep'
       })
     })
+    // The committed route changes with Started, not the accepted reservation.
+    expect(selector).toHaveTextContent('模型一')
+    const store = await import('./actionEventStore')
+    act(() => store.hydrateActionEventStore(resultSnapshot({
+      providerId: 'provider-two', modelId: 'model-deep', requestId: 'new-model',
+      requestGeneration: 2, status: 'streaming', content: '', contentScalarCount: 0
+    })))
     expect(selector).toHaveTextContent('深度模型')
   })
 
@@ -906,6 +943,165 @@ describe('ResultApp window interactions', () => {
     await waitFor(() => {
       expect(api.copyText).toHaveBeenCalledWith('你：\n补充解释\n\nAI：\n补充回答')
     })
+  })
+
+  it('commits and copies an Ask answer when Started, Delta and Completed arrive in one batch', async () => {
+    const initial = resultSnapshot({ actionId: 'ask-ai', content: '', status: 'idle', contentScalarCount: 0, lastSequence: 0, lastContentSequence: 0, transcript: [] })
+    const bridge = actionEventBridge()
+    const { api } = await renderResult(initial, settingsWithFontSize(), { onActionEvent: bridge.onActionEvent })
+    const store = await import('./actionEventStore')
+    const stop = store.startActionEventStore('session-1')
+    const input = screen.getByRole('textbox', { name: '继续提问' })
+    fireEvent.change(input, { target: { value: '快速问题' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(api.continueAction).toHaveBeenCalledOnce())
+    const identity = { sessionId: 'session-1', sessionGeneration: 1, requestGeneration: 2, requestId: 'request-followup', actionId: 'ask-ai' }
+    act(() => {
+      bridge.emit({ ...identity, type: 'started', sequence: 1, question: '快速问题', transcript: askTranscript([['快速问题', '']], true) })
+      bridge.emit({ ...identity, type: 'delta', sequence: 2, delta: '瞬间回答😀' })
+      bridge.emit({ ...identity, type: 'completed', sequence: 3, lastContentSequence: 2, contentScalarCount: countUnicodeScalars('瞬间回答😀') })
+    })
+    await screen.findByText('瞬间回答😀')
+    expect(screen.queryByText('正在等待模型响应…')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '复制' }))
+    await waitFor(() => expect(api.copyText).toHaveBeenCalledWith('你：\n快速问题\n\nAI：\n瞬间回答😀'))
+    stop()
+  })
+
+  it('restores repeated questions and their separate answers from a completed Ask snapshot', async () => {
+    const { api } = await renderResult(resultSnapshot({
+      actionId: 'ask-ai', content: '第二轮答案', transcript: askTranscript([['同一个问题', '第一轮答案'], ['同一个问题', '第二轮答案']])
+    }))
+    await screen.findByText('第一轮答案')
+    expect(screen.getAllByText('同一个问题')).toHaveLength(2)
+    expect(screen.getByText('第二轮答案')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '复制' }))
+    await waitFor(() => expect(api.copyText).toHaveBeenCalledWith('你：\n同一个问题\n\nAI：\n第一轮答案\n\n你：\n同一个问题\n\nAI：\n第二轮答案'))
+  })
+
+  it.each(['error', 'cancelled'] as const)('keeps prior Ask answers copyable after a %s before the first token', async (status) => {
+    const { api } = await renderResult(resultSnapshot({
+      actionId: 'ask-ai', status, content: '', contentScalarCount: 0,
+      errorMessage: status === 'error' ? '网络断开' : '', retryable: true,
+      transcript: askTranscript([['问题A', '已有答案'], ['问题B', '']])
+    }))
+    await screen.findByText('已有答案')
+    expect(screen.queryByText('正在等待模型响应…')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '复制' })).not.toBeDisabled()
+    fireEvent.keyDown(window, { key: 'c' })
+    await waitFor(() => expect(api.copyText).toHaveBeenCalledWith('你：\n问题A\n\nAI：\n已有答案\n\n你：\n问题B'))
+  })
+
+  it('restores preparation failure feedback and the unsubmitted question on hydration', async () => {
+    await renderResult(resultSnapshot({
+      actionId: 'ask-ai', content: '已有答案', transcript: askTranscript([['问题A', '已有答案']]),
+      preparationFailure: { requestId: 'request-failed', requestGeneration: 2, code: 'CONFIGURATION', message: '服务商已停用', retryable: false, question: '尚未提交的问题B' }
+    }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('服务商已停用')
+    expect(screen.getByRole('textbox', { name: '继续提问' })).toHaveValue('尚未提交的问题B')
+    expect(screen.queryByText('正在等待模型响应…')).not.toBeInTheDocument()
+  })
+
+  it('retires a failed preparation even when its event arrives before accepted, so retry cannot erase the restored question', async () => {
+    const initial = resultSnapshot({ actionId: 'ask-ai', content: '已有答案', transcript: askTranscript([['问题A', '已有答案']]) })
+    const accepted = deferred<{ accepted: true; requestId: string }>()
+    const bridge = actionEventBridge()
+    const { api } = await renderResult(initial, settingsWithFontSize(), {
+      onActionEvent: bridge.onActionEvent,
+      continueAction: vi.fn().mockReturnValue(accepted.promise),
+      retryAction: vi.fn().mockResolvedValue({ accepted: true, requestId: 'request-retry-a' })
+    })
+    const store = await import('./actionEventStore')
+    const stop = store.startActionEventStore('session-1')
+    const input = screen.getByRole('textbox', { name: '继续提问' })
+    fireEvent.change(input, { target: { value: '问题B' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    act(() => bridge.emit({ sessionId: 'session-1', sessionGeneration: 1, requestGeneration: 2, requestId: 'request-failed-b', actionId: 'ask-ai', type: 'preparationFailed', sequence: 4, code: 'CONFIGURATION', message: '服务商已停用', retryable: false, question: '问题B' }))
+    await act(async () => accepted.resolve({ accepted: true, requestId: 'request-failed-b' }))
+    await waitFor(() => expect(input).toHaveValue('问题B'))
+    expect(screen.getByRole('alert')).toHaveTextContent('服务商已停用')
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    await waitFor(() => expect(api.retryAction).toHaveBeenCalledOnce())
+    const identity = { sessionId: 'session-1', sessionGeneration: 1, requestGeneration: 3, requestId: 'request-retry-a', actionId: 'ask-ai' }
+    act(() => {
+      bridge.emit({ ...identity, type: 'started', sequence: 5, question: '问题A', transcript: askTranscript([['问题A', '']], true) })
+      bridge.emit({ ...identity, type: 'delta', sequence: 6, delta: '重试A的答案' })
+      bridge.emit({ ...identity, type: 'completed', sequence: 7, lastContentSequence: 6, contentScalarCount: countUnicodeScalars('重试A的答案') })
+    })
+    await screen.findByText('重试A的答案')
+    expect(input).toHaveValue('问题B')
+    stop()
+  })
+
+  it('blocks another dispatch while a fast Continue terminal is still awaiting its invoke reply', async () => {
+    const initial = resultSnapshot({ actionId: 'ask-ai', content: '', contentScalarCount: 0, lastSequence: 0, lastContentSequence: 0, transcript: [] })
+    const accepted = deferred<{ accepted: true; requestId: string }>()
+    const bridge = actionEventBridge()
+    const { api } = await renderResult(initial, settingsWithFontSize(), { onActionEvent: bridge.onActionEvent, continueAction: vi.fn().mockReturnValue(accepted.promise) })
+    const store = await import('./actionEventStore')
+    const stop = store.startActionEventStore('session-1')
+    const input = screen.getByRole('textbox', { name: '继续提问' })
+    fireEvent.change(input, { target: { value: '问题' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    const identity = { sessionId: 'session-1', sessionGeneration: 1, requestGeneration: 2, requestId: 'fast-request', actionId: 'ask-ai' }
+    act(() => {
+      bridge.emit({ ...identity, type: 'started', sequence: 1, transcript: askTranscript([['问题', '']], true) })
+      bridge.emit({ ...identity, type: 'delta', sequence: 2, delta: '回答' })
+      bridge.emit({ ...identity, type: 'completed', sequence: 3, lastContentSequence: 2, contentScalarCount: 2 })
+    })
+    await screen.findByText('回答')
+    expect(screen.getByRole('button', { name: '重试' })).toBeDisabled()
+    fireEvent.keyDown(window, { key: 'r' })
+    expect(api.retryAction).not.toHaveBeenCalled()
+    await act(async () => accepted.resolve({ accepted: true, requestId: 'fast-request' }))
+    await waitFor(() => expect(input).not.toBeDisabled())
+    expect(screen.getByRole('button', { name: '重试' })).not.toBeDisabled()
+    stop()
+  })
+
+  it('rolls back a rejected translation preparation and keeps its old answer', async () => {
+    const bridge = actionEventBridge()
+    const { api } = await renderResult(completedSession, settingsWithFontSize(), { onActionEvent: bridge.onActionEvent, retryAction: vi.fn().mockResolvedValue({ accepted: true, requestId: 'request-language' }) })
+    const store = await import('./actionEventStore')
+    const stop = store.startActionEventStore('session-1')
+    const target = screen.getByRole('combobox', { name: '翻译目标语言' })
+    const previous = (target as HTMLSelectElement).value
+    fireEvent.change(target, { target: { value: 'fr-FR' } })
+    await waitFor(() => expect(api.retryAction).toHaveBeenCalledOnce())
+    expect(target).toBeDisabled()
+    act(() => bridge.emit({ sessionId: 'session-1', sessionGeneration: 1, requestGeneration: 2, requestId: 'request-language', actionId: 'translate', type: 'preparationFailed', sequence: 4, code: 'CONFIGURATION', message: '模型已删除', retryable: false }))
+    await waitFor(() => expect(target).toHaveValue(previous))
+    expect(screen.getByText('可选择的结果')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('模型已删除')
+    stop()
+  })
+
+  it('keeps the committed model and releases its busy state when model preparation fails before the invoke reply', async () => {
+    const settings = settingsWithFontSize()
+    settings.providers[0]!.models.push({ id: 'model-2', name: '模型二', thinkingLevels: [] })
+    const accepted = deferred<{ accepted: true; requestId: string }>()
+    const bridge = actionEventBridge()
+    await renderResult(completedSession, settings, {
+      onActionEvent: bridge.onActionEvent,
+      retryAction: vi.fn().mockReturnValue(accepted.promise)
+    })
+    const store = await import('./actionEventStore')
+    const stop = store.startActionEventStore('session-1')
+    const model = screen.getByRole('button', { name: '切换模型' })
+    fireEvent.click(model)
+    fireEvent.click(screen.getByRole('option', { name: '模型二' }))
+    expect(model).toHaveTextContent('模型一')
+    act(() => bridge.emit({
+      sessionId: 'session-1', sessionGeneration: 1, requestGeneration: 2,
+      requestId: 'request-model-2', actionId: 'translate', type: 'preparationFailed',
+      sequence: 4, code: 'PREPARATION_FAILED', message: '服务商已停用', retryable: false
+    }))
+    await act(async () => accepted.resolve({ accepted: true, requestId: 'request-model-2' }))
+    await waitFor(() => expect(model).not.toBeDisabled())
+    expect(model).toHaveTextContent('模型一')
+    expect(screen.getByRole('alert')).toHaveTextContent('服务商已停用')
+    expect(screen.getByText('可选择的结果')).toBeInTheDocument()
+    stop()
   })
 
   it('shows the app toolbar for a real text selection inside result content', async () => {

@@ -12,28 +12,34 @@ body,
 
 .result-window {
   --result-radius: 8px;
-  --result-header-surface: color-mix(in srgb, var(--surface-muted) 66%, var(--surface-solid));
-  --result-content-surface: color-mix(in srgb, var(--surface-solid) 72%, var(--surface-muted));
-  --result-card-surface: color-mix(in srgb, var(--surface-solid) 95%, var(--surface-muted));
-  --result-model-control-surface: color-mix(in srgb, var(--surface-muted) 64%, var(--surface-solid));
-  --result-model-menu-surface: color-mix(in srgb, var(--surface-solid) 96%, var(--surface-muted));
+  --result-header-surface: var(--surface-muted);
+  --result-content-surface: var(--surface-solid);
+  --result-card-surface: var(--surface-solid);
+  --result-model-control-surface: var(--surface-muted);
+  --result-model-menu-surface: var(--surface-solid);
   --result-control-shadow: none;
-  --result-scrollbar-thumb: color-mix(in srgb, var(--text-tertiary) 40%, transparent);
-  --result-scrollbar-thumb-hover: color-mix(in srgb, var(--text-tertiary) 58%, transparent);
+  --result-scrollbar-thumb: var(--text-tertiary);
+  --result-scrollbar-thumb-hover: var(--text-secondary);
   position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100vh;
   overflow: hidden;
-  /* Literal fallback first: engines that drop the color-mix var() value
-     render a plain warm-white window instead of nothing. */
-  background: var(--surface-solid);
+  /* The base token remains valid on Safari 15. Mixed tokens are opt-in below. */
   background: var(--result-content-surface);
   border: 0;
   border-radius: var(--result-radius);
   box-shadow: none;
   isolation: isolate;
   clip-path: inset(0 round var(--result-radius));
+}
+
+.result-window[data-reveal-state="preparing"] {
+  opacity: 0;
+}
+
+.result-window[data-reveal-state="visible"] {
+  animation: result-reveal 90ms ease-out;
 }
 
 /* Explicit hit zones make all eight resize directions reliable in a
@@ -126,6 +132,7 @@ body,
   background: var(--surface-muted);
   background: var(--result-header-surface);
   border: 0;
+  border-bottom: 1px solid var(--border);
   border-bottom: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
   border-radius: var(--result-radius) var(--result-radius) 0 0;
 }
@@ -166,6 +173,7 @@ body,
 
 .result-close:hover:not(:disabled) {
   color: var(--danger);
+  background: var(--danger-soft);
   background: color-mix(in srgb, var(--danger) 12%, transparent);
 }
 
@@ -297,6 +305,7 @@ body,
 .result-model-switch__trigger:focus-visible,
 .result-model-switch--open .result-model-switch__trigger {
   color: var(--text);
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--surface-muted) 58%, var(--accent-soft));
 }
 
@@ -321,6 +330,7 @@ body,
   overflow-x: hidden;
   overflow-y: auto;
   background: var(--result-model-menu-surface);
+  border: 1px solid var(--border-strong);
   border: 1px solid color-mix(in srgb, var(--border-strong) 62%, transparent);
   border-radius: var(--radius-sm);
   box-shadow: var(--shadow-sm);
@@ -336,6 +346,7 @@ body,
   align-items: center;
   min-height: 22px;
   padding: 1px 7px;
+  color: var(--text-secondary);
   color: color-mix(in srgb, var(--text-secondary) 84%, var(--accent));
   font-size: 10px;
   font-weight: var(--weight-bold);
@@ -379,12 +390,14 @@ body,
 .result-model-menu__option:hover:not(:disabled),
 .result-model-menu__option:focus-visible {
   color: var(--text);
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--surface-solid) 84%, var(--accent));
 }
 
 .result-model-menu__option.is-selected {
   color: var(--accent);
   font-weight: var(--weight-semibold);
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--surface-solid) 76%, var(--accent));
 }
 
@@ -589,7 +602,6 @@ body,
   /* Between former title (0.93/13px) and hint (0.78/11px). */
   font-size: max(12px, calc(var(--result-font-size, 14px) * 0.86));
   text-align: center;
-  animation: result-fade-in 200ms ease-out;
 }
 
 .result-placeholder--waiting {
@@ -613,16 +625,18 @@ body,
   width: 6px;
   height: 6px;
   border-radius: 50%;
+  background: var(--accent);
   background: color-mix(in srgb, var(--accent) 75%, var(--text-tertiary));
-  animation: result-dot-bounce 1.05s ease-in-out infinite;
+  opacity: 0.65;
+  animation: result-waiting-dot 1s ease-in-out infinite;
 }
 
 .result-waiting-dots span:nth-child(2) {
-  animation-delay: 0.14s;
+  animation-delay: 150ms;
 }
 
 .result-waiting-dots span:nth-child(3) {
-  animation-delay: 0.28s;
+  animation-delay: 300ms;
 }
 
 /* Collapsible chain-of-thought above the answer body. Collapsed chrome is tight. */
@@ -635,14 +649,14 @@ body,
   margin: 0 0 10px;
   padding: 2px 8px;
   border-radius: var(--radius-sm);
+  background: var(--result-card-surface);
   background: color-mix(in srgb, var(--result-card-surface) 78%, transparent);
+  border: 1px solid var(--border-strong);
   border: 1px solid color-mix(in srgb, var(--border-strong) 72%, transparent);
   box-shadow: none;
   transition:
-    border-color 160ms ease,
-    background 160ms ease,
-    padding 160ms ease;
-  animation: result-fade-in 180ms ease-out;
+    border-color 90ms ease,
+    background 90ms ease;
 }
 
 .result-thinking--open {
@@ -651,7 +665,9 @@ body,
 }
 
 .result-thinking--live {
+  border-color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--accent-soft) 38%, transparent);
 }
 
@@ -684,6 +700,7 @@ body,
 }
 
 .result-thinking__toggle:focus-visible {
+  outline: 2px solid var(--accent);
   outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
   outline-offset: 1px;
 }
@@ -719,11 +736,6 @@ body,
   border-radius: var(--radius-pill);
 }
 
-.result-thinking__badge--live {
-  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent);
-  animation: result-thinking-pulse 1.4s ease-out infinite;
-}
-
 .result-thinking__toggle .is-expanded {
   transform: rotate(180deg);
 }
@@ -738,6 +750,7 @@ body,
   max-height: min(36vh, 240px);
   overflow: auto;
   padding-top: 6px;
+  border-top: 1px dashed var(--border);
   border-top: 1px dashed color-mix(in srgb, var(--border) 85%, transparent);
   color: var(--text-secondary);
   /*
@@ -750,7 +763,6 @@ body,
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   letter-spacing: 0.01em;
-  animation: result-fade-in 150ms ease-out;
 }
 
 .markdown-body {
@@ -759,7 +771,6 @@ body,
   line-height: 1.58;
   overflow-wrap: anywhere;
   user-select: text;
-  animation: result-fade-in 180ms ease-out;
 }
 
 .result-turn {
@@ -769,7 +780,9 @@ body,
 }
 
 .result-turn--user {
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--accent) 12%, var(--surface-solid));
+  border: 1px solid var(--accent);
   border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border));
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -777,6 +790,7 @@ body,
 
 .result-turn--assistant {
   background: var(--result-card-surface);
+  border: 1px solid var(--border);
   border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
 }
 
@@ -929,6 +943,7 @@ body,
   padding: 6px 0 6px 13px;
   margin-left: 0;
   color: var(--text-secondary);
+  background: var(--surface-muted);
   background: color-mix(in srgb, var(--surface-muted) 55%, transparent);
   border-left: 3px solid var(--border-strong);
   border-radius: 0 var(--radius-tag) var(--radius-tag) 0;
@@ -997,6 +1012,7 @@ body,
 
 .markdown-body th {
   font-weight: var(--weight-semibold);
+  background: var(--surface-muted);
   background: color-mix(in srgb, var(--surface-muted) 80%, transparent);
   text-align: left;
 }
@@ -1040,6 +1056,7 @@ body,
   background: var(--accent);
   border-radius: var(--radius-2xs);
   animation: result-caret 900ms step-end infinite;
+  box-shadow: 0 0 0 0.5px var(--accent-soft);
   box-shadow: 0 0 0 0.5px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 
@@ -1049,6 +1066,7 @@ body,
   padding: 13px;
   color: var(--danger);
   background: var(--danger-soft);
+  border: 1px solid var(--danger);
   border: 1px solid color-mix(in srgb, var(--danger) 20%, transparent);
   border-radius: var(--radius-control);
 }
@@ -1088,6 +1106,7 @@ body,
   color: var(--danger);
   font-size: 12px;
   background: var(--danger-soft);
+  border: 1px solid var(--danger);
   border: 1px solid color-mix(in srgb, var(--danger) 18%, transparent);
   border-radius: var(--radius-sm);
 }
@@ -1121,10 +1140,7 @@ body,
   pointer-events: auto;
   visibility: visible;
   opacity: 0;
-  transform: translateY(5px);
-  transition:
-    opacity 120ms ease,
-    transform 150ms ease;
+  transition: opacity 90ms ease;
 }
 
 /* Only reveal when the pointer is over the bottom footer zone (or focus is
@@ -1132,7 +1148,6 @@ body,
 .result-footer:hover,
 .result-footer:focus-within {
   opacity: 1;
-  transform: translateY(0);
   background: transparent;
   border: 0;
   border-radius: 0;
@@ -1188,6 +1203,7 @@ body,
 }
 
 .result-followup textarea:focus {
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--accent-soft) 72%, transparent);
   box-shadow: none;
 }
@@ -1261,7 +1277,9 @@ body,
   font-size: 11px;
   font-weight: var(--weight-semibold);
   white-space: nowrap;
+  background: var(--result-header-surface);
   background: color-mix(in srgb, var(--result-header-surface) 66%, var(--surface-solid));
+  border: 1px solid var(--border);
   border: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
   border-radius: var(--radius-sm);
   box-shadow: var(--result-control-shadow);
@@ -1274,7 +1292,9 @@ body,
 .result-footer-button:hover:not(:disabled),
 .result-footer-button:focus-visible {
   color: var(--text);
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--surface-solid) 74%, var(--accent-soft));
+  border-color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 24%, transparent);
   box-shadow: none;
 }
@@ -1286,13 +1306,16 @@ body,
 
 .result-footer-button--stop {
   color: var(--danger);
+  background: var(--danger-soft);
   background: color-mix(in srgb, var(--danger-soft) 88%, transparent);
+  border: 1px solid var(--danger);
   border: 1px solid color-mix(in srgb, var(--danger) 16%, transparent);
 }
 
 .result-footer-button--stop:hover:not(:disabled),
 .result-footer-button--stop:focus-visible {
   color: var(--danger);
+  background: var(--danger-soft);
   background: color-mix(in srgb, var(--danger-soft) 100%, transparent);
   box-shadow: none;
 }
@@ -1303,6 +1326,18 @@ body,
 
 .result-spin {
   animation: result-spin 850ms linear infinite;
+}
+
+@keyframes result-waiting-dot {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.45;
+  }
+
+  30% {
+    transform: translateY(-3px);
+    opacity: 0.95;
+  }
 }
 
 @keyframes result-spin {
@@ -1317,58 +1352,24 @@ body,
   }
 }
 
-@keyframes result-fade-in {
+@keyframes result-reveal {
   from {
-    opacity: 0;
-    transform: translateY(4px);
+    opacity: 0.35;
   }
 
   to {
     opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-@keyframes result-dot-bounce {
-  0%,
-  80%,
-  100% {
-    transform: translateY(0);
-    opacity: 0.45;
-  }
-
-  40% {
-    transform: translateY(-4px);
-    opacity: 1;
-  }
-}
-
-@keyframes result-thinking-pulse {
-  0% {
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 42%, transparent);
-  }
-
-  70% {
-    box-shadow: 0 0 0 8px transparent;
-  }
-
-  100% {
-    box-shadow: 0 0 0 0 transparent;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .result-window[data-reveal-state] {
+    animation: none;
+  }
+  .result-window,
+  .result-waiting-dots span,
   .result-spin,
   .stream-caret {
-    animation-duration: 1.8s;
-  }
-
-  .result-waiting-dots span,
-  .result-thinking__badge--live,
-  .result-placeholder,
-  .result-thinking,
-  .result-thinking__body,
-  .markdown-body {
     animation: none;
   }
 
@@ -1384,15 +1385,6 @@ body,
 }
 
 @media (prefers-color-scheme: dark) {
-  .result-window {
-    --result-header-surface: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-solid));
-    --result-content-surface: color-mix(in srgb, var(--surface-solid) 76%, var(--surface-inset));
-    --result-card-surface: color-mix(in srgb, var(--surface-solid) 84%, var(--surface-muted));
-    --result-model-control-surface: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-solid));
-    --result-model-menu-surface: color-mix(in srgb, var(--surface-solid) 78%, var(--surface-muted));
-    --result-control-shadow: none;
-  }
-
   .result-footer-button:hover:not(:disabled),
   .result-footer-button:focus-visible {
     box-shadow: none;
@@ -1401,7 +1393,9 @@ body,
   /* Lift muted surfaces so code / quotes stay readable on dark chrome. */
   .markdown-body code,
   .markdown-body pre {
+    background: var(--surface-muted);
     background: color-mix(in srgb, var(--surface-muted) 88%, var(--text) 8%);
+    border-color: var(--border);
     border-color: color-mix(in srgb, var(--border) 70%, var(--text) 12%);
   }
 
@@ -1410,12 +1404,16 @@ body,
   }
 
   .markdown-body blockquote {
+    color: var(--text-secondary);
     color: color-mix(in srgb, var(--text-secondary) 88%, var(--text) 12%);
+    background: var(--surface-muted);
     background: color-mix(in srgb, var(--surface-muted) 70%, transparent);
+    border-left-color: var(--border-strong);
     border-left-color: color-mix(in srgb, var(--border-strong) 75%, var(--text) 25%);
   }
 
   .markdown-body th {
+    background: var(--surface-muted);
     background: color-mix(in srgb, var(--surface-muted) 72%, var(--text) 6%);
   }
 
@@ -1431,6 +1429,29 @@ body,
   }
 
   .markdown-body hr {
+    border-top-color: var(--border);
     border-top-color: color-mix(in srgb, var(--border) 80%, var(--text) 12%);
+  }
+}
+
+@supports (color: color-mix(in srgb, black, white)) {
+  .result-window {
+    --result-header-surface: color-mix(in srgb, var(--surface-muted) 66%, var(--surface-solid));
+    --result-content-surface: color-mix(in srgb, var(--surface-solid) 72%, var(--surface-muted));
+    --result-card-surface: color-mix(in srgb, var(--surface-solid) 95%, var(--surface-muted));
+    --result-model-control-surface: color-mix(in srgb, var(--surface-muted) 64%, var(--surface-solid));
+    --result-model-menu-surface: color-mix(in srgb, var(--surface-solid) 96%, var(--surface-muted));
+    --result-scrollbar-thumb: color-mix(in srgb, var(--text-tertiary) 40%, transparent);
+    --result-scrollbar-thumb-hover: color-mix(in srgb, var(--text-tertiary) 58%, transparent);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .result-window {
+      --result-header-surface: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-solid));
+      --result-content-surface: color-mix(in srgb, var(--surface-solid) 76%, var(--surface-inset));
+      --result-card-surface: color-mix(in srgb, var(--surface-solid) 84%, var(--surface-muted));
+      --result-model-control-surface: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-solid));
+      --result-model-menu-surface: color-mix(in srgb, var(--surface-solid) 78%, var(--surface-muted));
+    }
   }
 }

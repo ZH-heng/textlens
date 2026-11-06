@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type JSX,
   type MouseEvent
 } from 'react'
@@ -97,8 +98,13 @@ function toolbarControlIdFromElement(
   return control.dataset.toolbarControl || null
 }
 
+function toolbarWidthBudget(selection: SelectionPayload | null): number {
+  return Math.max(44, Math.min(900, Math.floor(selection?.toolbarMaxWidth ?? 900)))
+}
+
 export function ToolbarApp(): JSX.Element {
   const toolbarRef = useRef<HTMLDivElement>(null)
+  const pillRef = useRef<HTMLDivElement>(null)
   const focusClearFramesRef = useRef<number[]>([])
   const copySuccessTimerRef = useRef<number | null>(null)
   const copySuccessActiveRef = useRef(false)
@@ -107,6 +113,8 @@ export function ToolbarApp(): JSX.Element {
   // Native events can arrive in the same React batch. Keep the active owner
   // synchronously available to callbacks before the state render commits.
   const selectionIdRef = useRef<string | null>(null)
+  const measuredSizeRef = useRef<{ selectionId?: string; width: number; height: number } | null>(null)
+  const busyActionRef = useRef<string | null>(null)
   const [busyActionId, setBusyActionId] = useState<string | null>(null)
   const [copySuccessActionId, setCopySuccessActionId] = useState<string | null>(null)
   const [hoveredControlId, setHoveredControlId] = useState<string | null>(null)
@@ -115,6 +123,11 @@ export function ToolbarApp(): JSX.Element {
   const operationGenerationRef = useRef(0)
   const selectionGenerationRef = useRef(0)
   const selectionTimingStartedAtRef = useRef<number | null>(null)
+
+  const setBusyAction = (value: string | null): void => {
+    busyActionRef.current = value
+    setBusyActionId(value)
+  }
 
   const publishSelection = (nextSelection: SelectionPayload): void => {
     selectionIdRef.current = nextSelection.selectionId ?? null
@@ -220,7 +233,7 @@ export function ToolbarApp(): JSX.Element {
       selectionGenerationRef.current += 1
       operationGenerationRef.current += 1
       publishSelection(nextSelection)
-      setBusyActionId(null)
+      setBusyAction(null)
       setMessage('')
     })
     const initialSelectionGeneration = selectionGenerationRef.current
@@ -284,7 +297,7 @@ export function ToolbarApp(): JSX.Element {
       resetCopySuccess()
       clearRetainedToolbarFocus()
       retireSelection(payload.selectionId)
-      setBusyActionId(null)
+      setBusyAction(null)
       setMessage('')
     }) ?? (() => undefined)
 
@@ -331,6 +344,18 @@ export function ToolbarApp(): JSX.Element {
   }, [theme])
 
   useLayoutEffect(() => {
+    const pill = pillRef.current
+    if (!selection?.selectionId || !pill?.animate || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return
+    // Replay the reveal in the retained singleton without replacing buttons
+    // or postponing the native presentation for another animation frame.
+    const animation = pill.animate([{ opacity: 0.35 }, { opacity: 1 }], {
+      duration: 90,
+      easing: 'ease-out'
+    })
+    return () => animation.cancel()
+  }, [selection?.selectionId])
+
+  useLayoutEffect(() => {
     const element = toolbarRef.current
     const presentToolbar = window.textLens.presentToolbar
     const selectionId = selection?.selectionId
@@ -346,9 +371,10 @@ export function ToolbarApp(): JSX.Element {
     // the toolbar visible; the observer below handles later content changes.
     const rectangle = element.getBoundingClientRect()
     const size = {
-      width: Math.max(1, Math.ceil(rectangle.width)),
+      width: Math.min(toolbarWidthBudget(selection), Math.max(1, Math.ceil(rectangle.width))),
       height: Math.max(1, Math.ceil(rectangle.height))
     }
+    measuredSizeRef.current = { selectionId, ...size }
     let disposed = false
     let retryFrame = 0
     const timingStartedAt = selectionTimingStartedAtRef.current
@@ -368,7 +394,7 @@ export function ToolbarApp(): JSX.Element {
           selectionGenerationRef.current += 1
           operationGenerationRef.current += 1
           publishSelection(current)
-          setBusyActionId(null)
+          setBusyAction(null)
           setMessage('')
         }
         return false
@@ -424,29 +450,30 @@ export function ToolbarApp(): JSX.Element {
       disposed = true
       cancelAnimationFrame(retryFrame)
     }
-  }, [selection?.selectionId, settings, visibleActions])
+  }, [selection?.selectionId, selection?.toolbarMaxWidth, settings, visibleActions])
 
   useEffect(() => {
     const element = toolbarRef.current
     if (!element) return
     const selectionId = selection?.selectionId
+    const maxWidth = toolbarWidthBudget(selection)
 
     let frame = 0
-    const initialRectangle = element.getBoundingClientRect()
-    // `presentToolbar` already commits this initial size. Seed the observer
-    // from the same layout so it only reports later, real DOM changes instead
-    // of issuing a redundant native resize IPC on every selection.
-    let lastWidth = Math.max(1, Math.ceil(initialRectangle.width))
-    let lastHeight = Math.max(1, Math.ceil(initialRectangle.height))
+    // Share the layout-effect measurement so an observer never repeats the
+    // successful initial presentation IPC. Keep the observer across messages.
+    if (measuredSizeRef.current?.selectionId !== selectionId) {
+      const rectangle = element.getBoundingClientRect()
+      measuredSizeRef.current = { selectionId, width: Math.min(maxWidth, Math.max(1, Math.ceil(rectangle.width))), height: Math.max(1, Math.ceil(rectangle.height)) }
+    }
     const report = (): void => {
       cancelAnimationFrame(frame)
       frame = requestAnimationFrame(() => {
         const rectangle = element.getBoundingClientRect()
-        const width = Math.max(1, Math.ceil(rectangle.width))
+        const width = Math.min(maxWidth, Math.max(1, Math.ceil(rectangle.width)))
         const height = Math.max(1, Math.ceil(rectangle.height))
-        if (width === lastWidth && height === lastHeight) return
-        lastWidth = width
-        lastHeight = height
+        const previous = measuredSizeRef.current
+        if (previous && previous.selectionId === selectionId && width === previous.width && height === previous.height) return
+        measuredSizeRef.current = { selectionId, width, height }
         runDetached(window.textLens.reportToolbarSize({ width, height }, selectionId), {
           scope: 'toolbar',
           operation: 'report-size'
@@ -461,18 +488,13 @@ export function ToolbarApp(): JSX.Element {
       cancelAnimationFrame(frame)
       observer.disconnect()
     }
-  }, [
-    message,
-    selection?.selectionId,
-    settings?.toolbar.displayMode,
-    visibleActions.length
-  ])
+  }, [selection?.selectionId, selection?.toolbarMaxWidth])
 
   const runAction = async (
     actionId: string,
     event: MouseEvent<HTMLButtonElement>
   ): Promise<void> => {
-    if (busyActionId) return
+    if (busyActionRef.current) return
     const action = visibleActions.find((candidate) => candidate.id === actionId)
     if (!action) return
     resetCopySuccess()
@@ -484,7 +506,7 @@ export function ToolbarApp(): JSX.Element {
     if (pointerTriggered) {
       clearRetainedToolbarFocus()
     }
-    setBusyActionId(actionId)
+    setBusyAction(actionId)
     setMessage('')
     const operationGeneration = operationGenerationRef.current + 1
     operationGenerationRef.current = operationGeneration
@@ -500,10 +522,11 @@ export function ToolbarApp(): JSX.Element {
               focus: 'actions',
               notice
             })
+            if (operationGenerationRef.current !== operationGeneration) return
             retireSelection(actedSelectionId)
             await window.textLens.hideToolbar(actedSelectionId)
           } catch (error) {
-            setMessage(getErrorMessage(error, result.message))
+            if (operationGenerationRef.current === operationGeneration) setMessage(getErrorMessage(error, result.message))
           }
           return
         }
@@ -525,7 +548,7 @@ export function ToolbarApp(): JSX.Element {
       }
     } finally {
       if (operationGenerationRef.current === operationGeneration) {
-        setBusyActionId(null)
+        setBusyAction(null)
       }
     }
   }
@@ -533,18 +556,24 @@ export function ToolbarApp(): JSX.Element {
   const openSettings = async (notice?: string): Promise<void> => {
     if (!window.textLens.openSettings) return
     const actedSelectionId = selection?.selectionId
+    const operationGeneration = operationGenerationRef.current
     try {
       await window.textLens.openSettings({
         focus: 'actions',
         ...(notice ? { notice } : {})
       })
+      if (operationGenerationRef.current !== operationGeneration) return
       retireSelection(actedSelectionId)
       await window.textLens.hideToolbar(actedSelectionId)
     } catch (error) {
-      setMessage(getErrorMessage(error, '无法打开设置'))
+      if (operationGenerationRef.current === operationGeneration) {
+        setMessage(getErrorMessage(error, '无法打开设置'))
+      }
     }
   }
 
+  const toolbarMaxWidth = toolbarWidthBudget(selection)
+  const toolbarStyle = { '--toolbar-max-width': `${toolbarMaxWidth}px` } as CSSProperties
   const iconOnly = settings?.toolbar.displayMode === 'icon-only'
 
   const updateHoveredControl = (target: EventTarget | null): void => {
@@ -561,6 +590,7 @@ export function ToolbarApp(): JSX.Element {
     <div
       ref={toolbarRef}
       className="toolbar-shell"
+      style={toolbarStyle}
       role="toolbar"
       aria-label={selection ? `处理来自 ${selection.sourceApp.name} 的选中文本` : '划词动作'}
       onPointerMoveCapture={(event) => updateHoveredControl(event.target)}
@@ -568,7 +598,12 @@ export function ToolbarApp(): JSX.Element {
       onMouseMoveCapture={(event) => updateHoveredControl(event.target)}
       onMouseLeave={() => setHoveredControlId(null)}
     >
-      <div className="toolbar-pill">
+      <div ref={pillRef} className="toolbar-pill" onWheel={(event) => {
+        const pill = event.currentTarget
+        if (pill.scrollWidth > pill.clientWidth && Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+          pill.scrollLeft += event.deltaY
+        }
+      }}>
         {visibleActions.map((action) => {
           const busy = busyActionId === action.id
           const muted = busyActionId !== null && !busy

@@ -511,6 +511,46 @@ fn string_or_number(value: &Value) -> Option<String> {
         .or_else(|| value.as_i64().map(|number| number.to_string()))
 }
 
+pub(crate) fn is_incomplete_finish_reason(reason: &str) -> bool {
+    matches!(
+        reason.to_ascii_lowercase().as_str(),
+        "length"
+            | "max_tokens"
+            | "max_output_tokens"
+            | "incomplete"
+            | "content_filter"
+            | "safety"
+            | "recitation"
+            | "blocklist"
+            | "prohibited_content"
+            | "spii"
+            | "malformed_function_call"
+            | "tool_calls"
+            | "function_call"
+            | "tool_use"
+            | "pause_turn"
+    )
+}
+
+pub(crate) fn json_response_is_incomplete(codec: SseCodec, value: &Value) -> bool {
+    if codec == SseCodec::OpenAiResponses
+        && value.get("status").and_then(Value::as_str) == Some("incomplete")
+    {
+        return true;
+    }
+    let reason = match codec {
+        SseCodec::OpenAiChat => value.pointer("/choices/0/finish_reason"),
+        SseCodec::AnthropicMessages => value.get("stop_reason"),
+        SseCodec::Gemini => value
+            .pointer("/candidates/0/finishReason")
+            .or_else(|| value.pointer("/candidates/0/finish_reason")),
+        SseCodec::OpenAiResponses => None,
+    };
+    reason
+        .and_then(Value::as_str)
+        .is_some_and(is_incomplete_finish_reason)
+}
+
 /// Extract answer text from a non-streaming response body for one protocol.
 pub(crate) fn decode_json_content(codec: SseCodec, value: &Value) -> Option<String> {
     let content = match codec {

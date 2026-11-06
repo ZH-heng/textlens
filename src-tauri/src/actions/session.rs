@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::models::{
     ActionNotice, ActionSnapshot, ActionSnapshotStatus, ActionStreamEvent, ActionStreamPayload,
-    EventSequence, HandshakeGeneration, RequestGeneration, ResultReadyAck, SessionGeneration,
-    MAX_WIRE_COUNTER,
+    EventSequence, HandshakeGeneration, PreparationFailure, RequestGeneration, ResultReadyAck,
+    SessionGeneration, MAX_WIRE_COUNTER,
 };
 
 // Content deltas are emitted immediately (no coalesce window / byte batching)
@@ -169,6 +169,7 @@ pub(super) struct SessionFailure {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+    pub question: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +362,12 @@ impl SessionTable {
             &mut state,
             &ticket,
             EventSequence::FIRST,
-            ActionStreamPayload::Started,
+            ActionStreamPayload::Started {
+                provider_id: None,
+                model_id: None,
+                question: None,
+                transcript: None,
+            },
         );
 
         self.last_session_generation = session_generation;
@@ -434,6 +440,8 @@ impl SessionTable {
                 error_code: None,
                 error_message: None,
                 retryable: false,
+                preparation_failure: None,
+                transcript: Vec::new(),
             },
             next_sequence: EventSequence::NONE,
             pending_events: VecDeque::new(),
@@ -530,7 +538,19 @@ impl SessionTable {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn commit_prepare_success(&mut self, ticket: &RequestTicket) -> TransitionResult {
+        self.commit_prepare_success_with_metadata(ticket, None, None, None, None)
+    }
+
+    pub(super) fn commit_prepare_success_with_metadata(
+        &mut self,
+        ticket: &RequestTicket,
+        provider_id: Option<String>,
+        model_id: Option<String>,
+        question: Option<String>,
+        transcript: Option<Vec<crate::models::TranscriptTurn>>,
+    ) -> TransitionResult {
         let Some(SessionEntry::Open(state)) = self.entries.get_mut(&ticket.session_id) else {
             return TransitionResult::Rejected;
         };
@@ -565,7 +585,17 @@ impl SessionTable {
         };
 
         if let Some(sequence) = replacement_sequence {
-            enqueue_payload_at(state, ticket, sequence, ActionStreamPayload::Started);
+            enqueue_payload_at(
+                state,
+                ticket,
+                sequence,
+                ActionStreamPayload::Started {
+                    provider_id,
+                    model_id,
+                    question,
+                    transcript,
+                },
+            );
             apply_pending_limit_plan(state, pending_limit);
         }
         state.request_slot = RequestSlot::Running {
@@ -592,38 +622,32 @@ impl SessionTable {
             } if active == ticket => *kind,
             _ => return TransitionResult::Rejected,
         };
-        let error_sequence = if kind == ReservationKind::Initial {
-            let Some(sequence) = state.next_sequence.checked_next() else {
-                return TransitionResult::Rejected;
-            };
-            Some(sequence)
-        } else {
-            None
+        let Some(error_sequence) = state.next_sequence.checked_next() else {
+            return TransitionResult::Rejected;
         };
-        let pending_limit = if let Some(sequence) = error_sequence {
-            match preflight_pending_limit(state, 1, sequence) {
-                Ok(plan) => plan,
-                Err(_) => return TransitionResult::Rejected,
-            }
-        } else {
-            PendingLimitPlan::None
+        let pending_limit = match preflight_pending_limit(state, 1, error_sequence) {
+            Ok(plan) => plan,
+            Err(_) => return TransitionResult::Rejected,
         };
         state.request_slot = RequestSlot::Vacant;
         state.request_stream = None;
 
-        if let Some(sequence) = error_sequence {
-            enqueue_payload_at(
-                state,
-                ticket,
-                sequence,
-                ActionStreamPayload::Error {
-                    code: failure.code,
-                    message: failure.message,
-                    retryable: failure.retryable,
-                },
-            );
-            apply_pending_limit_plan(state, pending_limit);
-        }
+        let payload = if kind == ReservationKind::Initial {
+            ActionStreamPayload::Error {
+                code: failure.code,
+                message: failure.message,
+                retryable: failure.retryable,
+            }
+        } else {
+            ActionStreamPayload::PreparationFailed {
+                code: failure.code,
+                message: failure.message,
+                retryable: failure.retryable,
+                question: failure.question,
+            }
+        };
+        enqueue_payload_at(state, ticket, error_sequence, payload);
+        apply_pending_limit_plan(state, pending_limit);
         TransitionResult::Applied
     }
 
@@ -854,7 +878,7 @@ impl SessionTable {
             None => return Err(SessionError::NotFound),
         };
         enum CancelKind {
-            PreserveReplacement,
+            PreserveReplacement(RequestTicket),
             CommitPreparing(RequestTicket),
             CommitRunning {
                 ticket: RequestTicket,
@@ -866,7 +890,9 @@ impl SessionTable {
             RequestSlot::Preparing { ticket, kind, .. } if *kind == ReservationKind::Initial => {
                 CancelKind::CommitPreparing(ticket.clone())
             }
-            RequestSlot::Preparing { .. } => CancelKind::PreserveReplacement,
+            RequestSlot::Preparing { ticket, .. } => {
+                CancelKind::PreserveReplacement(ticket.clone())
+            }
             RequestSlot::Running { ticket, .. } => CancelKind::CommitRunning {
                 ticket: ticket.clone(),
                 has_pending: state
@@ -876,7 +902,9 @@ impl SessionTable {
             },
         };
         let sequences = match &cancel_kind {
-            CancelKind::PreserveReplacement => None,
+            CancelKind::PreserveReplacement(_) => {
+                Some(preflight_event_sequences(state.next_sequence, 1)?)
+            }
             CancelKind::CommitPreparing(_) => {
                 Some(preflight_event_sequences(state.next_sequence, 1)?)
             }
@@ -894,7 +922,19 @@ impl SessionTable {
         };
 
         let timer = match (&cancel_kind, sequences) {
-            (CancelKind::PreserveReplacement, None) => {
+            (CancelKind::PreserveReplacement(ticket), Some((sequence, _))) => {
+                enqueue_payload_at(
+                    state,
+                    ticket,
+                    sequence,
+                    ActionStreamPayload::PreparationFailed {
+                        code: "PREPARATION_CANCELLED".to_owned(),
+                        message: "请求准备已取消，已保留上一轮内容".to_owned(),
+                        retryable: true,
+                        question: None,
+                    },
+                );
+                apply_pending_limit_plan(state, pending_limit);
                 state.request_stream = None;
                 TimerDirective::None
             }
@@ -1312,7 +1352,7 @@ fn enqueue_payload_at(
 
 fn apply_event_to_snapshot(snapshot: &mut ActionSnapshot, event: &ActionStreamEvent) {
     match &event.payload {
-        ActionStreamPayload::Started => {
+        ActionStreamPayload::Started { transcript, .. } => {
             snapshot.session_id.clone_from(&event.session_id);
             snapshot.session_generation = event.session_generation;
             snapshot.request_id.clone_from(&event.request_id);
@@ -1328,6 +1368,24 @@ fn apply_event_to_snapshot(snapshot: &mut ActionSnapshot, event: &ActionStreamEv
             snapshot.error_code = None;
             snapshot.error_message = None;
             snapshot.retryable = false;
+            snapshot.preparation_failure = None;
+            snapshot.transcript = transcript.clone().unwrap_or_default();
+        }
+        ActionStreamPayload::PreparationFailed {
+            code,
+            message,
+            retryable,
+            question,
+        } => {
+            snapshot.last_sequence = event.sequence;
+            snapshot.preparation_failure = Some(PreparationFailure {
+                request_id: event.request_id.clone(),
+                request_generation: event.request_generation,
+                code: code.clone(),
+                message: message.clone(),
+                retryable: *retryable,
+                question: question.clone(),
+            });
         }
         ActionStreamPayload::Delta { delta } => {
             snapshot.content.push_str(delta);
@@ -1475,6 +1533,8 @@ fn running_snapshot(ticket: &RequestTicket, sequence: EventSequence) -> ActionSn
         error_code: None,
         error_message: None,
         retryable: false,
+        preparation_failure: None,
+        transcript: Vec::new(),
     }
 }
 
@@ -2655,7 +2715,15 @@ mod tests {
         assert_eq!(open_state(&table, "s").request_stream, None);
         let transition = table.cancel("s").unwrap();
         assert_eq!(transition.timer, TimerDirective::None);
-        assert_eq!(open_state(&table, "s").snapshot, before);
+        let snapshot = &open_state(&table, "s").snapshot;
+        assert_eq!(snapshot.content, before.content);
+        assert_eq!(snapshot.status, before.status);
+        assert_eq!(snapshot.request_id, before.request_id);
+        assert_eq!(
+            snapshot.preparation_failure.as_ref().unwrap().request_id,
+            retry.ticket.request_id
+        );
+        assert!(snapshot.last_sequence > before.last_sequence);
         assert_eq!(open_state(&table, "s").request_stream, None);
         assert_eq!(
             table.commit_prepare_success(&retry.ticket),
@@ -2787,7 +2855,10 @@ mod tests {
         );
         assert_eq!(started.action_id, state.snapshot.action_id);
         assert_eq!(started.sequence, EventSequence::FIRST);
-        assert!(matches!(started.payload, ActionStreamPayload::Started));
+        assert!(matches!(
+            started.payload,
+            ActionStreamPayload::Started { .. }
+        ));
 
         let closed = table.close("session-a");
         assert!(closed.cancellation.is_some());
@@ -2921,7 +2992,10 @@ mod tests {
             );
             assert_eq!(started.action_id, running.snapshot.action_id);
             assert_eq!(started.sequence, expected_sequence);
-            assert!(matches!(started.payload, ActionStreamPayload::Started));
+            assert!(matches!(
+                started.payload,
+                ActionStreamPayload::Started { .. }
+            ));
             match &running.request_slot {
                 RequestSlot::Running { ticket, .. } => assert_eq!(ticket, &reservation.ticket),
                 _ => panic!("matching prepare success must transition to Running"),
@@ -3057,7 +3131,13 @@ mod tests {
         let transition = table.cancel("session-cancel").unwrap();
         let state = open_state(&table, "session-cancel");
         assert!(matches!(state.request_slot, RequestSlot::Vacant));
-        assert_eq!(state.snapshot, old_snapshot);
+        assert_eq!(state.snapshot.content, old_snapshot.content);
+        assert_eq!(state.snapshot.status, old_snapshot.status);
+        assert_eq!(state.snapshot.request_id, old_snapshot.request_id);
+        let failure = state.snapshot.preparation_failure.as_ref().unwrap();
+        assert_eq!(failure.request_id, reservation.ticket.request_id);
+        assert_eq!(failure.code, "PREPARATION_CANCELLED");
+        assert!(state.snapshot.last_sequence > old_snapshot.last_sequence);
         assert_eq!(
             table.commit_prepare_success(&reservation.ticket),
             TransitionResult::Rejected
@@ -3087,13 +3167,34 @@ mod tests {
                     code: "PREPARE_FAILED".to_owned(),
                     message: "could not prepare".to_owned(),
                     retryable: true,
+                    question: Some("follow-up".to_owned()),
                 },
             ),
             TransitionResult::Applied
         );
         let state = open_state(&table, "session-failure");
         assert!(matches!(state.request_slot, RequestSlot::Vacant));
-        assert_eq!(state.snapshot, before);
+        assert_eq!(state.snapshot.content, before.content);
+        assert_eq!(state.snapshot.status, before.status);
+        assert_eq!(state.snapshot.request_id, before.request_id);
+        assert_eq!(state.snapshot.request_generation, before.request_generation);
+        assert_eq!(
+            state.snapshot.last_content_sequence,
+            before.last_content_sequence
+        );
+        assert!(state.snapshot.last_sequence > before.last_sequence);
+        let failure = state.snapshot.preparation_failure.as_ref().unwrap();
+        assert_eq!(failure.request_id, reservation.ticket.request_id);
+        assert_eq!(
+            failure.request_generation,
+            reservation.ticket.request_generation
+        );
+        assert_eq!(failure.code, "PREPARE_FAILED");
+        assert_eq!(failure.question.as_deref(), Some("follow-up"));
+        assert!(matches!(
+            state.pending_events.back().unwrap().payload,
+            ActionStreamPayload::PreparationFailed { .. }
+        ));
     }
 
     #[test]
@@ -3110,6 +3211,7 @@ mod tests {
                     code: "NO_ROUTE".to_owned(),
                     message: "route unavailable".to_owned(),
                     retryable: false,
+                    question: None,
                 },
             ),
             TransitionResult::Applied
@@ -3120,7 +3222,7 @@ mod tests {
         assert_eq!(state.pending_events[0].sequence, EventSequence(1));
         assert!(matches!(
             state.pending_events[0].payload,
-            ActionStreamPayload::Started
+            ActionStreamPayload::Started { .. }
         ));
         assert_eq!(state.pending_events[1].sequence, EventSequence(2));
         assert!(matches!(
@@ -3202,6 +3304,7 @@ mod tests {
                     code: "STALE".to_owned(),
                     message: "stale failure".to_owned(),
                     retryable: false,
+                    question: None,
                 },
             ),
             TransitionResult::Rejected

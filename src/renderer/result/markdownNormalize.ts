@@ -7,11 +7,12 @@
  * outside fenced code without a full re-parse, keeping O(n) cost.
  */
 
-const FENCE_MARKER = /^[ \t]{0,3}([`~]{3,})(.*)$/u
+const FENCE_MARKER = /^[ \t]{0,3}(`{3,}|~{3,})(.*)$/u
 const ATX_HEADING = /^[ \t]{0,3}#{1,6}(?:[ \t]|$)/u
 const BLOCKQUOTE = /^[ \t]{0,3}>/u
 const TABLE_ROW = /^[ \t]{0,3}\|/u
 const HORIZONTAL_RULE = /^[ \t]{0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$/u
+const SETEXT_UNDERLINE = /^[ \t]{0,3}(?:=+|-+)[ \t]*$/u
 /** GFM / CommonMark list markers, plus common Chinese translation markers. */
 const LIST_LINE =
   /^[ \t]{0,3}(?:[-*+•·●○](?:[ \t]+|$)|(?:\d{1,3}(?:[.)]|、|．)|[（(]\d{1,3}[）)])(?:[ \t]+|$))/u
@@ -26,14 +27,13 @@ type LineKind = 'blank' | 'list' | 'table' | 'heading' | 'quote' | 'hr' | 'fence
 export function normalizeMarkdownSource(source: string): string {
   if (!source) return source
 
-  let text = source.replace(/\r\n?/gu, '\n')
-  if (shouldUnescapeLiteralNewlines(text)) {
-    text = text.replace(/\\n/gu, '\n').replace(/\\t/gu, '\t')
-  }
-
+  // The transport has already decoded JSON. Literal escapes are content,
+  // especially inside code, regular expressions and Windows paths.
+  const text = source.replace(/\r\n?/gu, '\n')
   const lines = text.split('\n')
   const out: string[] = []
   let fenceChar: string | null = null
+  let fenceLength = 0
   let previousKind: LineKind = 'blank'
   let previousLine = ''
 
@@ -53,17 +53,18 @@ export function normalizeMarkdownSource(source: string): string {
   for (const raw of lines) {
     if (fenceChar !== null) {
       emitLine(raw, 'fence')
-      if (isMatchingFenceClose(raw, fenceChar)) {
+      if (isMatchingFenceClose(raw, fenceChar, fenceLength)) {
         fenceChar = null
       }
       continue
     }
 
     const fenceMatch = raw.match(FENCE_MARKER)
-    if (fenceMatch) {
+    if (fenceMatch && !(fenceMatch[1]![0] === '`' && fenceMatch[2]!.includes('`'))) {
       // Outside a fence any fence marker opens (``` / ```ts / ~~~).
       if (previousKind !== 'blank') emitBlank()
       fenceChar = fenceMatch[1]![0]!
+      fenceLength = fenceMatch[1]!.length
       emitLine(raw, 'fence')
       continue
     }
@@ -73,8 +74,18 @@ export function normalizeMarkdownSource(source: string): string {
       continue
     }
 
+    // A Setext underline belongs to the preceding paragraph. Separating it
+    // would turn an h1/h2 into ordinary prose and a horizontal rule.
+    const priorKind = previousKind as LineKind
+    if (priorKind === 'prose' && SETEXT_UNDERLINE.test(raw)) {
+      emitLine(raw, 'heading')
+      continue
+    }
+
     const line = convertListMarkers(raw)
-    const kind = classifyLine(line)
+    const kind = priorKind === 'list' && /^[ \t]{2,}\S/u.test(line)
+      ? 'list'
+      : classifyLine(line)
 
     if (previousKind !== 'blank' && shouldSeparate(previousKind, kind, previousLine, line)) {
       emitBlank()
@@ -117,22 +128,11 @@ function shouldSeparate(
   return looksLikeParagraphBreak(previousLine, nextLine)
 }
 
-function shouldUnescapeLiteralNewlines(text: string): boolean {
-  const literal = countMatches(text, /\\n/gu)
-  if (literal < 2) return false
-  const real = countMatches(text, /\n/gu)
-  return literal >= real + 2
-}
-
-function countMatches(text: string, pattern: RegExp): number {
-  return text.match(pattern)?.length ?? 0
-}
-
-function isMatchingFenceClose(line: string, fenceChar: string): boolean {
-  const match = line.match(/^[ \t]{0,3}([`~]{3,})[ \t]*$/u)
+function isMatchingFenceClose(line: string, fenceChar: string, fenceLength: number): boolean {
+  const match = line.match(/^[ \t]{0,3}(`{3,}|~{3,})[ \t]*$/u)
   if (!match) return false
   const marker = match[1]!
-  return marker[0] === fenceChar && marker.length >= 3
+  return marker[0] === fenceChar && marker.length >= fenceLength
 }
 
 /**

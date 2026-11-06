@@ -541,3 +541,225 @@ describe('action event store ordered notices', () => {
     stop()
   })
 })
+
+describe('action event store replacement preparation contract', () => {
+  const oldTranscript = [
+    { id: 'session-1:turn:0', role: 'user', content: 'old question', streaming: false, scalarCount: 12 },
+    { id: 'session-1:turn:1', role: 'assistant', content: 'old answer', streaming: false, scalarCount: 10 }
+  ] satisfies NonNullable<ResultSessionSnapshot['transcript']>
+
+  const nextTranscript = [
+    ...oldTranscript,
+    { id: 'session-1:turn:2', role: 'user', content: 'next question', streaming: false, scalarCount: 13 },
+    { id: 'session-1:turn:3', role: 'assistant', content: '', streaming: true, scalarCount: 0 }
+  ] satisfies NonNullable<ResultSessionSnapshot['transcript']>
+
+  const completedSnapshot = (overrides: Partial<ResultSessionSnapshot> = {}) => snapshot({
+    status: 'completed',
+    content: 'old answer',
+    contentScalarCount: 10,
+    lastContentSequence: 9,
+    lastSequence: 10,
+    transcript: oldTranscript,
+    ...overrides
+  })
+
+  const preparationFailed = (sequence = 11, generation = 2): ActionStreamEvent => ({
+    ...eventBase,
+    requestId: `request-${generation}`,
+    requestGeneration: generation,
+    type: 'preparationFailed',
+    sequence,
+    code: 'PREPARATION_FAILED',
+    message: 'provider disabled',
+    retryable: false,
+    question: 'next question'
+  })
+
+  const nextStarted = (sequence = 12, generation = 3): ActionStreamEvent => ({
+    ...eventBase,
+    requestId: `request-${generation}`,
+    requestGeneration: generation,
+    type: 'started',
+    sequence,
+    providerId: 'provider-next',
+    modelId: 'model-next',
+    question: 'next question',
+    transcript: nextTranscript
+  })
+
+  const nextCompleted = (sequence = 14, generation = 3): ActionStreamEvent => ({
+    ...eventBase,
+    requestId: `request-${generation}`,
+    requestGeneration: generation,
+    type: 'completed',
+    sequence,
+    lastContentSequence: sequence - 1,
+    contentScalarCount: 1
+  })
+
+  it('consumes preparation failure sequence while preserving the committed answer and accepts a following request', async () => {
+    const store = await import('./actionEventStore')
+    const recovery = vi.fn()
+    const stop = store.startActionEventStore('session-1', recovery)
+    store.hydrateActionEventStore(completedSnapshot())
+    const before = store.getActionEventSnapshot()
+    const revision = store.getActionEventLogicalRevision()
+
+    emit(preparationFailed())
+    const failed = store.getActionEventSnapshot()
+    expect(failed).toEqual({
+      ...before,
+      preparationFailure: {
+        requestId: 'request-2', requestGeneration: 2, code: 'PREPARATION_FAILED',
+        message: 'provider disabled', retryable: false, question: 'next question'
+      }
+    })
+    expect(failed.transcript).toBe(before.transcript)
+    expect(store.getActionEventLogicalRevision()).toBe(revision + 1)
+    emit(preparationFailed())
+    expect(store.getActionEventSnapshot()).toBe(failed)
+    expect(store.getActionEventLogicalRevision()).toBe(revision + 1)
+
+    emit(nextStarted())
+    emit(delta(13, '😀', { requestId: 'request-3', requestGeneration: 3 }))
+    emit(nextCompleted())
+    expect(store.getActionEventSnapshot()).toMatchObject({
+      requestId: 'request-3', requestGeneration: 3, providerId: 'provider-next', modelId: 'model-next',
+      preparationFailure: null, transcript: nextTranscript, content: '😀', contentScalarCount: 1, status: 'completed'
+    })
+    expect(recovery).not.toHaveBeenCalled()
+    expect(frameCallbacks.size).toBe(0)
+    stop()
+  })
+
+  it('replays a same-batch failure and success after hydration without creating a sequence gap', async () => {
+    const store = await import('./actionEventStore')
+    const recovery = vi.fn()
+    const stop = store.startActionEventStore('session-1', recovery)
+    emit(preparationFailed())
+    emit(nextStarted())
+    emit(delta(13, '😀', { requestId: 'request-3', requestGeneration: 3 }))
+    emit(nextCompleted())
+
+    const outcome = store.hydrateActionEventStore(completedSnapshot())
+    expect(outcome).toEqual({
+      ack: { sessionId: 'session-1', sessionGeneration: 9, requestGeneration: 1, lastSequence: 10, handshakeGeneration: 4 },
+      recoveryNeeded: false
+    })
+    expect(store.getActionEventSnapshot()).toMatchObject({
+      requestId: 'request-3', requestGeneration: 3, status: 'completed', content: '😀', preparationFailure: null, transcript: nextTranscript
+    })
+    expect(recovery).not.toHaveBeenCalled()
+    stop()
+  })
+
+  it('acks the committed generation and failure watermark on snapshot recovery while replaying later failures and Started', async () => {
+    const store = await import('./actionEventStore')
+    const recovery = vi.fn()
+    const stop = store.startActionEventStore('session-1', recovery)
+    emit(preparationFailed())
+    emit(preparationFailed(12, 3))
+    emit(nextStarted(13, 4))
+    emit(delta(14, '😀', { requestId: 'request-4', requestGeneration: 4 }))
+    emit(nextCompleted(15, 4))
+    const outcome = store.hydrateActionEventStore(completedSnapshot({
+      lastSequence: 11,
+      handshakeGeneration: 5,
+      preparationFailure: {
+        requestId: 'request-2', requestGeneration: 2, code: 'PREPARATION_FAILED',
+        message: 'provider disabled', retryable: false, question: 'next question'
+      }
+    }))
+    expect(outcome.ack).toMatchObject({ requestGeneration: 1, lastSequence: 11, handshakeGeneration: 5 })
+    expect(outcome.recoveryNeeded).toBe(false)
+    expect(store.getActionEventSnapshot()).toMatchObject({
+      requestId: 'request-4', requestGeneration: 4, status: 'completed', content: '😀', preparationFailure: null
+    })
+    expect(recovery).not.toHaveBeenCalled()
+    stop()
+  })
+
+  it('recovers a real gap after a failure and replays the continuous tail with the new request watermarks', async () => {
+    const store = await import('./actionEventStore')
+    const recovery = vi.fn()
+    const stop = store.startActionEventStore('session-1', recovery)
+    store.hydrateActionEventStore(completedSnapshot())
+    emit(preparationFailed())
+    emit(nextStarted(13))
+    emit(delta(14, '😀', { requestId: 'request-3', requestGeneration: 3 }))
+    emit(nextCompleted(15))
+    expect(recovery).toHaveBeenCalledTimes(1)
+    expect(recovery).toHaveBeenCalledWith('sequence-gap')
+    expect(store.getActionEventSnapshot().requestId).toBe('request-1')
+
+    const outcome = store.hydrateActionEventStore(snapshot({
+      requestId: 'request-3', requestGeneration: 3, providerId: 'provider-next', modelId: 'model-next',
+      lastSequence: 13, transcript: nextTranscript, handshakeGeneration: 5
+    }))
+    expect(outcome.ack).toMatchObject({ requestGeneration: 3, lastSequence: 13, handshakeGeneration: 5 })
+    expect(outcome.recoveryNeeded).toBe(false)
+    expect(store.getActionEventSnapshot()).toMatchObject({ requestId: 'request-3', status: 'completed', content: '😀' })
+    expect(recovery).toHaveBeenCalledTimes(1)
+    stop()
+  })
+
+  it.each([false, true])('honors committed-generation resync after a terminal answer (preparation failure received: %s)', async (hasFailure) => {
+    const store = await import('./actionEventStore')
+    const recovery = vi.fn()
+    const stop = store.startActionEventStore('session-1', recovery)
+    store.hydrateActionEventStore(completedSnapshot())
+    if (hasFailure) emit(preparationFailed())
+    const resyncSequence = hasFailure ? 12 : 11
+    emit({ ...eventBase, type: 'resyncRequired', sequence: resyncSequence, snapshotLastSequence: resyncSequence - 1 })
+    expect(recovery).toHaveBeenCalledTimes(1)
+    expect(recovery).toHaveBeenCalledWith('resync-required')
+    expect(store.getActionEventSnapshot().content).toBe('old answer')
+
+    emit(nextStarted(resyncSequence + 1))
+    emit(delta(resyncSequence + 2, '😀', { requestId: 'request-3', requestGeneration: 3 }))
+    emit(nextCompleted(resyncSequence + 3))
+    const outcome = store.hydrateActionEventStore(completedSnapshot({
+      lastSequence: resyncSequence,
+      handshakeGeneration: 5,
+      ...(hasFailure ? { preparationFailure: {
+        requestId: 'request-2', requestGeneration: 2, code: 'PREPARATION_FAILED',
+        message: 'provider disabled', retryable: false, question: 'next question'
+      } } : {})
+    }))
+    expect(outcome.ack).toMatchObject({ requestGeneration: 1, lastSequence: resyncSequence })
+    expect(outcome.recoveryNeeded).toBe(false)
+    expect(store.getActionEventSnapshot()).toMatchObject({ requestId: 'request-3', status: 'completed', content: '😀' })
+    expect(recovery).toHaveBeenCalledTimes(1)
+    stop()
+  })
+})
+
+describe('action event store compacted preparation recovery', () => {
+  it('honors a resync marker that skips discarded failed-attempt events and restores their snapshot metadata', async () => {
+    const store = await import('./actionEventStore')
+    const recovery = vi.fn()
+    const stop = store.startActionEventStore('session-1', recovery)
+    const completed = snapshot({ status: 'completed', content: 'old', contentScalarCount: 3, lastContentSequence: 9, lastSequence: 10 })
+    store.hydrateActionEventStore(completed)
+    // Failed generations 2 and 3 occupied sequences 11 and 12, but the native
+    // pending queue compacted them into its authoritative snapshot.
+    emit({ ...eventBase, type: 'resyncRequired', sequence: 13, snapshotLastSequence: 12 })
+    expect(recovery).toHaveBeenCalledTimes(1)
+    expect(recovery).toHaveBeenCalledWith('resync-required')
+    const preparationFailure = {
+      requestId: 'request-3', requestGeneration: 3, code: 'PREPARATION_FAILED',
+      message: 'provider disabled', retryable: false, question: 'restore this input'
+    }
+    const outcome = store.hydrateActionEventStore({ ...completed, lastSequence: 13, handshakeGeneration: 5, preparationFailure })
+    expect(outcome).toEqual({
+      ack: { sessionId: 'session-1', sessionGeneration: 9, requestGeneration: 1, lastSequence: 13, handshakeGeneration: 5 },
+      recoveryNeeded: false
+    })
+    expect(store.getActionEventSnapshot()).toMatchObject({ requestId: 'request-1', requestGeneration: 1, status: 'completed', content: 'old', preparationFailure })
+    emit(started(14, { requestId: 'request-4', requestGeneration: 4 }))
+    expect(store.getActionEventSnapshot()).toMatchObject({ requestId: 'request-4', preparationFailure: null, status: 'streaming' })
+    expect(recovery).toHaveBeenCalledTimes(1)
+    stop()
+  })
+})

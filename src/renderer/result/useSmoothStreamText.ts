@@ -51,6 +51,25 @@ export function useSmoothStreamText(
   cancelFrame: SmoothStreamFrameCanceller = defaultCancelFrame,
   now: SmoothStreamClock = defaultNow
 ): SmoothStreamSnapshot {
+  const [reducedMotion, setReducedMotion] = useState(() =>
+    window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
+  )
+  useLayoutEffect(() => {
+    // Own the media query for this subscription lifecycle, including a
+    // StrictMode setup/cleanup/setup, rather than retaining a render-time MQL.
+    const motionPreference = window.matchMedia?.('(prefers-reduced-motion: reduce)')
+    if (!motionPreference) return
+    const update = (): void => setReducedMotion(motionPreference.matches)
+    if (motionPreference.addEventListener) {
+      motionPreference.addEventListener('change', update)
+      update()
+      return () => motionPreference.removeEventListener('change', update)
+    }
+    motionPreference.addListener?.(update)
+    update()
+    return () => motionPreference.removeListener?.(update)
+  }, [])
+
   const controllerRef = useRef<SmoothStreamController | null>(null)
   if (controllerRef.current === null) {
     controllerRef.current = new SmoothStreamController(config)
@@ -72,8 +91,8 @@ export function useSmoothStreamText(
       controller.reset()
     }
 
-    animationRef.current = streaming
-    if (!streaming) {
+    animationRef.current = streaming && !reducedMotion
+    if (!animationRef.current) {
       const snapped = controller.setTarget(target, false, now())
       setDisplayed((current) =>
         current.text === snapped ? current : { text: snapped, scalarCount: controller.getDisplayedScalarCount() }
@@ -116,7 +135,7 @@ export function useSmoothStreamText(
       cancelled = true
       if (handle !== null) cancelFrame(handle)
     }
-  }, [cancelFrame, controller, now, requestFrame, resetKey, streaming, target])
+  }, [cancelFrame, controller, now, reducedMotion, requestFrame, resetKey, streaming, target])
 
   return streaming
     ? displayed

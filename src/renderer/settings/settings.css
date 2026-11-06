@@ -27,6 +27,7 @@ body::-webkit-scrollbar-thumb,
 .dialog-card::-webkit-scrollbar-thumb,
 textarea.control::-webkit-scrollbar-thumb,
 .settings-nav::-webkit-scrollbar-thumb {
+  background: var(--text-tertiary);
   background: color-mix(in srgb, var(--text-tertiary) 42%, transparent);
   background-clip: padding-box;
   border: 1px solid transparent;
@@ -38,6 +39,7 @@ body::-webkit-scrollbar-thumb:hover,
 .dialog-card::-webkit-scrollbar-thumb:hover,
 textarea.control::-webkit-scrollbar-thumb:hover,
 .settings-nav::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
   background: color-mix(in srgb, var(--text-tertiary) 62%, transparent);
   background-clip: padding-box;
 }
@@ -60,8 +62,11 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   min-height: 100vh;
   padding: 0;
   margin: 0 auto;
+  background: var(--surface-solid);
   background: color-mix(in srgb, var(--surface-solid) 72%, var(--bg));
+  border-right: 1px solid var(--border);
   border-right: 1px solid color-mix(in srgb, var(--border) 48%, transparent);
+  border-left: 1px solid var(--border);
   border-left: 1px solid color-mix(in srgb, var(--border) 48%, transparent);
 }
 
@@ -74,7 +79,9 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   gap: 18px;
   min-height: 100vh;
   padding: 24px 14px 24px 10px;
+  background: var(--surface-muted);
   background: color-mix(in srgb, var(--surface-muted) 54%, var(--surface-solid));
+  border-right: 1px solid var(--border);
   border-right: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
 }
 
@@ -83,6 +90,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   flex-direction: column;
   min-width: 0;
   min-height: 100vh;
+  background: var(--surface-solid);
   background: color-mix(in srgb, var(--surface-solid) 84%, var(--bg));
 }
 
@@ -180,6 +188,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 
 .settings-nav__item.is-selected {
   color: var(--accent);
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--accent-soft) 76%, transparent);
   border-color: transparent;
 }
@@ -189,6 +198,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 }
 
 .settings-nav__item:focus-visible {
+  outline: 3px solid var(--accent);
   outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
   outline-offset: 1px;
 }
@@ -218,13 +228,17 @@ textarea.control::-webkit-scrollbar-thumb:hover,
    appearance theme tints them. */
 .settings-banner.notice--success {
   color: var(--success);
+  background: var(--success-soft);
   background: color-mix(in srgb, var(--success-soft) 78%, var(--surface-solid));
+  border: 1px solid var(--success);
   border: 1px solid color-mix(in srgb, var(--success) 30%, transparent);
 }
 
 .settings-banner.notice--error {
   color: var(--danger);
+  background: var(--danger-soft);
   background: color-mix(in srgb, var(--danger-soft) 78%, var(--surface-solid));
+  border: 1px solid var(--danger);
   border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
 }
 
@@ -258,8 +272,11 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.5;
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--accent-soft) 46%, var(--surface-muted));
+  border: 1px solid var(--accent);
   border: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border));
+  border-left: 3px solid var(--accent);
   border-left: 3px solid color-mix(in srgb, var(--accent) 70%, var(--border));
   border-radius: var(--radius-md);
 }
@@ -273,6 +290,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   font-size: 11px;
   font-weight: var(--weight-bold);
   letter-spacing: 0.02em;
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--accent-soft) 80%, transparent);
   border-radius: var(--radius-pill);
 }
@@ -359,7 +377,9 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 
 .settings-card,
 .action-list {
+  background: var(--surface-solid);
   background: color-mix(in srgb, var(--surface-solid) 88%, var(--surface-muted));
+  border: 1px solid var(--border);
   border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
   border-radius: var(--radius-md);
   box-shadow: none;
@@ -433,7 +453,9 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 .segmented-control {
   display: inline-flex;
   padding: 3px;
+  background: var(--surface-muted);
   background: color-mix(in srgb, var(--surface-muted) 78%, var(--surface-solid));
+  border: 1px solid var(--border);
   border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
   border-radius: var(--radius-card);
 }
@@ -532,6 +554,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 }
 
 .switch input:focus-visible + span {
+  outline: 3px solid var(--accent);
   outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
   outline-offset: 2px;
 }
@@ -677,6 +700,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   justify-content: space-between;
   min-height: 54px;
   padding: 9px 13px 9px 17px;
+  background: var(--surface-muted);
   background: color-mix(in srgb, var(--surface-muted) 72%, var(--surface-solid));
   border-bottom: 1px solid var(--border);
 }
@@ -699,6 +723,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   line-height: 1;
   cursor: pointer;
   user-select: none;
+  background: var(--surface-solid);
   background: color-mix(in srgb, var(--surface-solid) 70%, transparent);
   border: 1px solid var(--border);
   border-radius: var(--radius-pill);
@@ -785,7 +810,9 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   font-size: 12px;
   font-weight: var(--weight-semibold);
   line-height: 1.45;
+  background: var(--warning-soft);
   background: color-mix(in srgb, var(--warning) 16%, var(--surface-solid));
+  border: 1px solid var(--warning);
   border: 1px solid color-mix(in srgb, var(--warning) 42%, var(--border));
   border-radius: var(--radius-sm);
 }
@@ -817,7 +844,9 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   padding: 2px 6px 2px 2px;
   color: var(--text-secondary);
   font-size: 12px;
+  background: var(--surface-muted);
   background: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-solid));
+  border: 1px solid var(--border);
   border: 1px solid color-mix(in srgb, var(--border) 86%, transparent);
   border-radius: var(--radius-sm);
 }
@@ -1078,6 +1107,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   justify-items: center;
   padding: 19px 20px;
   margin-bottom: 12px;
+  background: var(--surface-muted);
   background: color-mix(in srgb, var(--surface-muted) 42%, var(--surface-solid));
 }
 
@@ -1145,21 +1175,30 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 .action-zone {
   min-width: 0;
   overflow: hidden;
+  background: var(--surface-solid);
   background: color-mix(in srgb, var(--surface-solid) 96%, var(--accent-soft));
+  border: 1px solid var(--border-strong);
   border: 1px solid color-mix(in srgb, var(--border-strong) 78%, transparent);
   border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
   box-shadow: 0 5px 16px color-mix(in srgb, var(--text) 4%, transparent);
 }
 
 .action-zone--enabled {
+  border-color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  box-shadow:
+    0 1px 2px var(--accent-soft),
+    0 0 0 1px var(--accent-soft);
   box-shadow:
     0 1px 2px color-mix(in srgb, var(--accent) 8%, transparent),
     0 0 0 1px color-mix(in srgb, var(--accent) 6%, transparent);
 }
 
 .action-zone.is-drag-over {
+  border-color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 62%, var(--border));
+  box-shadow: 0 0 0 2px var(--accent-soft);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
@@ -1169,6 +1208,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   justify-content: space-between;
   min-height: 43px;
   padding: 8px 12px;
+  background: var(--surface-muted);
   background: color-mix(in srgb, var(--surface-muted) 82%, var(--surface-solid));
   border-bottom: 1px solid var(--border);
 }
@@ -1193,6 +1233,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   align-items: center;
   min-height: 54px;
   padding: 5px 5px 5px 2px;
+  background: var(--surface-solid);
   background: color-mix(in srgb, var(--surface-solid) 94%, var(--surface-muted));
   border: 1px solid transparent;
   border-radius: var(--radius-card);
@@ -1273,6 +1314,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   height: 39px;
   color: var(--accent);
   background: var(--accent-soft);
+  border: 1px solid var(--accent);
   border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
   border-radius: var(--radius-card);
 }
@@ -1280,6 +1322,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 .icon-picker__preview--invalid {
   color: var(--danger);
   background: var(--danger-soft);
+  border-color: var(--danger);
   border-color: color-mix(in srgb, var(--danger) 24%, transparent);
 }
 
@@ -1312,6 +1355,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 .icon-picker__popular button.is-selected {
   color: var(--accent);
   background: var(--accent-soft);
+  border-color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
@@ -1361,7 +1405,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 
 .filter-tag button:hover {
   color: var(--danger);
-  background: var(--danger-soft, color-mix(in srgb, var(--danger) 12%, transparent));
+  background: var(--danger-soft);
 }
 
 .dialog-card--action {
@@ -1489,8 +1533,10 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   min-height: 64px;
   margin-top: auto;
   padding: 12px 22px;
+  background: var(--surface-solid);
   background: color-mix(in srgb, var(--surface-solid) 94%, var(--surface-muted));
   border-top: 1px solid var(--border);
+  box-shadow: 0 -8px 28px rgba(0, 0, 0, 0.06);
   box-shadow: 0 -8px 28px color-mix(in srgb, var(--text) 6%, transparent);
   -webkit-backdrop-filter: blur(18px);
   backdrop-filter: blur(18px);
@@ -1501,8 +1547,11 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 }
 
 .settings-footer--dirty {
+  border-top-color: var(--accent);
   border-top-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: var(--accent-soft);
   background: color-mix(in srgb, var(--accent-soft) 38%, var(--surface-solid));
+  box-shadow: 0 -10px 32px var(--accent-soft);
   box-shadow: 0 -10px 32px color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
@@ -1525,6 +1574,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   height: 7px;
   border-radius: 50%;
   background: var(--accent);
+  box-shadow: 0 0 0 0 var(--accent-soft);
   box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent);
   animation: settings-dirty-pulse 1.6s ease-out infinite;
 }
@@ -1564,9 +1614,11 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   max-height: calc(100vh - 56px);
   overflow: auto;
   overscroll-behavior: contain;
+  background: var(--surface-solid);
   background: color-mix(in srgb, var(--surface-solid) 98%, var(--accent-soft));
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg), 0 0 0 1px var(--surface-solid);
   box-shadow: var(--shadow-lg), 0 0 0 1px color-mix(in srgb, var(--surface-solid) 30%, transparent);
 }
 
@@ -1679,6 +1731,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 
 @keyframes settings-dirty-pulse {
   0% {
+    box-shadow: 0 0 0 0 var(--accent-soft);
     box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent);
   }
 
@@ -1703,6 +1756,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
     z-index: 14;
     min-height: 0;
     padding: 14px 0 10px;
+    background: var(--bg);
     background: color-mix(in srgb, var(--bg) 92%, transparent);
     border-right: 0;
     border-bottom: 1px solid var(--border);
@@ -1779,7 +1833,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 
 @media (prefers-reduced-motion: reduce) {
   .settings-spin {
-    animation-duration: 1.8s;
+    animation: none;
   }
 
   .settings-section--enter {
@@ -1866,6 +1920,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 }
 
 .theme-option:hover {
+  border-color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
 }
 
@@ -1899,7 +1954,9 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   width: max-content;
   margin: 0 auto;
   padding: 3px 4px;
+  background: var(--surface-solid);
   background: color-mix(in srgb, var(--surface-solid) 88%, var(--surface-muted));
+  border: 1px solid var(--border-strong);
   border: 1px solid color-mix(in srgb, var(--border-strong) 55%, transparent);
   border-radius: var(--radius-tag);
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
@@ -1921,6 +1978,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   gap: 4px;
   width: 100%;
   padding: 6px;
+  background: var(--surface-solid);
   background: color-mix(in srgb, var(--surface-solid) 72%, var(--surface-muted));
   border: 1px solid var(--border);
   border-radius: var(--radius-tag);
@@ -1933,6 +1991,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   min-height: 10px;
   padding: 2px 4px;
   margin: -2px -2px 1px;
+  background: var(--surface-muted);
   background: color-mix(in srgb, var(--surface-muted) 66%, var(--surface-solid));
   border-radius: var(--radius-xs);
 }
@@ -1949,6 +2008,7 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 .theme-preview__line {
   display: block;
   height: 4px;
+  background: var(--text-secondary);
   background: color-mix(in srgb, var(--text-secondary) 55%, transparent);
   border-radius: var(--radius-pill);
 }
@@ -1956,11 +2016,13 @@ textarea.control::-webkit-scrollbar-thumb:hover,
 .theme-preview__line--meta {
   flex: 1;
   max-width: 52px;
+  background: var(--text-tertiary);
   background: color-mix(in srgb, var(--text-tertiary) 60%, transparent);
 }
 
 .theme-preview__line--short {
   width: 62%;
+  background: var(--text-tertiary);
   background: color-mix(in srgb, var(--text-tertiary) 50%, transparent);
 }
 
@@ -1970,7 +2032,9 @@ textarea.control::-webkit-scrollbar-thumb:hover,
   height: 8px;
   margin-top: 2px;
   margin-left: auto;
+  background: var(--result-header-surface, var(--surface-muted));
   background: color-mix(in srgb, var(--result-header-surface, var(--surface-muted)) 66%, var(--surface-solid));
+  border: 1px solid var(--border);
   border: 1px solid color-mix(in srgb, var(--border) 58%, transparent);
   border-radius: var(--radius-2xs);
 }

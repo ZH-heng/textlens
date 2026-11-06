@@ -1,0 +1,22 @@
+[
+  { "text": "Dies ist ein deutscher Text über die aktuelle Auswahl.", "language": "de-DE" },
+  { "text": "Bitte übersetzen Sie diese Auswahl.", "language": "de-DE" },
+  { "text": "Guten Tag!", "language": "de-DE" },
+  { "text": "Hallo!", "language": "de-DE" },
+  { "text": "Ceci est un texte français pour vous.", "language": "fr-FR" },
+  { "text": "Traduire cette sélection, merci.", "language": "fr-FR" },
+  { "text": "Bonjour!", "language": "fr-FR" },
+  { "text": "Hello world", "language": "en-US" },
+  { "text": "Please translate this English text.", "language": "en-US" },
+  { "text": "The cafe offers a café menu with coffee.", "language": "en-US" },
+  { "text": "This English paragraph contains the word bonjour for illustration.", "language": "en-US" },
+  { "text": "bonjour bonjour bonjour", "language": "en-US" },
+  { "text": "café", "language": "en-US" },
+  { "text": "und et", "language": "en-US" },
+  { "text": "这是中文", "language": "zh-CN" },
+  { "text": "日本語能力試験に合格した", "language": "ja-JP" },
+  { "text": "안녕하세요", "language": "ko-KR" },
+  { "text": "Привет", "language": "ru-RU" },
+  { "text": "Hello の world", "language": "en-US" },
+  { "text": "12345 — !", "language": "en-US" }
+]

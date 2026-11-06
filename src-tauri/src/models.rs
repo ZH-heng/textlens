@@ -940,6 +940,35 @@ pub struct ActionNotice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct PreparationFailure {
+    pub request_id: String,
+    pub request_generation: RequestGeneration,
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptTurn {
+    pub id: String,
+    pub role: TranscriptRole,
+    pub content: String,
+    pub streaming: bool,
+    pub scalar_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ActionSnapshot {
     pub session_id: String,
     pub session_generation: SessionGeneration,
@@ -961,6 +990,12 @@ pub struct ActionSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     pub retryable: bool,
+    /// A rejected replacement keeps the previous answer and request identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_failure: Option<PreparationFailure>,
+    /// Reconstructed from in-memory Ask context; never written to disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript: Vec<TranscriptTurn>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -983,7 +1018,23 @@ pub struct ActionStreamEvent {
     rename_all_fields = "camelCase"
 )]
 pub enum ActionStreamPayload {
-    Started,
+    Started {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcript: Option<Vec<TranscriptTurn>>,
+    },
+    PreparationFailed {
+        code: String,
+        message: String,
+        retryable: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question: Option<String>,
+    },
     Delta {
         delta: String,
     },

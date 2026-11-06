@@ -26,6 +26,7 @@ export type ActionEventFlushReason =
 interface LogicalCursor {
   sessionGeneration: number
   requestGeneration: number
+  latestRequestGeneration: number
   lastSequence: number
   lastContentSequence: number
   contentScalarCount: number
@@ -89,6 +90,7 @@ function acceptInitialStarted(
   cursor = {
     sessionGeneration: event.sessionGeneration,
     requestGeneration: event.requestGeneration,
+    latestRequestGeneration: event.requestGeneration,
     lastSequence: event.sequence,
     lastContentSequence: 0,
     contentScalarCount: 0
@@ -190,10 +192,26 @@ function processLiveEvent(
     beginRecovery('sequence-gap', event, options.reportRecovery)
     return
   }
-  if (event.requestGeneration < cursor.requestGeneration) return
+  // Queue compaction is a session control message. Its identity follows the
+  // committed snapshot, even if a newer replacement failed preparation, and
+  // it must still recover after that committed request has completed.
+  if (event.type === 'resyncRequired') {
+    if (event.sequence <= cursor.lastSequence) return
+    beginRecovery('resync-required', event, options.reportRecovery)
+    return
+  }
+  if (event.requestGeneration < cursor.latestRequestGeneration) return
   if (event.sequence <= cursor.lastSequence) return
   if (event.sequence !== cursor.lastSequence + 1) {
     beginRecovery('sequence-gap', event, options.reportRecovery)
+    return
+  }
+  if (event.type === 'preparationFailed') {
+    if (event.requestGeneration <= cursor.requestGeneration) return
+    cursor.lastSequence = event.sequence
+    cursor.latestRequestGeneration = event.requestGeneration
+    logicalRevision += 1
+    publishReducedEvent(event, options.notify)
     return
   }
   if (event.requestGeneration > cursor.requestGeneration && event.type !== 'started') {
@@ -213,10 +231,6 @@ function processLiveEvent(
     event.requestGeneration === cursor.requestGeneration
   ) return
 
-  if (event.type === 'resyncRequired') {
-    beginRecovery('resync-required', event, options.reportRecovery)
-    return
-  }
   if (event.type === 'started') {
     if (event.requestGeneration <= cursor.requestGeneration) {
       beginRecovery('sequence-gap', event, options.reportRecovery)
@@ -327,6 +341,10 @@ export function hydrateActionEventStore(
   cursor = {
     sessionGeneration: sessionSnapshot.sessionGeneration,
     requestGeneration: sessionSnapshot.requestGeneration,
+    latestRequestGeneration: Math.max(
+      sessionSnapshot.requestGeneration,
+      sessionSnapshot.preparationFailure?.requestGeneration ?? 0
+    ),
     lastSequence: sessionSnapshot.lastSequence,
     lastContentSequence: sessionSnapshot.lastContentSequence,
     contentScalarCount: sessionSnapshot.contentScalarCount

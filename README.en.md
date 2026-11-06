@@ -44,11 +44,12 @@ Enhancements beyond a basic selection assistant:
 - **Follow-up in results:** Translate / explain / summarize / polish result windows support multi-turn questions at the bottom (not only Ask AI).
 - **Header model switch & regenerate:** Switch models by provider group and regenerate in the same window; translation targets include CN/EN/JA/KO/RU/DE/FR.
 - **Multilingual translation:** Auto-detect source language; default other languages → Chinese, Chinese → English; primary/backup language pairs are configurable.
-- **Ask AI sessions:** Open a result window with selection as context; you can wait before the first model call, then chat multi-turn in that window only.
+- **Ask AI sessions:** Open a result window with selection as context; you can wait before the first model call, then chat multi-turn. Retrying a failed turn retains its question and earlier conversation, and both display and copy include the full transcript. Sessions stay within the current result window.
 - **Thinking & streaming:** Streaming thinking / reasoning display; thinking levels inferred from model names (including “off”); low-latency streaming.
-- **Provider enable/disable:** Disabled providers are hidden from action binding and result model lists (already-bound actions still run).
-- **Plays well with other apps:** When the clipboard holds something TextLens cannot fully preserve (a screenshot, for example), the temporary copy is skipped instead of rewriting your clipboard. Picking a toolbar action clears the highlight in the source app, and a leftover selection no longer brings the toolbar back on an unrelated click.
-- **Keyboard accessible:** Toolbar focus ring, listbox navigation in the model picker, arrow-key radio groups, and keyboard drag-reordering; Settings is organized into seven sections with errors shown on the field that failed.
+- **Provider enable/disable:** Disabled providers are hidden from action binding and result model lists. Already-bound actions also refuse to run and prompt you to update their configuration.
+- **Popup and waiting feedback:** The toolbar and result window use a brief fade-in, and three dots bounce in sequence while waiting for the model. Long action names truncate or scroll horizontally while retaining full tooltips. The system’s reduced-motion preference disables waiting animations and stream typewriter playback.
+- **Plays well with other apps:** When the clipboard holds something TextLens cannot fully preserve (a screenshot, for example), the temporary copy is skipped instead of rewriting your clipboard. On macOS, the source highlight is cleared after a short delay once copy/search succeeds or the result window is shown; configuration rejection or a failed result reveal leaves it selected. Windows currently leaves source highlights unchanged. A leftover selection no longer brings the toolbar back on an unrelated click.
+- **Settings and keyboard accessibility:** Edits and new API keys entered while a save is pending remain as unsaved drafts. Dialogs trap and restore focus, and validation switches to the relevant section and field. Toolbar focus rings, model listbox navigation, arrow-key radio groups, and keyboard drag-reordering are supported; Settings has seven sections.
 - **Lightweight & private:** Standalone Tauri tool; API keys encrypted locally; no selection history; text is sent only when you click an AI action.
 
 ## Tech stack
@@ -70,7 +71,7 @@ Enhancements beyond a basic selection assistant:
 | Testing | Vitest, Testing Library, jsdom, Rust tests | Frontend and backend logic tests |
 | Release | Tauri CLI, DMG, NSIS | macOS arm64 app and Windows x64 installer |
 
-macOS uses system WKWebView; Windows uses Microsoft Edge WebView2 Runtime. Current macOS DMG and Windows NSIS builds are unsigned test artifacts.
+macOS uses system WKWebView; Windows uses Microsoft Edge WebView2 Runtime. The macOS app uses local ad-hoc signing only, with no Developer ID signing or notarization; Windows NSIS outputs are unsigned test builds.
 
 ## Major open-source dependencies
 
@@ -108,8 +109,8 @@ These projects also pull transitive dependencies. Before a formal public release
 3. When standard APIs cannot read allowed custom-drawn apps, the backend briefly uses copy; original clipboard content is restored only if it was not modified again. If the current clipboard cannot be snapshotted completely (a screenshot, for example), the temporary copy is skipped and the clipboard is left alone.
 4. The Rust runtime validates the selection and positions the toolbar.
 5. On action click, local actions run on device; AI actions create a request session and send text.
-6. reqwest receives OpenAI-compatible Chat Completions SSE; after the first token, each content delta is forwarded immediately to the result window (no extra TTFB batching).
-7. The result window shows stream deltas synchronously, then switches to safe Markdown and KaTeX when complete.
+6. reqwest receives SSE or JSON model responses and forwards content deltas immediately. Empty answers, truncated responses, and read timeouts report a failure while retaining any text already received.
+7. The result window renders safe Markdown while streaming and loads math support when needed. Logical text updates immediately; adaptive playback smooths the display and completion reveals the full text. Reduced motion shows complete deltas directly.
 8. Settings and provider metadata live in local JSON; API keys are encrypted on disk. Normal settings payloads only expose `keyConfigured`. The settings window can reveal or edit plaintext via settings-only IPC when the user clicks show; toolbar and result windows cannot read keys.
 
 Main directories:
@@ -127,7 +128,7 @@ Main directories:
 
 ## Privacy and security
 
-- Selected text is sent only after the user clicks an AI action; no chat history store; no selection history.
+- Text is sent only when you run an AI action or submit a follow-up. Chat and selection history are not persisted; the temporary conversation stays within the current result window.
 - AI text defaults to a 20,000 character limit with an explicit error—no silent truncation.
 - Normal settings (`get_settings` / `PublicSettings`) include only `keyConfigured`, not plaintext API keys; on-disk settings JSON also stores no plaintext keys.
 - The settings window can load a saved API key via settings-only IPC (`get_provider_api_key`) when the user **clicks show**; toolbar and result windows cannot call that command.
@@ -159,7 +160,7 @@ Only Apple Silicon builds are published; they do not run on Intel Macs.
 3. If Gatekeeper blocks first launch, right-click TextLens in Finder and choose Open, or allow it under System Settings → Privacy & Security.
 4. Enable TextLens under System Settings → Privacy & Security → Accessibility, then restart the app.
 
-The macOS DMG is still unsigned and not notarized; it is not suitable for direct public distribution. Formal release needs Apple Developer ID signing and notarization.
+The macOS app uses local ad-hoc signing only and has no Developer ID signing or notarization. It remains a test build; those steps are still required before a formal public release.
 
 ## Third-party licenses and release checklist
 

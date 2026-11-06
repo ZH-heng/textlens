@@ -1,7 +1,7 @@
 {
   "name": "textlens",
   "productName": "TextLens",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "description": "TextLens, a lightweight macOS and Windows selection assistant built with Tauri.",
   "type": "module",

@@ -148,12 +148,13 @@ describe('ResultOutput', () => {
     }
   )
 
-  it('keeps the same rich renderer when streaming completes', async () => {
+  it('keeps streaming Markdown plain and parses once after completion', async () => {
     const scheduler = new DeterministicScheduler()
     const parser = vi.fn(({ content }: SafeMarkdownProps) => (
       <h1>{content.replace(/^# /u, '')}</h1>
     ))
     const loader = createRetryableMarkdownLoader(async () => ({ SafeMarkdown: memo(parser) }))
+    const grownContent = '# Streaming heading\n\n- growing answer'
     const view = render(
       <ResultOutput
         {...outputProps({
@@ -166,17 +167,30 @@ describe('ResultOutput', () => {
       />
     )
 
-    await act(async () => {
-      scheduler.runNextFrame()
-      await Promise.resolve()
-    })
-    const heading = await screen.findByRole('heading', { name: 'Streaming heading' })
+    expect(screen.getByText('# Streaming heading')).toHaveClass('stream-plain-text')
+    expect(parser).not.toHaveBeenCalled()
+
+    view.rerender(
+      <ResultOutput
+        {...outputProps({
+          status: 'streaming',
+          content: grownContent,
+          contentScalarCount: [...grownContent].length,
+          revealCommitted: true
+        })}
+        loader={loader}
+        scheduler={scheduler}
+      />
+    )
+    await waitFor(() => expect(document.querySelector('.stream-plain-text')?.textContent).toBe(grownContent))
+    expect(parser).not.toHaveBeenCalled()
 
     view.rerender(
       <ResultOutput
         {...outputProps({
           status: 'completed',
-          content: '# Streaming heading',
+          content: grownContent,
+          contentScalarCount: [...grownContent].length,
           revealCommitted: true
         })}
         loader={loader}
@@ -184,7 +198,11 @@ describe('ResultOutput', () => {
       />
     )
 
-    expect(screen.getByRole('heading', { name: 'Streaming heading' })).toBe(heading)
+    await act(async () => {
+      scheduler.runNextFrame()
+      await Promise.resolve()
+    })
+    expect(await screen.findByRole('heading')).toHaveTextContent(/Streaming heading\s+- growing answer/u)
     expect(scheduler.frames.size).toBe(0)
     expect(parser).toHaveBeenCalledOnce()
   })

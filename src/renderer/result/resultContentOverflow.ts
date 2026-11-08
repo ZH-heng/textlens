@@ -60,7 +60,9 @@ export function useResultContentOverflow(
   }, [measure])
 
   useLayoutEffect(() => {
-    measure()
+    // Coalesce geometry reads into a frame rather than forcing layout during
+    // the first token's React commit.
+    scheduleMeasure()
 
     const scrollElement = scrollRef.current
     const observedElement = observedRef.current
@@ -80,7 +82,7 @@ export function useResultContentOverflow(
         frameRef.current = null
       }
     }
-  }, [measure, observedRef, scheduleMeasure, scrollRef])
+  }, [observedRef, scheduleMeasure, scrollRef])
 
   return state
 }

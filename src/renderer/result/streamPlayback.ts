@@ -58,266 +58,136 @@ export function flushGraphemeTail(carry: string): string {
   return carry
 }
 
-/**
- * Time-based adaptive typewriter for stream display.
- * Store still holds full logical text immediately; the UI reveals it at a
- * continuous velocity so network bursts feel like smooth typing, not chunk dumps.
- */
-export interface SmoothStreamConfig {
-  /** Calm reveal rate (Unicode scalars / second) when backlog is thin. */
-  baseCharsPerSec: number
-  /** Catch-up rate when backlog is large. */
-  maxCharsPerSec: number
-  /** Backlog size (scalars) at which rate reaches maxCharsPerSec. */
-  catchUpBacklog: number
-  /**
-   * On first non-empty paint while streaming, reveal at most this many scalars
-   * immediately for TTFB; the rest drains at the typewriter rate.
-   * `0` means show the entire first chunk at once.
-   */
-  firstBurstMax: number
-  /** Hard cap of scalars released in a single tick (safety). */
-  maxStep: number
-}
-
-export const DEFAULT_SMOOTH_STREAM_CONFIG: SmoothStreamConfig = {
-  // ~4–5 chars/frame at 60fps — snappy Chinese / mixed text without chunk dumps.
-  baseCharsPerSec: 78,
-  // Drain multi-token bursts fast so display lag stays under ~0.3s for large IPC.
-  maxCharsPerSec: 360,
-  // Begin ramping earlier so English dumps and multi-token CN bursts do not stall.
-  catchUpBacklog: 36,
-  // Small immediate peek for TTFB; remainder typewrites so the first SSE chunk
-  // never dumps a whole paragraph in one paint.
-  firstBurstMax: 8,
-  maxStep: 56
-}
-
-/**
- * Scalars / second given remaining backlog. Smoothstep-ish lerp so rate does
- * not jump discretely between "slow" and "fast".
- */
-export function smoothStreamRate(
-  backlogScalars: number,
-  config: SmoothStreamConfig = DEFAULT_SMOOTH_STREAM_CONFIG
-): number {
-  if (backlogScalars <= 0) return 0
-  const t = Math.min(1, backlogScalars / Math.max(1, config.catchUpBacklog))
-  // Ease-in: stay near base for small backlog, ramp to max as it grows.
-  const eased = t * t * (3 - 2 * t)
-  return (
-    config.baseCharsPerSec +
-    (config.maxCharsPerSec - config.baseCharsPerSec) * eased
-  )
-}
-
-/**
- * How many whole scalars to release for `elapsedMs` at the adaptive rate,
- * carrying a fractional residual across frames for continuous motion.
- */
-export function smoothStreamStep(
-  backlogScalars: number,
-  elapsedMs: number,
-  residual: number,
-  config: SmoothStreamConfig = DEFAULT_SMOOTH_STREAM_CONFIG
-): { step: number; residual: number } {
-  if (backlogScalars <= 0 || elapsedMs <= 0) {
-    return { step: 0, residual }
-  }
-  const rate = smoothStreamRate(backlogScalars, config)
-  const budget = residual + (rate * elapsedMs) / 1000
-  const raw = Math.floor(budget)
-  const step = Math.min(backlogScalars, Math.max(0, Math.min(config.maxStep, raw)))
-  // Keep fractional leftover only when we did not clamp to backlog/maxStep.
-  const nextResidual =
-    step >= backlogScalars || step >= config.maxStep
-      ? 0
-      : budget - step
-  return { step, residual: nextResidual }
-}
-
-/** Advance `from` by up to `scalarCount` Unicode scalars without splitting surrogates. */
-export function advanceByUnicodeScalars(
-  value: string,
-  from: number,
-  scalarCount: number
-): number {
+/** Advance by Unicode scalars without splitting a surrogate pair. */
+export function advanceByUnicodeScalars(value: string, from: number, scalarCount: number): number {
   let index = Math.max(0, Math.min(from, value.length))
-  let remaining = Math.max(0, scalarCount)
-  while (index < value.length && remaining > 0) {
-    const codeUnit = value.charCodeAt(index)
-    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff && index + 1 < value.length) {
-      const next = value.charCodeAt(index + 1)
-      if (next >= 0xdc00 && next <= 0xdfff) {
-        index += 2
-        remaining -= 1
-        continue
-      }
+  while (index < value.length && scalarCount-- > 0) {
+    const first = value.charCodeAt(index++)
+    if (first >= 0xd800 && first <= 0xdbff && index < value.length) {
+      const next = value.charCodeAt(index)
+      if (next >= 0xdc00 && next <= 0xdfff) index++
     }
-    index += 1
-    remaining -= 1
   }
   return index
 }
 
-/** Count Unicode scalars from `from` to end of string, capped for cheap probes. */
-function countBacklogScalars(value: string, from: number, cap: number): number {
-  let index = Math.max(0, Math.min(from, value.length))
-  let count = 0
-  while (index < value.length && count < cap) {
-    const next = advanceByUnicodeScalars(value, index, 1)
-    if (next === index) break
-    index = next
-    count += 1
-  }
-  return count
-}
+// Time budgets, not output speed limits. The first chunk bypasses playback.
+const MIN_SMOOTH_MS = 32
+const MAX_SMOOTH_MS = 48
+const MAX_QUEUED_MS = 64
+const RATE_RESET_MS = 250
+
+interface Chunk { text: string; offset: number; arrivedAt: number }
 
 export class SmoothStreamController {
   private target = ''
   private displayed = ''
-  /** UTF-16 offset of `displayed` inside `target`; stays a prefix while streaming. */
-  private displayedLength = 0
-  /** Scalar count of `displayed`, maintained incrementally so per-frame
-      consumers never rescan the full revealed text. */
-  private displayedScalarCount = 0
+  private scalarCount = 0
   private streaming = false
-  private residual = 0
-  private lastTickAt: number | null = null
-  private readonly config: SmoothStreamConfig
+  private chunks: Chunk[] = []
+  private size = 0
+  private lastArrival: number | null = null
+  private lastFrame = 0
+  private interval = 0
+  private rate = 0
+  private credit = 0
 
-  constructor(config: SmoothStreamConfig = DEFAULT_SMOOTH_STREAM_CONFIG) {
-    this.config = config
-  }
-
-  getDisplayed(): string {
-    return this.displayed
-  }
-
-  getDisplayedScalarCount(): number {
-    return this.displayedScalarCount
-  }
-
-  getTarget(): string {
-    return this.target
-  }
-
-  needsTick(): boolean {
-    // `displayed` is always a prefix of `target` while streaming, so the
-    // offset comparison stays O(1) instead of comparing the whole string.
-    return this.streaming && this.displayedLength < this.target.length
-  }
+  getDisplayed(): string { return this.displayed }
+  getDisplayedScalarCount(): number { return this.scalarCount }
+  getTarget(): string { return this.target }
+  needsTick(): boolean { return this.streaming && this.size > 0 }
+  getDeadline(): number { return this.chunks.length ? this.chunks[0]!.arrivedAt + MAX_QUEUED_MS : Infinity }
 
   reset(): void {
     this.target = ''
     this.displayed = ''
-    this.displayedLength = 0
-    this.displayedScalarCount = 0
+    this.scalarCount = 0
     this.streaming = false
-    this.residual = 0
-    this.lastTickAt = null
+    this.clearQueue()
+    this.lastArrival = null
+    this.interval = this.rate = 0
   }
 
-  /**
-   * Update logical target. First non-empty paint while streaming reveals up to
-   * `firstBurstMax` scalars immediately (TTFB). Terminal / non-streaming snaps
-   * to full target.
-   */
+  private clearQueue(): void {
+    this.chunks = []
+    this.size = 0
+    this.credit = 0
+  }
+
   setTarget(target: string, streaming: boolean, now = 0): string {
-    this.target = target
+    const previous = this.target
     this.streaming = streaming
-
-    if (!streaming) {
+    this.target = target
+    if (!streaming || !target.startsWith(previous)) {
+      this.clearQueue()
       this.displayed = target
-      this.displayedLength = target.length
-      this.displayedScalarCount = countUnicodeScalars(target)
-      this.residual = 0
-      this.lastTickAt = null
+      this.scalarCount = countUnicodeScalars(target)
+      this.lastArrival = streaming && target ? now : null
+      this.interval = this.rate = 0
       return this.displayed
     }
-
-    // Request reset / content replace (not a pure append).
-    if (
-      this.displayed.length > 0 &&
-      !target.startsWith(this.displayed) &&
-      !this.displayed.startsWith(target)
-    ) {
-      this.displayed = target
-      this.displayedLength = target.length
-      this.displayedScalarCount = countUnicodeScalars(target)
-      this.residual = 0
-      this.lastTickAt = now || null
+    const delta = target.slice(previous.length)
+    if (!delta) return this.displayed
+    if (this.lastArrival !== null) {
+      const gap = now - this.lastArrival
+      if (gap > 0) {
+        const sample = delta.length * 1000 / Math.max(16, gap)
+        if (!this.interval || gap >= RATE_RESET_MS) {
+          this.interval = Math.min(gap, MAX_SMOOTH_MS * 2)
+          this.rate = sample
+        } else {
+          const weight = 1 - Math.exp(-gap / 120)
+          this.interval += weight * (Math.min(gap, MAX_SMOOTH_MS * 2) - this.interval)
+          this.rate += weight * (sample - this.rate)
+        }
+      }
+    }
+    this.lastArrival = now
+    if (!previous) {
+      this.displayed = delta
+      this.scalarCount = countUnicodeScalars(delta)
       return this.displayed
     }
-
-    if (this.displayedLength > target.length) {
-      this.displayed = target
-      this.displayedLength = target.length
-      this.displayedScalarCount = countUnicodeScalars(target)
-      this.residual = 0
-      this.lastTickAt = now || null
-      return this.displayed
-    }
-
-    // First visible answer chunk: small immediate peek for TTFB, rest typewrites.
-    if (this.displayedLength === 0 && target.length > 0) {
-      const burst =
-        this.config.firstBurstMax <= 0
-          ? target.length
-          : advanceByUnicodeScalars(target, 0, this.config.firstBurstMax)
-      this.displayed = target.slice(0, burst)
-      this.displayedLength = burst
-      this.displayedScalarCount = countUnicodeScalars(this.displayed)
-      this.residual = 0
-      // Anchor the clock so the next tick uses a real frame delta, not a huge gap.
-      this.lastTickAt = now || null
-      return this.displayed
-    }
-
+    if (!this.size) { this.lastFrame = now; this.credit = 0 }
+    this.chunks.push({ text: delta, offset: 0, arrivedAt: now })
+    this.size += delta.length
     return this.displayed
   }
 
-  /**
-   * One animation-frame of time-based catch-up.
-   * Pass `performance.now()` (or a test clock) so release rate is frame-rate stable.
-   */
   tick(now: number): string {
-    if (!this.streaming || this.displayedLength >= this.target.length) {
-      this.lastTickAt = now
-      return this.displayed
+    if (!this.needsTick()) return this.displayed
+    const elapsed = Math.max(0, now - this.lastFrame)
+    this.lastFrame = now
+    const window = Math.max(MIN_SMOOTH_MS, Math.min(MAX_SMOOTH_MS, this.interval / 2))
+    const speed = Math.max(this.rate, this.size * 1000 / window)
+    const budget = this.credit + speed * elapsed / 1000
+    let count = elapsed >= MAX_SMOOTH_MS || this.size <= 2
+      ? this.size : Math.max(1, Math.floor(budget))
+    let due = 0
+    for (const chunk of this.chunks) {
+      if (now - chunk.arrivedAt < MAX_QUEUED_MS) break
+      due += chunk.text.length - chunk.offset
     }
-
-    const previous = this.lastTickAt
-    this.lastTickAt = now
-    // First tick after idle: assume one 60fps frame so we still advance.
-    const elapsedMs =
-      previous === null ? 1000 / 60 : Math.min(100, Math.max(0, now - previous))
-
-    const cap = this.config.maxStep * 4
-    const backlog = countBacklogScalars(
-      this.target,
-      this.displayedLength,
-      Math.max(cap, this.config.catchUpBacklog)
-    )
-    if (backlog <= 0) return this.displayed
-
-    const { step, residual } = smoothStreamStep(
-      backlog,
-      elapsedMs,
-      this.residual,
-      this.config
-    )
-    this.residual = residual
-    if (step <= 0) return this.displayed
-
-    const start = this.displayedLength
-    const end = advanceByUnicodeScalars(this.target, start, step)
-    this.displayedScalarCount += countUnicodeScalars(
-      this.target.slice(start, end)
-    )
-    // Append the new delta instead of re-slicing the whole prefix every frame.
-    this.displayed += this.target.slice(start, end)
-    this.displayedLength = end
+    count = Math.min(this.size, Math.max(count, due))
+    this.credit = Math.max(0, budget - count) % 1
+    const parts: string[] = []
+    while (count > 0 && this.chunks.length) {
+      const chunk = this.chunks[0]!
+      let end = Math.min(chunk.text.length, chunk.offset + count)
+      const before = chunk.text.charCodeAt(end - 1)
+      const after = chunk.text.charCodeAt(end)
+      if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end++
+      const part = chunk.text.slice(chunk.offset, end)
+      parts.push(part)
+      const taken = end - chunk.offset
+      this.size -= taken
+      count -= taken
+      chunk.offset = end
+      if (end === chunk.text.length) this.chunks.shift()
+    }
+    const released = parts.join('')
+    this.displayed += released
+    this.scalarCount += countUnicodeScalars(released)
     return this.displayed
   }
 }

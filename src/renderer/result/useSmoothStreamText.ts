@@ -1,9 +1,7 @@
-import { useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useLayoutEffect, useRef, useState } from 'react'
 
 import {
-  DEFAULT_SMOOTH_STREAM_CONFIG,
-  SmoothStreamController,
-  type SmoothStreamConfig
+  SmoothStreamController
 } from './streamPlayback'
 
 export type SmoothStreamFrameScheduler = (
@@ -39,14 +37,14 @@ const EMPTY_STREAM_SNAPSHOT: SmoothStreamSnapshot = { text: '', scalarCount: 0 }
  * - Non-streaming / terminal: always returns `target` immediately (no lag).
  * - Streaming: rAF pump only while backlog remains; stops when caught up and
  *   restarts on the next target growth (no forever-rAF between tokens).
- * - First non-empty target: small immediate peek for TTFB, rest typewrites.
+ * - First non-empty target: complete first chunk is displayed immediately.
  * - useLayoutEffect seeds before paint so first-burst is not a post-paint flash.
  */
 export function useSmoothStreamText(
   target: string,
   streaming: boolean,
   resetKey: string,
-  config: SmoothStreamConfig = DEFAULT_SMOOTH_STREAM_CONFIG,
+  _config: undefined = undefined,
   requestFrame: SmoothStreamFrameScheduler = defaultRequestFrame,
   cancelFrame: SmoothStreamFrameCanceller = defaultCancelFrame,
   now: SmoothStreamClock = defaultNow
@@ -72,70 +70,62 @@ export function useSmoothStreamText(
 
   const controllerRef = useRef<SmoothStreamController | null>(null)
   if (controllerRef.current === null) {
-    controllerRef.current = new SmoothStreamController(config)
+    controllerRef.current = new SmoothStreamController()
   }
   const controller = controllerRef.current
 
-  const targetRef = useRef(target)
+  const frameRef = useRef<number | null>(null)
+  const timerRef = useRef<number | null>(null)
   const animationRef = useRef(streaming)
-  targetRef.current = target
-
-  const [displayed, setDisplayed] = useState<SmoothStreamSnapshot>(
-    EMPTY_STREAM_SNAPSHOT
-  )
+  const [displayed, setDisplayed] = useState<SmoothStreamSnapshot>(EMPTY_STREAM_SNAPSHOT)
   const resetKeyRef = useRef(resetKey)
+
+  const publish = useCallback(() => {
+    const text = controller.getDisplayed()
+    const scalarCount = controller.getDisplayedScalarCount()
+    setDisplayed((current) => current.text === text && current.scalarCount === scalarCount
+      ? current : { text, scalarCount })
+  }, [controller])
+
+  const cancelScheduled = useCallback(() => {
+    if (frameRef.current !== null) cancelFrame(frameRef.current)
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current)
+    frameRef.current = timerRef.current = null
+  }, [cancelFrame])
+
+  const schedule = useCallback(function schedule(): void {
+    if (frameRef.current !== null || timerRef.current !== null) return
+    const pump = (): void => {
+      cancelScheduled()
+      if (!animationRef.current) return
+      controller.tick(now())
+      publish()
+      if (controller.needsTick()) schedule()
+    }
+    frameRef.current = requestFrame(pump)
+    timerRef.current = window.setTimeout(pump, Math.max(0, Math.min(50, controller.getDeadline() - now())))
+  }, [cancelScheduled, controller, now, publish, requestFrame])
 
   useLayoutEffect(() => {
     if (resetKeyRef.current !== resetKey) {
       resetKeyRef.current = resetKey
       controller.reset()
     }
-
     animationRef.current = streaming && !reducedMotion
-    if (!animationRef.current) {
-      const snapped = controller.setTarget(target, false, now())
-      setDisplayed((current) =>
-        current.text === snapped ? current : { text: snapped, scalarCount: controller.getDisplayedScalarCount() }
-      )
-      return
+    controller.setTarget(target, animationRef.current, now())
+    publish()
+    if (controller.needsTick()) {
+      // Target growth must not cancel an already queued frame. Otherwise dense
+      // IPC updates can repeatedly postpone playback without ever painting.
+      schedule()
+    } else {
+      cancelScheduled()
     }
+  }, [cancelScheduled, controller, now, publish, reducedMotion, resetKey, schedule, streaming, target])
 
-    const seeded = controller.setTarget(target, true, now())
-    setDisplayed((current) =>
-      current.text === seeded ? current : { text: seeded, scalarCount: controller.getDisplayedScalarCount() }
-    )
-
-    if (!controller.needsTick()) return
-
-    let handle: number | null = null
-    let cancelled = false
-
-    const pump = (frameTime: number): void => {
-      handle = null
-      if (cancelled || !animationRef.current) return
-
-      // Pull latest target so mid-pump IPC growth is absorbed without waiting
-      // for a React commit (store updates still re-run this effect too).
-      controller.setTarget(targetRef.current, true, frameTime)
-      if (!controller.needsTick()) {
-        return
-      }
-
-      const advanced = controller.tick(frameTime)
-      setDisplayed((current) =>
-        current.text === advanced ? current : { text: advanced, scalarCount: controller.getDisplayedScalarCount() }
-      )
-      if (controller.needsTick()) {
-        handle = requestFrame(pump)
-      }
-    }
-
-    handle = requestFrame(pump)
-    return () => {
-      cancelled = true
-      if (handle !== null) cancelFrame(handle)
-    }
-  }, [cancelFrame, controller, now, reducedMotion, requestFrame, resetKey, streaming, target])
+  useLayoutEffect(() => () => {
+    cancelScheduled()
+  }, [cancelScheduled])
 
   return streaming
     ? displayed

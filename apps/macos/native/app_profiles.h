@@ -103,6 +103,8 @@ inline const AppProfileRule kAppProfileRules[] = {
     // text, so never use the clipboard fallback there.
     {MatchKind::BundleExact, "com.depthpicture.pixpin", {false, false, ClipboardPolicy::Denied}},
     {MatchKind::NameEquals, "pixpin", {false, false, ClipboardPolicy::Denied}},
+    {MatchKind::BundleExact, "com.yy.kitty-tools.native", {false, false, ClipboardPolicy::Denied}},
+    {MatchKind::NameEquals, "kitty tools", {false, false, ClipboardPolicy::Denied}},
 
     // Smart-Cmd+C terminals.
     {MatchKind::BundlePrefix, "com.apple.terminal", {false, false, ClipboardPolicy::KeyboardOnly}},
@@ -130,6 +132,14 @@ inline const AppProfileRule kAppProfileRules[] = {
     {MatchKind::BundleExact, "com.tencent.xinwechat", {false, false, ClipboardPolicy::Allowed,
         AppleScriptDialect::None, SurfaceGuard::OpaqueWindow}},
 };
+
+// These apps can display non-activating capture windows over another app.
+inline bool IsScreenshotTool(const std::string &bundleId, const std::string &appName) {
+    const std::string bundle = LowercaseAscii(bundleId);
+    const std::string name = LowercaseAscii(appName);
+    return bundle == "com.depthpicture.pixpin" || name == "pixpin" ||
+        bundle == "com.yy.kitty-tools.native" || name == "kitty tools";
+}
 
 inline bool RuleMatches(
     const AppProfileRule &rule,

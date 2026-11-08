@@ -58,7 +58,8 @@ describe('useSmoothStreamText', () => {
     const requestFrame = vi.fn<SmoothStreamFrameScheduler>().mockReturnValue(42)
     const cancelFrame = vi.fn()
     const target = `完整输出😀${'字'.repeat(40)}`
-    const view = render(<Harness target={target} streaming resetKey="active" requestFrame={requestFrame} cancelFrame={cancelFrame} now={() => 0} />)
+    const view = render(<Harness target="完整输出" streaming resetKey="active" requestFrame={requestFrame} cancelFrame={cancelFrame} now={() => 0} />)
+    view.rerender(<Harness target={target} streaming resetKey="active" requestFrame={requestFrame} cancelFrame={cancelFrame} now={() => 0} />)
     expect(screen.getByTestId('out').textContent).not.toBe(target)
     expect(requestFrame).toHaveBeenCalledOnce()
     act(() => { preference.matches = true; onChange?.() })
@@ -88,7 +89,7 @@ describe('useSmoothStreamText', () => {
     const target = `即时输出😀${'内容'.repeat(40)}`
     const view = render(
       <StrictMode>
-        <Harness target={target} streaming resetKey="strict-motion" requestFrame={requestFrame} cancelFrame={cancelFrame} now={() => 0} />
+        <Harness target="即时" streaming resetKey="strict-motion" requestFrame={requestFrame} cancelFrame={cancelFrame} now={() => 0} />
       </StrictMode>
     )
     const active = preferences.filter((preference) => preference.listeners.size > 0)
@@ -96,6 +97,7 @@ describe('useSmoothStreamText', () => {
     const preference = active[0]
     if (!preference) throw new Error('Missing live motion preference subscription')
     expect(preference.listeners.size).toBe(1)
+    view.rerender(<StrictMode><Harness target={target} streaming resetKey="strict-motion" requestFrame={requestFrame} cancelFrame={cancelFrame} now={() => 0} /></StrictMode>)
     expect(screen.getByTestId('out').textContent).not.toBe(target)
     const frameCount = requestFrame.mock.calls.length
     act(() => {
@@ -199,7 +201,7 @@ describe('useSmoothStreamText', () => {
     const long = `ab${'c'.repeat(40)}`
     const { rerender } = render(
       <Harness
-        target={long}
+        target="ab"
         streaming
         resetKey="r1"
         requestFrame={requestFrame}
@@ -207,6 +209,7 @@ describe('useSmoothStreamText', () => {
         now={() => clock}
       />
     )
+    rerender(<Harness target={long} streaming resetKey="r1" requestFrame={requestFrame} cancelFrame={vi.fn()} now={() => clock} />)
     expect((screen.getByTestId('out').textContent ?? '').length).toBeLessThan(long.length)
 
     rerender(
@@ -264,6 +267,44 @@ describe('useSmoothStreamText', () => {
     })
     // New request first-burst for short "第二"
     expect(screen.getByTestId('out')).toHaveTextContent('第二')
+  })
+
+  it('keeps a queued playback frame across dense stream updates', () => {
+    const frames = new Map<number, FrameRequestCallback>()
+    let next = 0
+    let clock = 0
+    const requestFrame = vi.fn((cb: FrameRequestCallback) => {
+      frames.set(++next, cb)
+      return next
+    })
+    const cancelFrame = vi.fn((id: number) => { frames.delete(id) })
+    const now = () => clock
+    const view = render(<Harness target="My" streaming resetKey="r1" requestFrame={requestFrame} cancelFrame={cancelFrame} now={now} />)
+    expect(screen.getByTestId('out').textContent).toBe('My')
+    for (let i = 1; i <= 30; i++) {
+      view.rerender(<Harness target={'My' + 'x'.repeat(i * 10)} streaming resetKey="r1" requestFrame={requestFrame} cancelFrame={cancelFrame} now={now} />)
+    }
+    expect(requestFrame).toHaveBeenCalledOnce()
+    expect(cancelFrame).not.toHaveBeenCalled()
+    act(() => { clock = 16; const cb = frames.get(1)!; frames.delete(1); cb(clock) })
+    expect(screen.getByTestId('out').textContent!.length).toBeGreaterThan(2)
+    view.unmount()
+    expect(frames.size).toBe(0)
+  })
+
+  it('drains pending text with a timer when animation frames are suspended', () => {
+    vi.useFakeTimers()
+    let clock = 0
+    const requestFrame = vi.fn<SmoothStreamFrameScheduler>().mockReturnValue(42)
+    const cancelFrame = vi.fn()
+    const now = () => clock
+    const view = render(<Harness target="首" streaming resetKey="timer" requestFrame={requestFrame} cancelFrame={cancelFrame} now={now} />)
+    view.rerender(<Harness target={'首' + '字'.repeat(100)} streaming resetKey="timer" requestFrame={requestFrame} cancelFrame={cancelFrame} now={now} />)
+    act(() => { clock = 50; vi.advanceTimersByTime(50) })
+    expect(screen.getByTestId('out').textContent).toBe('首' + '字'.repeat(100))
+    expect(cancelFrame).toHaveBeenCalledWith(42)
+    view.unmount()
+    vi.useRealTimers()
   })
 
   it('stops the pump when backlog is empty (no forever rAF)', () => {

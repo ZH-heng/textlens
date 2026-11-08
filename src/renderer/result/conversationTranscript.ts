@@ -8,7 +8,7 @@ export interface TranscriptTurn {
   content: string
   streaming: boolean
   /** Unicode scalar count of `content`. Streaming patches supply it from the
-      typewriter controller so per-frame renders stay O(1); absent values fall
+      event store so per-frame renders stay O(1); absent values fall
       back to a one-shot scan at render time. */
   scalarCount?: number
 }
@@ -86,7 +86,7 @@ export function patchStreamingAssistant(
 }
 
 /** Hydration and batched terminal events use the complete answer, even when
- * React never rendered the streaming state or a typewriter frame. */
+ * React never rendered the streaming state or an intermediate frame. */
 export function reconcileTranscriptContent(
   turns: TranscriptTurn[],
   content: string,

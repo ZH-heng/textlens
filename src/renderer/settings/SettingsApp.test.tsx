@@ -152,6 +152,20 @@ describe('SettingsApp provider deletion', () => {
     expect(screen.queryByRole('heading', { name: 'AI 服务商与模型' })).not.toBeInTheDocument()
   })
 
+  it('returns the settings page to the top when switching sections', async () => {
+    installDefaultBridge()
+    render(<SettingsApp />)
+
+    expect(await screen.findByRole('heading', { name: '常规' })).toBeInTheDocument()
+    const scrollingElement = document.scrollingElement ?? document.documentElement
+    scrollingElement.scrollTop = 480
+
+    await goToSettingsSection('权限与诊断')
+
+    expect(screen.getByRole('button', { name: '权限与诊断' })).toHaveAttribute('aria-current', 'page')
+    expect(scrollingElement.scrollTop).toBe(0)
+  })
+
   it('shows AI reply and translation languages under the language section', async () => {
     installDefaultBridge()
     render(<SettingsApp />)

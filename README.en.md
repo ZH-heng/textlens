@@ -110,7 +110,7 @@ These projects also pull transitive dependencies. Before a formal public release
 4. The Rust runtime validates the selection and positions the toolbar.
 5. On action click, local actions run on device; AI actions create a request session and send text.
 6. reqwest receives SSE or JSON model responses and forwards content deltas immediately. Empty answers, truncated responses, and read timeouts report a failure while retaining any text already received.
-7. The result window renders safe Markdown while streaming and loads math support when needed. Logical text updates immediately; adaptive playback smooths the display and completion reveals the full text. Reduced motion shows complete deltas directly.
+7. The result window renders safe Markdown while streaming and loads math support when needed. The first delta appears immediately, later deltas are merged per browser frame, and completion or copy flushes the full text.
 8. Settings and provider metadata live in local JSON; API keys are encrypted on disk. Normal settings payloads only expose `keyConfigured`. The settings window can reveal or edit plaintext via settings-only IPC when the user clicks show; toolbar and result windows cannot read keys.
 
 Main directories:

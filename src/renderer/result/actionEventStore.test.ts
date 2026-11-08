@@ -133,7 +133,7 @@ afterEach(() => {
 })
 
 describe('action event store publication pacing', () => {
-  it('applies every delta synchronously without waiting for rAF', async () => {
+  it('publishes the first delta immediately and batches later deltas per frame', async () => {
     const store = await import('./actionEventStore')
     const stop = store.startActionEventStore()
     const listener = vi.fn()
@@ -145,16 +145,63 @@ describe('action event store publication pacing', () => {
     expect(listener).toHaveBeenCalledTimes(2)
     expect(store.getActionEventSnapshot().content).toBe('一')
     emit(delta(3, '二'))
+    expect(listener).toHaveBeenCalledTimes(2)
+    expect(store.getActionEventSnapshot().content).toBe('一')
+    expect(frameCallbacks.size).toBe(1)
+    runNextFrame()
     expect(listener).toHaveBeenCalledTimes(3)
     expect(store.getActionEventSnapshot().content).toBe('一二')
-    // must not require flushPendingActionEvents('frame')
-    expect(frameCallbacks.size).toBe(0)
 
     unsubscribe()
     stop()
   })
 
-  it('publishes many subsequent deltas immediately without frame batching', async () => {
+  it('flushes the tail within one frame when reveal delays animation callbacks', async () => {
+    const store = await import('./actionEventStore')
+    const stop = store.startActionEventStore()
+    const listener = vi.fn()
+    store.subscribeToActionEvents(listener)
+
+    emit(started())
+    emit(delta(2, '首'))
+    emit(delta(3, '个'))
+    vi.advanceTimersByTime(8)
+    emit(delta(4, '结果'))
+    vi.advanceTimersByTime(8)
+
+    // Later arrivals must not postpone the original fallback deadline.
+    expect(store.getActionEventSnapshot().content).toBe('首个结果')
+    expect(listener).toHaveBeenCalledTimes(3)
+    expect(frameCallbacks.size).toBe(0)
+
+    // The next batch must resume normally after the timer won the race.
+    emit(delta(5, '继续'))
+    runNextFrame()
+    expect(store.getActionEventSnapshot().content).toBe('首个结果继续')
+    vi.advanceTimersByTime(50)
+    expect(listener).toHaveBeenCalledTimes(4)
+    stop()
+  })
+
+  it('cancels the timer fallback when the animation frame flushes first', async () => {
+    const store = await import('./actionEventStore')
+    const stop = store.startActionEventStore()
+    const listener = vi.fn()
+    store.subscribeToActionEvents(listener)
+
+    emit(started())
+    emit(delta(2, 'A'))
+    emit(delta(3, 'B'))
+    runNextFrame()
+
+    expect(store.getActionEventSnapshot().content).toBe('AB')
+    expect(vi.getTimerCount()).toBe(0)
+    vi.advanceTimersByTime(50)
+    expect(listener).toHaveBeenCalledTimes(3)
+    stop()
+  })
+
+  it('coalesces dense subsequent deltas into one frame publication', async () => {
     const store = await import('./actionEventStore')
     const stop = store.startActionEventStore()
     const listener = vi.fn()
@@ -165,9 +212,12 @@ describe('action event store publication pacing', () => {
     for (let index = 0; index < 100; index += 1) {
       emit(delta(index + 3, 'x'))
     }
-    expect(listener).toHaveBeenCalledTimes(102)
+    expect(listener).toHaveBeenCalledTimes(2)
+    expect(store.getActionEventSnapshot().content).toBe('A')
+    expect(frameCallbacks.size).toBe(1)
+    runNextFrame()
+    expect(listener).toHaveBeenCalledTimes(3)
     expect(store.getActionEventSnapshot().content).toBe(`A${'x'.repeat(100)}`)
-    expect(frameCallbacks.size).toBe(0)
     stop()
   })
 
@@ -188,8 +238,9 @@ describe('action event store publication pacing', () => {
       contentScalarCount: 3,
       status: 'streaming'
     })
-    // started + 2 thinking + 1 answer
-    expect(listener).toHaveBeenCalledTimes(4)
+    // started + first thinking + answer (the answer flushes queued reasoning).
+    expect(listener).toHaveBeenCalledTimes(3)
+    expect(store.getActionEventSnapshot().thinkingContent).toBe('think-more')
     stop()
   })
 
@@ -202,6 +253,8 @@ describe('action event store publication pacing', () => {
     emit(started())
     emit(delta(2, 'A'))
     emit(delta(3, 'B'))
+    expect(store.getActionEventSnapshot().content).toBe('A')
+    runNextFrame()
     emit({
       ...eventBase,
       type: 'completed',
@@ -228,6 +281,8 @@ describe('action event store publication pacing', () => {
     emit(started())
     emit(delta(2, 'A'))
     emit(delta(3, 'B'))
+    expect(store.getActionEventSnapshot().content).toBe('A')
+    store.flushPendingActionEvents('copy')
     expect(store.getActionEventSnapshot().content).toBe('AB')
 
     window.dispatchEvent(new PageTransitionEvent('pageshow'))
@@ -462,6 +517,7 @@ describe('action event store ordered notices', () => {
     emit(started(20))
     emit(delta(21, 'A'))
     emit(delta(22, 'B'))
+    store.flushPendingActionEvents('frame')
     const beforeNotice = store.getActionEventSnapshot()
     const logicalBeforeNotice = store.getActionEventLogicalRevision()
     expect(beforeNotice.content).toBe('AB')

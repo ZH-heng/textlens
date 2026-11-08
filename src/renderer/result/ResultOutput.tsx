@@ -22,8 +22,7 @@ import {
   shouldRenderRichMarkdown
 } from './markdownPolicy'
 import type { ResultStatus } from './resultState'
-
-const STREAMING_MARKDOWN_UPDATE_INTERVAL_MS = 48
+import { useSmoothStreamText } from './useSmoothStreamText'
 
 export type ResultOutputMilestone =
   | 'plain-layout'
@@ -208,66 +207,6 @@ function RichCommitMarker({
   return <>{children}</>
 }
 
-/**
- * react-markdown reparses its complete source on every update. Keep the
- * renderer stable while limiting that work to roughly 20 Hz; terminal content
- * still commits synchronously so the final token is never left behind.
- */
-function useStreamingMarkdownContent(content: string, streaming: boolean): string {
-  const [rendered, setRendered] = useState(content)
-  const latestRef = useRef(content)
-  const timerRef = useRef<number | null>(null)
-  const lastCommitRef = useRef(performance.now())
-  latestRef.current = content
-
-  useEffect(() => {
-    if (!streaming) {
-      if (timerRef.current !== null) {
-        window.clearTimeout(timerRef.current)
-        timerRef.current = null
-      }
-      lastCommitRef.current = performance.now()
-      setRendered(content)
-      return
-    }
-
-    const elapsed = performance.now() - lastCommitRef.current
-    if (elapsed >= STREAMING_MARKDOWN_UPDATE_INTERVAL_MS) {
-      lastCommitRef.current = performance.now()
-      setRendered(content)
-      return
-    }
-    if (timerRef.current !== null) return
-
-    timerRef.current = window.setTimeout(() => {
-      timerRef.current = null
-      lastCommitRef.current = performance.now()
-      setRendered(latestRef.current)
-    }, Math.max(0, STREAMING_MARKDOWN_UPDATE_INTERVAL_MS - elapsed))
-  }, [content, streaming])
-
-  useEffect(() => () => {
-    if (timerRef.current !== null) window.clearTimeout(timerRef.current)
-  }, [])
-
-  return streaming ? rendered : content
-}
-
-function RichMarkdownOutput({
-  component: RichMarkdown,
-  content,
-  streaming,
-  onOpenExternal
-}: {
-  component: MarkdownGeneration['Component']
-  content: string
-  streaming: boolean
-  onOpenExternal(url: string): void
-}): JSX.Element {
-  const renderedContent = useStreamingMarkdownContent(content, streaming)
-  return <RichMarkdown content={renderedContent} onOpenExternal={onOpenExternal} />
-}
-
 function ResultOutputInstance({
   requestKey,
   status,
@@ -279,14 +218,19 @@ function ResultOutputInstance({
   scheduler = browserMarkdownScheduler,
   onMilestone
 }: ResultOutputProps): JSX.Element {
-  // Match Cherry Studio's stable streaming renderer: once an append-only
-  // request reveals Markdown syntax, keep that renderer through completion so
-  // the terminal event does not replace the whole plain-text DOM.
+  const stream = useSmoothStreamText(content, status === 'streaming', requestKey)
+  // Keep streaming updates on the cheap plain-text path. Parsing the complete
+  // Markdown document on every published frame can interrupt visible output.
   const richModeRef = useRef(false)
-  if (!richModeRef.current && shouldRenderRichMarkdown(content, contentScalarCount)) {
+  if (
+    status !== 'streaming' &&
+    !richModeRef.current &&
+    shouldRenderRichMarkdown(content, contentScalarCount)
+  ) {
     richModeRef.current = true
   }
-  const eligible = richModeRef.current &&
+  const eligible = status !== 'streaming' &&
+    richModeRef.current &&
     content.length > 0 &&
     contentScalarCount <= RICH_MARKDOWN_SCALAR_LIMIT
   const deferred = useDeferredRichMarkdown(
@@ -301,10 +245,9 @@ function ResultOutputInstance({
   const recordRichCommit = useCallback(() => {
     onMilestone?.('rich-commit', performance.now())
   }, [onMilestone])
-  const outputIsStreaming = status === 'streaming'
   const fallback = (
     <PlainOutput
-      content={content}
+      content={stream.text}
       showCaret={status === 'streaming'}
       failed={deferred.failed}
       retry={deferred.retry}
@@ -320,7 +263,7 @@ function ResultOutputInstance({
       fallback={(
         <PlainOutput
           content={content}
-          showCaret={status === 'streaming'}
+          showCaret={false}
           failed
           retry={deferred.retry}
         />
@@ -328,10 +271,9 @@ function ResultOutputInstance({
     >
       <Suspense fallback={fallback}>
         <RichCommitMarker onCommit={recordRichCommit}>
-          <RichMarkdownOutput
-            component={RichMarkdown}
+          {/* Terminal content is authoritative; playback never delays rich output. */}
+          <RichMarkdown
             content={content}
-            streaming={outputIsStreaming}
             onOpenExternal={onOpenExternal}
           />
         </RichCommitMarker>

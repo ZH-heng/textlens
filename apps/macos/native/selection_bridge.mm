@@ -417,6 +417,44 @@ static CGWindowID TopmostWindowNumberAtPoint(pid_t processIdentifier, CGPoint po
     return result;
 }
 
+// Screenshot overlays can receive pointer input without becoming frontmost.
+// Inspect windows above the capture target rather than trusting app focus.
+template <typename IsScreenshotOwner>
+static bool ScreenshotWindowAboveTarget(
+    NSArray *windows, pid_t targetPid, CGPoint point, IsScreenshotOwner isScreenshotOwner) {
+    for (NSDictionary *info in windows) {
+        NSNumber *owner = info[(__bridge NSString *)kCGWindowOwnerPID];
+        NSNumber *alpha = info[(__bridge NSString *)kCGWindowAlpha];
+        NSDictionary *bounds = info[(__bridge NSString *)kCGWindowBounds];
+        CGRect frame = CGRectZero;
+        if (owner == nil || bounds == nil || (alpha != nil && alpha.doubleValue < 0.01) ||
+            !CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)bounds, &frame) ||
+            frame.size.width < 24.0 || frame.size.height < 24.0 ||
+            !CGRectContainsPoint(frame, point)) continue;
+        if (owner.intValue == targetPid) return false;
+        if (isScreenshotOwner(owner.intValue)) return true;
+    }
+    return false;
+}
+
+static bool ScreenshotOverlayCoversGesture(pid_t targetPid, const SelectionInfo &info) {
+    if (!info.hasMouseStart && !info.hasMouseEnd) return false;
+    CFArrayRef windows = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (windows == nullptr) return false;
+    NSArray *list = (__bridge NSArray *)windows;
+    auto isScreenshotOwner = [](pid_t pid) {
+        NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        return app != nil && textlens_app_profiles::IsScreenshotTool(
+            StringFromNSString(app.bundleIdentifier), StringFromNSString(app.localizedName));
+    };
+    const bool covered =
+        (info.hasMouseStart && ScreenshotWindowAboveTarget(list, targetPid, info.mouseStart, isScreenshotOwner)) ||
+        (info.hasMouseEnd && ScreenshotWindowAboveTarget(list, targetPid, info.mouseEnd, isScreenshotOwner));
+    CFRelease(windows);
+    return covered;
+}
+
 static CGPoint CurrentMousePosition() {
     CGEventRef event = CGEventCreate(nullptr);
     if (event == nullptr) {
@@ -2358,7 +2396,8 @@ static bool CaptureViaClipboard(
                 originalChangeCount,
                 pasteboard.changeCount,
                 MonotonicMilliseconds(),
-                deadlineMs) && !IsSecureEventInputEnabled();
+                deadlineMs) && !IsSecureEventInputEnabled() &&
+                !ScreenshotOverlayCoversGesture(application.processIdentifier, info);
         };
         if (!copyInjectionAllowed()) {
             TraceClipboardGateFor(info, "skip: copy-invalidated-during-snapshot");
@@ -2996,7 +3035,7 @@ static bool IsModifierKey(CGKeyCode keyCode) {
 // Collapse the focused AX selection to a caret at the end of the former range
 // when the selected text still exactly matches `expectedText`. Optional
 // `requiredBundleId` rejects apps that are not the original host.
-static uint8_t ClearMatchingTextOnMainThread(
+static uint8_t ClearMatchingTextOffMainThread(
     const std::string &requiredBundleId,
     const std::string &expectedText) {
     @autoreleasepool {
@@ -3012,37 +3051,31 @@ static uint8_t ClearMatchingTextOnMainThread(
         // frontmost when the deferred clear fires: after a toolbar action the
         // result window is usually frontmost, and keying off the frontmost app
         // made every result-opening action fail to collapse the highlight.
-        NSRunningApplication *application = nil;
-        if (!requiredBundleId.empty()) {
-            for (NSRunningApplication *candidate
-                 in [NSWorkspace sharedWorkspace].runningApplications) {
-                NSString *candidateBundle = candidate.bundleIdentifier;
-                if (candidateBundle != nil &&
-                    StringFromNSString(candidateBundle) == requiredBundleId) {
-                    application = candidate;
-                    break;
+        // Resolve AppKit state on the UI thread, but never perform synchronous
+        // cross-process AX messaging there. A slow host otherwise stalls result
+        // window IPC shortly after the first answer token becomes visible.
+        __block pid_t targetPid = 0;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            NSRunningApplication *application = nil;
+            if (!requiredBundleId.empty()) {
+                for (NSRunningApplication *candidate
+                     in [NSWorkspace sharedWorkspace].runningApplications) {
+                    if (StringFromNSString(candidate.bundleIdentifier) == requiredBundleId) {
+                        application = candidate;
+                        break;
+                    }
                 }
+            } else {
+                application = FrontmostApplication();
             }
-            if (application == nil) {
-                TraceHostClear("skip: app-not-found");
-                return 0;
-            }
-        } else {
-            application = FrontmostApplication();
-        }
-        if (application == nil || application.processIdentifier == getpid()) {
+            if (application != nil) targetPid = application.processIdentifier;
+        });
+        if (targetPid <= 0 || targetPid == getpid()) {
             TraceHostClear("skip: no-target-or-own-process");
             return 0;
         }
 
-        std::string appBundleId = StringFromNSString(application.bundleIdentifier);
-        if (!requiredBundleId.empty() && appBundleId != requiredBundleId) {
-            TraceHostClear("skip: bundle-mismatch");
-            return 0;
-        }
-
-        AXUIElementRef applicationElement =
-            AXUIElementCreateApplication(application.processIdentifier);
+        AXUIElementRef applicationElement = AXUIElementCreateApplication(targetPid);
         if (applicationElement == nullptr) {
             TraceHostClear("skip: no-application-element");
             return 0;
@@ -3895,17 +3928,12 @@ extern "C" uint8_t textlens_selection_clear_matching_text(
             requiredBundleId.assign(bundle_id_utf8);
         }
 
-        __block uint8_t result = 0;
-        void (^work)(void) = ^{
-            result = ClearMatchingTextOnMainThread(requiredBundleId, expectedText);
-        };
+        // RuntimeState owns a dedicated host-selection-clear worker. Reject
+        // accidental UI-thread callers rather than blocking painting on AX IPC.
         if ([NSThread isMainThread]) {
-            work();
-        } else {
-            // AX write must run on the main thread; hop when called from a worker.
-            dispatch_sync(dispatch_get_main_queue(), work);
+            return 0;
         }
-        return result;
+        return ClearMatchingTextOffMainThread(requiredBundleId, expectedText);
     } catch (...) {
         return 0;
     }

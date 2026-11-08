@@ -834,7 +834,7 @@ Windows 安装包使用 current-user 模式，不要求管理员权限；禁止�
 
 （整理日期：2026-07-22）
 
-- **显示层：** 新增自适应打字机（`useSmoothStreamText` / `streamPlayback` 平滑控制器）：逻辑全文仍即时进入 store，UI 按 backlog 调节揭晓速度，突发 token 不再整段倾泻；首包小 burst 兼顾 TTFB。
+- **显示层：** 流式结果首个增量立即进入界面，后续增量按浏览器帧合并；隐藏窗口用 50ms 定时器兜底，终态、复制和恢复会强制刷新积压内容，降低 IPC 与 Markdown 重渲染开销。
 - **Thinking：** OpenAI-compatible SSE 解析 thinking/reasoning 增量；会话 flusher 与结果窗事件链路端到端透传。
 - **后端泵：** action flusher 按批（约 16 次 emit）再 yield，减少密集 IPC 与调度抖动。
 - **版本对齐：** `package.json`、`Cargo.toml`、`tauri.conf.json`、Windows conf、README 与开发记录统一为 0.3.51。
@@ -958,7 +958,7 @@ Windows 侧改动本机无法编译验证（`aws-lc-sys` 在交叉编译阶段�
 - **启动迁移与捕获：** Quote→Ask 只迁移真正的旧动作，保留现代 Ask 的自定义 ID、空路线和多个实例；删除内置服务商后可以正常重启。macOS 在合成复制前重验取消状态、宿主焦点、剪贴板版本与预算，capture/dismiss 在输入入队时编号，AX 阶段超时不再误判为整个捕获取消。Windows 只豁免触发快捷键必要的尾 keyup，后续真实键盘输入会取消捕获。
 - **请求与会话：** 本地配置和一次 Key 读取在创建 session 之前完成。仍存活且 reservation 匹配的会话在准备成功时发 `Started`，准备失败或准备中取消时发 `PreparationFailed`；准备失败保留旧答案与已提交路线，恢复未提交问题，关闭后的旧 ticket 不复活 session。Ask 重试重放失败轮消息与历史；Started/snapshot 携带稳定 turn ID 的完整 transcript，同批快速结束、重复问题恢复、显示与复制保持一致。空 Ask 换模型只提交路线；空白答案、长度截断和 JSON 首字节/读取空闲超时报告明确错误，保留已有正文。
 - **窗口与动效：** 工具栏原生操作使用主线程串行队列，短暂 queue 锁不跨原生 getter 或操作。结果窗统一 `Hidden → Prepared → Committed`，原生准备与首个 React 帧并行，commit 确认后单次 90ms 透明度淡入；尺寸记忆、自动关闭与宿主接管分别门控。旧自动关闭在 CloseRequested 最终复核实时指针或原生焦点，再重验 generation/pin/mode，避免误关重新获焦的结果。长动作名共享原生工作区宽度预算，省略、tooltip 和极窄横向滚动保证可达。
-- **等待反馈与系统偏好：** 等待模型响应的三个点使用 1 秒循环、150ms/300ms 错峰，轻跳 3px 并渐明渐暗；正文与等待容器不叠加位移入场动画。减少动态效果时停用淡入、等待动画和 JS 打字播放；输出中切换偏好会取消播放 rAF 并立即显示积压文本，订阅生命周期覆盖 StrictMode。
+- **等待反馈与系统偏好：** 等待模型响应的三个点使用 1 秒循环、150ms/300ms 错峰，轻跳 3px 并渐明渐暗；正文与等待容器不叠加位移入场动画。输出流按帧合并，窗口隐藏时由定时器兜底，订阅生命周期覆盖 StrictMode。
 - **设置与迟到任务：** draft/Key 按版本确认，保存等待期间的新输入保留为未保存草稿，部分失败只重试未确认 Key；规则行使用稳定 UI ID。clear/save/delete/typing 撤销旧 Key reveal。resize epoch/revision 在 repository 写锁内部复查，旧写与迟到广播不会恢复重置尺寸或覆盖最新尺寸。字符串 IPC 错误保留具体提示，快捷键回滚展平两层 Result，超时后的旧主线程任务不再执行修改。
 - **内容与可访问性：** Markdown 保留 literal 反斜杠、代码、Setext 标题、匹配围栏和嵌套列表；TS/Rust 德/法/英启发式识别共享 20 例 fixture。共享 Dialog 限制并恢复焦点，保存校验先切分区再定位字段。旧 WebView 的基础背景和焦点色有可解析回退，主题预览使用独立浅深 palette。
 

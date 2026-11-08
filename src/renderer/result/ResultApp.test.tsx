@@ -609,18 +609,14 @@ describe('ResultApp window interactions', () => {
     expect(screen.getByText('const answer = 42').closest('pre')).toBeInTheDocument()
   })
 
-  it('starts Markdown while streaming and keeps that renderer after completion', async () => {
+  it('keeps Markdown plain during streaming and renders it after completion', async () => {
     await renderResult({
       ...completedSession,
       status: 'streaming',
       content: '# 尚未完成'
     })
 
-    const streamingHeading = await screen.findByRole(
-      'heading',
-      { name: '尚未完成', level: 1 },
-      { timeout: 5_000 }
-    )
+    expect(screen.getByText('# 尚未完成')).toHaveClass('stream-plain-text')
 
     const store = await import('./actionEventStore')
     act(() => {
@@ -630,7 +626,7 @@ describe('ResultApp window interactions', () => {
       })
     })
 
-    expect(await screen.findByRole('heading', { name: '尚未完成', level: 1 })).toBe(streamingHeading)
+    expect(await screen.findByRole('heading', { name: '尚未完成', level: 1 })).toBeInTheDocument()
     expect(screen.queryByText('# 尚未完成')).not.toBeInTheDocument()
   })
 
@@ -780,6 +776,17 @@ describe('ResultApp window interactions', () => {
       })
     })
     expect(screen.getByText('这是')).toHaveClass('stream-plain-text')
+
+    act(() => {
+      store.hydrateActionEventStore({
+        ...askSession,
+        requestId: 'request-followup',
+        status: 'streaming',
+        content: '这是持续输出',
+        contentScalarCount: countUnicodeScalars('这是持续输出')
+      })
+    })
+    expect(await screen.findByText('这是持续输出')).toHaveClass('stream-plain-text')
 
     act(() => {
       store.hydrateActionEventStore({

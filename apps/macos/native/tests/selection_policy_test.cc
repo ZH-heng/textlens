@@ -157,6 +157,10 @@ void ExpectAppProfiles() {
 
     assert(ResolveAppTraits("com.depthpicture.PixPin", "").clipboard == ClipboardPolicy::Denied);
     assert(ResolveAppTraits("", "PixPin").clipboard == ClipboardPolicy::Denied);
+    assert(ResolveAppTraits("com.yy.kitty-tools.native", "").clipboard == ClipboardPolicy::Denied);
+    assert(ResolveAppTraits("", "Kitty Tools").clipboard == ClipboardPolicy::Denied);
+    assert(IsScreenshotTool("com.yy.kitty-tools.native", ""));
+    assert(!IsScreenshotTool("com.example.editor", "Kitty Tools Notes"));
     assert(ResolveAppTraits("com.example.editor", "PixPin Notes").clipboard ==
         ClipboardPolicy::Allowed);
 

@@ -8,6 +8,7 @@ import {
   memo,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
+  type RefObject,
   type JSX
 } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -64,7 +65,6 @@ import { ResultOutput, stripLeadingBlankLines } from './ResultOutput'
 import { useResultContentOverflow } from './resultContentOverflow'
 import type { ResultSessionBootstrap } from './resultSessionBootstrap'
 import type { ResultState } from './resultState'
-import { useSmoothStreamText } from './useSmoothStreamText'
 
 const RESULT_RESIZE_DIRECTIONS = [
   'NorthWest',
@@ -187,7 +187,7 @@ function useResultField<T>(select: (state: ResultState) => T): T {
 /**
  * Stream body only: subscribes to content fields so translate/explain/summary
  * tokens re-render this subtree without rebuilding header/footer chrome.
- * Display uses adaptive typewriter so network bursts feel smooth.
+ * The store delivers the first text immediately and batches later text per frame.
  */
 function ResultStreamBody({
   revealCommitted,
@@ -204,17 +204,16 @@ function ResultStreamBody({
   const requestGeneration = useResultField((state) => state.requestGeneration)
   const requestId = useResultField((state) => state.requestId)
   const requestKey = `${sessionGeneration ?? 'none'}:${requestGeneration ?? 'none'}:${requestId ?? 'none'}`
-  const stream = useSmoothStreamText(content, status === 'streaming', requestKey)
+
+  if (!content) return <></>
 
   return (
     <article className="markdown-body">
       <ResultOutput
         requestKey={requestKey}
         status={status}
-        content={stream.text}
-        contentScalarCount={
-          status === 'streaming' ? stream.scalarCount : contentScalarCount
-        }
+        content={content}
+        contentScalarCount={contentScalarCount}
         contentRevision={contentRevision}
         revealCommitted={revealCommitted}
         onOpenExternal={onOpenExternal}
@@ -296,7 +295,7 @@ function ThinkingPanel(): JSX.Element | null {
 /**
  * Ask-only bridge: patches transcript turns from stream content without
  * forcing the non-ask chrome path to subscribe to the content string.
- * Applies the same smooth typewriter as translate/explain/summary.
+ * Uses the same frame-batched snapshot as translate/explain/summary.
  */
 function AskStreamBridge({
   enabled,
@@ -314,30 +313,20 @@ function AskStreamBridge({
   const status = useResultField((state) => state.status)
   const content = useResultField((state) => state.content)
   const contentScalarCount = useResultField((state) => state.contentScalarCount)
-  const sessionGeneration = useResultField((state) => state.sessionGeneration)
-  const requestGeneration = useResultField((state) => state.requestGeneration)
   const requestId = useResultField((state) => state.requestId)
   const transcript = useResultField((state) => state.transcript)
-  const requestKey = `${sessionGeneration ?? 'none'}:${requestGeneration ?? 'none'}:${requestId ?? 'none'}`
-  const stream = useSmoothStreamText(content, status === 'streaming', requestKey)
-  // Terminal states use store content and the store's authoritative scalar
-  // count, so a lagging typewriter frame cannot seal the assistant turn with
-  // truncated values.
-  const streamPatch = status === 'streaming' ? stream.text : content
-  const streamScalarCount =
-    status === 'streaming' ? stream.scalarCount : contentScalarCount
 
   useEffect(() => {
     if (!enabled) return
-    onStream(status, streamPatch, streamScalarCount, transcript, requestId)
-  }, [enabled, onStream, status, streamPatch, streamScalarCount, transcript, requestId])
+    onStream(status, content, contentScalarCount, transcript, requestId)
+  }, [enabled, onStream, status, content, contentScalarCount, transcript, requestId])
 
   return null
 }
 
 /**
  * Memoized per-turn output. The ask stream pumps the latest assistant turn
- * once per typewriter frame; a stable-props memo keeps every completed turn's
+ * once per published frame; a stable-props memo keeps every completed turn's
  * subtree (including its scalar scan) out of those frames.
  */
 const AssistantTurnOutput = memo(function AssistantTurnOutput({
@@ -371,6 +360,107 @@ const AssistantTurnOutput = memo(function AssistantTurnOutput({
     />
   )
 })
+
+const LiveAssistantTurnOutput = memo(function LiveAssistantTurnOutput({
+  requestKey,
+  revealCommitted,
+  onOpenExternal
+}: {
+  requestKey: string
+  revealCommitted: boolean
+  onOpenExternal: (url: string) => void
+}): JSX.Element {
+  const status = useResultField((state) => state.status)
+  const content = useResultField((state) => state.content)
+  const contentScalarCount = useResultField((state) => state.contentScalarCount)
+  const contentRevision = useResultField((state) => state.contentRevision)
+  const hasThinking = useResultField((state) => state.thinkingContent.length > 0)
+
+  if (!content) {
+    return status === 'streaming' && !hasThinking ? (
+      <div className="result-turn__waiting">
+        <LoaderCircle className="result-spin" size={16} />
+        <span>正在等待模型响应…</span>
+      </div>
+    ) : <></>
+  }
+
+  return (
+    <ResultOutput
+      requestKey={requestKey}
+      status={status}
+      content={content}
+      contentScalarCount={contentScalarCount}
+      contentRevision={contentRevision}
+      revealCommitted={revealCommitted}
+      onOpenExternal={onOpenExternal}
+    />
+  )
+})
+
+function ResultContentFrame({
+  scrollRef,
+  observedRef,
+  resetKey,
+  status,
+  onPointerUp,
+  children
+}: {
+  scrollRef: RefObject<HTMLDivElement | null>
+  observedRef: RefObject<HTMLDivElement | null>
+  resetKey: string | null
+  status: ResultState['status']
+  onPointerUp: (event: ReactPointerEvent<HTMLDivElement>) => void
+  children(activity: { hasContent: boolean; hasThinking: boolean }): JSX.Element
+}): JSX.Element {
+  const hasContent = useResultField((state) => state.content.length > 0)
+  const hasThinking = useResultField((state) => state.thinkingContent.length > 0)
+  const handleScroll = useAutoFollowOutput(scrollRef, observedRef, resetKey)
+  const waiting = status === 'streaming' && !hasContent && !hasThinking
+  const contentOverflow = useResultContentOverflow(scrollRef, observedRef, !waiting)
+
+  return (
+    <div
+      ref={scrollRef}
+      className={`result-content ${contentOverflow.isOverflowing ? 'result-content--scrollable' : ''}`}
+      style={{ '--result-scrollbar-track-margin': `${contentOverflow.trackMarginPx}px` } as CSSProperties}
+      onScroll={handleScroll}
+      onPointerUp={onPointerUp}
+    >
+      <div ref={observedRef} className="result-content__inner">
+        {children({ hasContent, hasThinking })}
+      </div>
+    </div>
+  )
+}
+
+function ResultCopyButton({
+  isAsk,
+  hasTurns,
+  copyComplete,
+  onCopy
+}: {
+  isAsk: boolean
+  hasTurns: boolean
+  copyComplete: boolean
+  onCopy(): void
+}): JSX.Element {
+  const hasContent = useResultField((state) => state.content.length > 0)
+  const canCopy = hasContent || (isAsk && hasTurns)
+
+  return (
+    <button
+      className={`result-footer-button ${copyComplete ? 'result-footer-button--done' : ''}`}
+      type="button"
+      disabled={!canCopy}
+      onClick={onCopy}
+      title={canCopy ? '复制结果到剪贴板' : '生成完成后可复制'}
+    >
+      {copyComplete ? <Check size={14} /> : <Copy size={14} />}
+      {copyComplete ? '已复制' : '复制'}
+    </button>
+  )
+}
 
 export interface ResultAppProps {
   bootstrap?: ResultSessionBootstrap | null
@@ -412,8 +502,6 @@ function ResultSessionApp({
   const preparationFailure = useResultField((state) => state.preparationFailure)
   const committedProviderId = useResultField((state) => state.providerId)
   const committedModelId = useResultField((state) => state.modelId)
-  const hasContent = useResultField((state) => state.content.length > 0)
-  const hasThinking = useResultField((state) => state.thinkingContent.length > 0)
   const [settings, setSettings] = useState<PublicSettings>(DEFAULT_PUBLIC_SETTINGS)
   // The initial value above is only a warm-theme placeholder. Applying it
   // before the real snapshot arrives would overwrite the theme seeded from
@@ -463,14 +551,10 @@ function ResultSessionApp({
   const followUpComposing = useRef(false)
   const askOriginalDefaulted = useRef(false)
   const pendingFollowUp = useRef<{ question: string; requestId: string | null } | null>(null)
-  const handleScroll = useAutoFollowOutput(contentRef, contentInnerRef, requestId)
-  // Thinking counts as visible activity — hide the empty waiting spinner early.
-  const isWaitingForFirstContent = status === 'streaming' && !hasContent && !hasThinking
-  const contentOverflow = useResultContentOverflow(
-    contentRef,
-    contentInnerRef,
-    !isWaitingForFirstContent
-  )
+  const askStreamRenderRef = useRef<{
+    requestId: string | null
+    firstContentSeeded: boolean
+  }>({ requestId: null, firstContentSeeded: false })
 
   const action = useMemo(
     () => settings?.actions.find((item) => item.id === (actionId ?? session?.actionId)),
@@ -496,7 +580,7 @@ function ResultSessionApp({
   const effectiveModelRoute = committedProviderId && committedModelId
     ? { providerId: committedProviderId, modelId: committedModelId }
     : modelRouteFromSnapshot(session) ?? defaultModelRoute
-  const canCopy = hasContent || (isAsk && turns.some((turn) => turn.content.trim().length > 0))
+  const hasTurns = turns.some((turn) => turn.content.trim().length > 0)
   const modelGroups = useMemo(() => (
     settings?.providers
       .filter((provider) => provider.enabled !== false && provider.models.length > 0)
@@ -574,8 +658,36 @@ function ResultSessionApp({
       transcript: TranscriptTurn[] | null,
       streamRequestId: string | null
     ): void => {
+      if (streamStatus === 'streaming') {
+        const isNewRequest = askStreamRenderRef.current.requestId !== streamRequestId
+        if (isNewRequest) {
+          askStreamRenderRef.current = {
+            requestId: streamRequestId,
+            firstContentSeeded: content.length > 0
+          }
+          setTurns((current) => reconcileTranscriptContent(
+            transcript ?? current,
+            content,
+            true,
+            streamRequestId,
+            scalarCount
+          ))
+          return
+        }
+        if (content.length === 0 || askStreamRenderRef.current.firstContentSeeded) return
+        askStreamRenderRef.current.firstContentSeeded = true
+      } else {
+        askStreamRenderRef.current = {
+          requestId: streamRequestId,
+          firstContentSeeded: false
+        }
+      }
       setTurns((current) => reconcileTranscriptContent(
-        transcript ?? current, content, streamStatus === 'streaming', streamRequestId, scalarCount
+        transcript ?? current,
+        content,
+        streamStatus === 'streaming',
+        streamRequestId,
+        scalarCount
       ))
     },
     []
@@ -645,6 +757,7 @@ function ResultSessionApp({
   }, [switchModel])
 
   const copy = useCallback(async (): Promise<void> => {
+    flushPendingActionEvents('copy')
     const latest = getActionEventSnapshot()
     const completeTurns = reconcileTranscriptContent(
       latest.transcript ?? turns, latest.content, latest.status === 'streaming',
@@ -957,8 +1070,8 @@ function ResultSessionApp({
     if (modelMenuOpen && modelSwitchDisabled) setModelMenuOpen(false)
   }, [modelMenuOpen, modelSwitchDisabled])
 
-  const keyboardState = useRef({ status, canCopy, cancel, closeWindow, retry, copy })
-  keyboardState.current = { status, canCopy, cancel, closeWindow, retry, copy }
+  const keyboardState = useRef({ status, isAsk, hasTurns, cancel, closeWindow, retry, copy })
+  keyboardState.current = { status, isAsk, hasTurns, cancel, closeWindow, retry, copy }
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
       if (isEditableTarget(event.target) || event.metaKey || event.ctrlKey || event.altKey) return
@@ -979,7 +1092,9 @@ function ResultSessionApp({
         void current.retry()
         return
       }
-      if (key === 'c' && current.canCopy && !window.getSelection()?.toString()) {
+      const latest = getActionEventSnapshot()
+      const canCopy = latest.content.length > 0 || (current.isAsk && current.hasTurns)
+      if (key === 'c' && canCopy && !window.getSelection()?.toString()) {
         event.preventDefault()
         void current.copy()
       }
@@ -1126,8 +1241,7 @@ function ResultSessionApp({
   }
 
   const style = {
-    '--result-font-size': `${resultFontSize(settings)}px`,
-    '--result-scrollbar-track-margin': `${contentOverflow.trackMarginPx}px`
+    '--result-font-size': `${resultFontSize(settings)}px`
   } as CSSProperties
 
   const startWindowResize = (
@@ -1324,13 +1438,15 @@ function ResultSessionApp({
         </div>
       </header>
 
-      <div
-        ref={contentRef}
-        className={`result-content ${contentOverflow.isOverflowing ? 'result-content--scrollable' : ''}`}
-        onScroll={handleScroll}
+      <ResultContentFrame
+        scrollRef={contentRef}
+        observedRef={contentInnerRef}
+        resetKey={requestId}
+        status={status}
         onPointerUp={showSelectionToolbar}
       >
-        <div ref={contentInnerRef} className="result-content__inner">
+        {({ hasContent, hasThinking }) => (
+          <>
           {selection && (
             <section className="result-original">
               <button type="button" onClick={() => setShowOriginal((current) => !current)} aria-expanded={showOriginal}>
@@ -1365,22 +1481,25 @@ function ResultSessionApp({
                       <>
                         {/* CoT attaches to the latest assistant bubble (Cherry-style). */}
                         {isLatestAssistant && <ThinkingPanel />}
-                        {turn.content ? (
+                        {turn.content || (isLatestAssistant && turn.streaming) ? (
                           <article className="markdown-body result-turn__content">
-                            <AssistantTurnOutput
-                              requestKey={`${sessionId}:${turn.id}`}
-                              streaming={turn.streaming}
-                              content={turn.content}
-                              scalarCount={turn.scalarCount}
-                              revealCommitted={revealCommitted}
-                              onOpenExternal={openExternal}
-                            />
+                            {isLatestAssistant && turn.streaming ? (
+                              <LiveAssistantTurnOutput
+                                requestKey={`${sessionId}:${turn.id}`}
+                                revealCommitted={revealCommitted}
+                                onOpenExternal={openExternal}
+                              />
+                            ) : (
+                              <AssistantTurnOutput
+                                requestKey={`${sessionId}:${turn.id}`}
+                                streaming={turn.streaming}
+                                content={turn.content}
+                                scalarCount={turn.scalarCount}
+                                revealCommitted={revealCommitted}
+                                onOpenExternal={openExternal}
+                              />
+                            )}
                           </article>
-                        ) : turn.streaming && status === 'streaming' && !hasThinking ? (
-                          <div className="result-turn__waiting">
-                            <LoaderCircle className="result-spin" size={16} />
-                            <span>正在等待模型响应…</span>
-                          </div>
                         ) : null}
                       </>
                     )}
@@ -1391,12 +1510,11 @@ function ResultSessionApp({
           ) : (
             <>
               <ThinkingPanel />
-              {hasContent ? (
-                <ResultStreamBody
-                  revealCommitted={revealCommitted}
-                  onOpenExternal={openExternal}
-                />
-              ) : status === 'error' ? null : hasThinking ? null : (
+              <ResultStreamBody
+                revealCommitted={revealCommitted}
+                onOpenExternal={openExternal}
+              />
+              {!hasContent && status !== 'error' && !hasThinking ? (
                 <div
                   className={`result-placeholder ${
                     status === 'streaming' ? 'result-placeholder--waiting' : ''
@@ -1415,7 +1533,7 @@ function ResultSessionApp({
                     <span className="result-placeholder__label">正在准备结果…</span>
                   )}
                 </div>
-              )}
+              ) : null}
             </>
           )}
 
@@ -1425,8 +1543,9 @@ function ResultSessionApp({
             <div className="result-inline-notice" role="status">{generationNotice}</div>
           )}
           {status === 'cancelled' && <div className="result-inline-notice" role="status">本次生成已取消。已生成的内容仍可复制。</div>}
-        </div>
-      </div>
+          </>
+        )}
+      </ResultContentFrame>
 
       {bootstrapMessage && (
         <div className="result-command-error" role="alert">
@@ -1506,16 +1625,12 @@ function ResultSessionApp({
               重试
             </button>
           )}
-          <button
-            className={`result-footer-button ${copyComplete ? 'result-footer-button--done' : ''}`}
-            type="button"
-            disabled={!canCopy}
-            onClick={() => void copy()}
-            title={canCopy ? '复制结果到剪贴板' : '生成完成后可复制'}
-          >
-            {copyComplete ? <Check size={14} /> : <Copy size={14} />}
-            {copyComplete ? '已复制' : '复制'}
-          </button>
+          <ResultCopyButton
+            isAsk={isAsk}
+            hasTurns={hasTurns}
+            copyComplete={copyComplete}
+            onCopy={() => void copy()}
+          />
         </div>
       </footer>
     </main>

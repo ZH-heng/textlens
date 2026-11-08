@@ -19,7 +19,12 @@ export function useAutoFollowOutput(
     frameRef.current = window.requestAnimationFrame(() => {
       frameRef.current = null
       const element = scrollRef.current
-      if (element && followingRef.current) element.scrollTop = element.scrollHeight
+      if (element && followingRef.current) {
+        const bottom = Math.max(0, element.scrollHeight - element.clientHeight)
+        // Wrapped lines can notify repeatedly without changing scroll position.
+        // Avoid redundant scroll writes and the resulting scroll events/layout.
+        if (Math.abs(element.scrollTop - bottom) > 1) element.scrollTop = bottom
+      }
     })
   }, [scrollRef])
 

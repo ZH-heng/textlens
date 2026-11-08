@@ -13,6 +13,24 @@ static NSDictionary *Decode(const std::string &json) {
 
 int main() {
     @autoreleasepool {
+        NSDictionary *(^window)(int, CGRect, double) = ^NSDictionary *(int pid, CGRect frame, double alpha) {
+            return @{(__bridge NSString *)kCGWindowOwnerPID: @(pid),
+                     (__bridge NSString *)kCGWindowBounds: CFBridgingRelease(CGRectCreateDictionaryRepresentation(frame)),
+                     (__bridge NSString *)kCGWindowAlpha: @(alpha)};
+        };
+        auto screenshotOwner = [](pid_t pid) { return pid == 2; };
+        NSDictionary *target = window(1, CGRectMake(0, 0, 500, 500), 1);
+        NSDictionary *overlay = window(2, CGRectMake(0, 0, 500, 500), 1);
+        assert(ScreenshotWindowAboveTarget(@[overlay, target], 1, CGPointMake(100, 100), screenshotOwner));
+        assert(!ScreenshotWindowAboveTarget(@[target, overlay], 1, CGPointMake(100, 100), screenshotOwner));
+        assert(!ScreenshotWindowAboveTarget(@[window(2, CGRectMake(0, 0, 500, 500), 0), target],
+                                            1, CGPointMake(100, 100), screenshotOwner));
+        assert(!ScreenshotWindowAboveTarget(@[window(2, CGRectMake(200, 200, 50, 50), 1), target],
+                                            1, CGPointMake(100, 100), screenshotOwner));
+        // A UI-thread caller must return before any AX queries or synchronous
+        // main-queue dispatch, even when supplied a real, nonempty selection.
+        assert([NSThread isMainThread]);
+        assert(textlens_selection_clear_matching_text("com.apple.TextEdit", "selection") == 0);
         std::atomic<uint64_t> generation{7};
         gCaptureRunning.store(true);
         const AccessibilityReadContext expiredAXStage{&generation, 7, 0};

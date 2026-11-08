@@ -22,6 +22,11 @@ export type ActionEventFlushReason =
   | 'visibility'
   | 'pageshow'
   | 'native-reveal'
+  | 'copy'
+
+// A newly revealed or hidden WebView can delay rAF. Keep the fallback within
+// one nominal frame so the immediate first token is not followed by a 50ms gap.
+const STREAM_FLUSH_TIMEOUT_MS = 16
 
 interface LogicalCursor {
   sessionGeneration: number
@@ -43,6 +48,11 @@ let cursor: LogicalCursor | null = null
 let bufferedEvents: ActionStreamEvent[] = []
 let logicalRevision = 0
 let hasPublishedNonEmptyContent = false
+let hasPublishedNonEmptyThinking = false
+let pendingContent: string[] = []
+let pendingThinking: string[] = []
+let flushFrame: number | null = null
+let flushTimer: number | null = null
 
 let stopBridgeListener: Unsubscribe | null = null
 let activeSessionId: string | null = null
@@ -53,12 +63,57 @@ function notifySubscribers(): void {
   for (const listener of listeners) listener()
 }
 
-/**
- * Compatibility flush: deltas now publish synchronously, so this is a no-op
- * for content. Kept so pageshow/visibility/native-reveal call sites stay valid.
- */
+function cancelScheduledFlush(): void {
+  if (flushFrame !== null) window.cancelAnimationFrame(flushFrame)
+  if (flushTimer !== null) window.clearTimeout(flushTimer)
+  flushFrame = flushTimer = null
+}
+
+/** Publish one snapshot per paint, while the logical cursor advances per event. */
+function publishPendingDeltas(notify: boolean): boolean {
+  cancelScheduledFlush()
+  if (!cursor || (!pendingContent.length && !pendingThinking.length)) return false
+
+  const identity = {
+    requestId: publishedSnapshot.requestId!,
+    sessionGeneration: cursor.sessionGeneration,
+    requestGeneration: cursor.requestGeneration
+  }
+  let next = publishedSnapshot
+  if (pendingContent.length) {
+    next = appendResultDeltaBatch(next, {
+      ...identity,
+      delta: pendingContent.join(''),
+      contentScalarCount: cursor.contentScalarCount
+    })
+    pendingContent = []
+    hasPublishedNonEmptyContent = true
+  }
+  if (pendingThinking.length) {
+    next = appendResultThinkingBatch(next, {
+      ...identity,
+      delta: pendingThinking.join('')
+    })
+    pendingThinking = []
+    hasPublishedNonEmptyThinking = true
+  }
+  if (next === publishedSnapshot) return false
+  publishedSnapshot = next
+  if (notify) notifySubscribers()
+  return true
+}
+
 export function flushPendingActionEvents(_reason: ActionEventFlushReason): void {
-  // no-op: content deltas are applied immediately in acceptDelta
+  publishPendingDeltas(true)
+}
+
+function scheduleDeltaFlush(): void {
+  if (flushFrame !== null) return
+  flushFrame = window.requestAnimationFrame(() => flushPendingActionEvents('frame'))
+  flushTimer = window.setTimeout(
+    () => flushPendingActionEvents('timeout'),
+    STREAM_FLUSH_TIMEOUT_MS
+  )
 }
 
 function publishReducedEvent(event: ActionStreamEvent, notify: boolean): boolean {
@@ -74,6 +129,7 @@ function beginRecovery(
   event: ActionStreamEvent,
   reportRecovery: boolean
 ): void {
+  publishPendingDeltas(reportRecovery)
   if (phase !== 'live') {
     bufferedEvents.push(event)
     return
@@ -87,6 +143,7 @@ function acceptInitialStarted(
   event: Extract<ActionStreamEvent, { type: 'started' }>,
   notify: boolean
 ): void {
+  publishPendingDeltas(false)
   cursor = {
     sessionGeneration: event.sessionGeneration,
     requestGeneration: event.requestGeneration,
@@ -97,13 +154,14 @@ function acceptInitialStarted(
   }
   logicalRevision += 1
   hasPublishedNonEmptyContent = false
+  hasPublishedNonEmptyThinking = false
   publishReducedEvent(event, notify)
 }
 
 function acceptDelta(
   event: Extract<ActionStreamEvent, { type: 'delta' }>,
   notify: boolean,
-  _schedule: boolean
+  schedule: boolean
 ): void {
   if (!cursor) return
   cursor.lastSequence = event.sequence
@@ -113,24 +171,16 @@ function acceptDelta(
   cursor.lastContentSequence = event.sequence
   cursor.contentScalarCount += countUnicodeScalars(event.delta)
 
-  // Always sync-apply first and later tokens (no rAF / grapheme batching).
-  const next = appendResultDeltaBatch(publishedSnapshot, {
-    requestId: event.requestId,
-    sessionGeneration: event.sessionGeneration,
-    requestGeneration: event.requestGeneration,
-    delta: event.delta,
-    contentScalarCount: cursor.contentScalarCount
-  })
-  hasPublishedNonEmptyContent = true
-  if (next !== publishedSnapshot) {
-    publishedSnapshot = next
-    if (notify) notifySubscribers()
-  }
+  pendingContent.push(event.delta)
+  // First answer bypasses batching, including after a long reasoning phase.
+  if (!hasPublishedNonEmptyContent || !schedule) publishPendingDeltas(notify)
+  else scheduleDeltaFlush()
 }
 
 function acceptThinkingDelta(
   event: Extract<ActionStreamEvent, { type: 'thinkingDelta' }>,
-  notify: boolean
+  notify: boolean,
+  schedule: boolean
 ): void {
   if (!cursor) return
   cursor.lastSequence = event.sequence
@@ -138,16 +188,9 @@ function acceptThinkingDelta(
   if (!event.delta) return
 
   // Thinking advances sequence only — not answer integrity counters.
-  const next = appendResultThinkingBatch(publishedSnapshot, {
-    requestId: event.requestId,
-    sessionGeneration: event.sessionGeneration,
-    requestGeneration: event.requestGeneration,
-    delta: event.delta
-  })
-  if (next !== publishedSnapshot) {
-    publishedSnapshot = next
-    if (notify) notifySubscribers()
-  }
+  pendingThinking.push(event.delta)
+  if (!hasPublishedNonEmptyThinking || !schedule) publishPendingDeltas(notify)
+  else scheduleDeltaFlush()
 }
 
 function acceptTerminal(
@@ -167,9 +210,9 @@ function acceptTerminal(
 
   cursor.lastSequence = event.sequence
   logicalRevision += 1
-  const stateBeforeTerminal = publishedSnapshot
+  const contentChanged = publishPendingDeltas(false)
   const terminalChanged = publishReducedEvent(event, false)
-  if (notify && (terminalChanged || publishedSnapshot !== stateBeforeTerminal)) {
+  if (notify && (terminalChanged || contentChanged)) {
     notifySubscribers()
   }
 }
@@ -211,6 +254,7 @@ function processLiveEvent(
     cursor.lastSequence = event.sequence
     cursor.latestRequestGeneration = event.requestGeneration
     logicalRevision += 1
+    publishPendingDeltas(false)
     publishReducedEvent(event, options.notify)
     return
   }
@@ -244,13 +288,15 @@ function processLiveEvent(
     return
   }
   if (event.type === 'thinkingDelta') {
-    acceptThinkingDelta(event, options.notify)
+    acceptThinkingDelta(event, options.notify, options.schedule)
     return
   }
   if (event.type === 'notice') {
     cursor.lastSequence = event.sequence
     logicalRevision += 1
-    publishReducedEvent(event, options.notify)
+    const contentChanged = publishPendingDeltas(false)
+    const noticeChanged = publishReducedEvent(event, false)
+    if (options.notify && (contentChanged || noticeChanged)) notifySubscribers()
     return
   }
   acceptTerminal(event, options.notify, options.reportRecovery)
@@ -301,6 +347,7 @@ export function startActionEventStore(
   }
 
   return () => {
+    publishPendingDeltas(true)
     stopBridgeListener?.()
     stopBridgeListener = null
     activeSessionId = null
@@ -337,6 +384,9 @@ export function hydrateActionEventStore(
   }
   const eventsWaitingForSnapshot = bufferedEvents
 
+  cancelScheduledFlush()
+  pendingContent = []
+  pendingThinking = []
   publishedSnapshot = resultStateFromSnapshot(sessionSnapshot)
   cursor = {
     sessionGeneration: sessionSnapshot.sessionGeneration,
@@ -352,6 +402,7 @@ export function hydrateActionEventStore(
   bufferedEvents = []
   phase = 'live'
   hasPublishedNonEmptyContent = sessionSnapshot.contentScalarCount > 0
+  hasPublishedNonEmptyThinking = publishedSnapshot.thinkingContent.length > 0
   logicalRevision += 1
   notifySubscribers()
 

@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -371,6 +372,10 @@ export function SettingsApp(): JSX.Element {
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(restoredSettingsSection)
   const activeSectionRef = useRef(activeSection)
   activeSectionRef.current = activeSection
+  useLayoutEffect(() => {
+    const scrollingElement = document.scrollingElement ?? document.documentElement
+    scrollingElement.scrollTop = 0
+  }, [activeSection])
   const dirtyRef = useRef(false)
   const unsavedChangesRef = useRef(false)
   const quittingRef = useRef(false)

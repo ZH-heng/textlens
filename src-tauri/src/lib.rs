@@ -1,5 +1,6 @@
 pub mod actions;
 mod clipboard;
+mod language_detection;
 mod local_secrets;
 pub mod models;
 mod openai_protocol;

@@ -18,6 +18,7 @@ describe('rich Markdown policy', () => {
     '# heading',
     '- list item',
     '• Chinese bullet',
+    '第一项。 • 第二项。 • 第三项。',
     '1、中文有序',
     '（1）括号序号',
     '[link](https://example.com)',

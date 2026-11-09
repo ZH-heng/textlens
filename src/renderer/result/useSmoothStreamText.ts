@@ -98,12 +98,12 @@ export function useSmoothStreamText(
     const pump = (): void => {
       cancelScheduled()
       if (!animationRef.current) return
-      controller.tick(now())
+      controller.tick(now(), document.visibilityState === 'hidden')
       publish()
       if (controller.needsTick()) schedule()
     }
     frameRef.current = requestFrame(pump)
-    timerRef.current = window.setTimeout(pump, Math.max(0, Math.min(50, controller.getDeadline() - now())))
+    timerRef.current = window.setTimeout(pump, Math.max(0, Math.min(100, controller.getDeadline() - now())))
   }, [cancelScheduled, controller, now, publish, requestFrame])
 
   useLayoutEffect(() => {

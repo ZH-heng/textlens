@@ -1,3 +1,5 @@
+import { hasCollapsedBulletList } from './markdownNormalize'
+
 export const RICH_MARKDOWN_SCALAR_LIMIT = 16_384
 
 // Includes Chinese-style list markers (1、 / （1） / •) so translation output
@@ -15,7 +17,9 @@ const MATH_DISPLAY = /\$\$/u
 const MATH_INLINE = /\$[^$\n]+\$/u
 
 export function hasLikelyMarkdownSyntax(content: string): boolean {
-  return BLOCK_MARKDOWN.test(content) || INLINE_MARKDOWN.test(content)
+  return BLOCK_MARKDOWN.test(content) || INLINE_MARKDOWN.test(content) ||
+    (content.includes('•') || content.includes('·') || content.includes('●') || content.includes('○')) &&
+    content.split(/\r?\n/u).some(hasCollapsedBulletList)
 }
 
 export function contentLooksLikeMath(content: string): boolean {

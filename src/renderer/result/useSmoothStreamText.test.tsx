@@ -161,7 +161,7 @@ describe('useSmoothStreamText', () => {
         now={() => clock}
       />
     )
-    // Still at first-burst seed until frames advance.
+    // Resume with one code point in the same commit.
     expect(screen.getByTestId('out').textContent).toBe('你好')
     expect(frames.length).toBeGreaterThan(0)
 
@@ -300,7 +300,7 @@ describe('useSmoothStreamText', () => {
     const now = () => clock
     const view = render(<Harness target="首" streaming resetKey="timer" requestFrame={requestFrame} cancelFrame={cancelFrame} now={now} />)
     view.rerender(<Harness target={'首' + '字'.repeat(100)} streaming resetKey="timer" requestFrame={requestFrame} cancelFrame={cancelFrame} now={now} />)
-    act(() => { clock = 50; vi.advanceTimersByTime(50) })
+    act(() => { clock = 1000; vi.advanceTimersByTime(100) })
     expect(screen.getByTestId('out').textContent).toBe('首' + '字'.repeat(100))
     expect(cancelFrame).toHaveBeenCalledWith(42)
     view.unmount()

@@ -48,6 +48,14 @@ describe('normalizeMarkdownSource', () => {
     )
   })
 
+  it('restores a collapsed run of sentence-separated bullet items', () => {
+    expect(normalizeMarkdownSource('第一项。 • 第二项。 • 第三项。')).toBe('- 第一项。\n- 第二项。\n- 第三项。')
+    expect(normalizeMarkdownSource('• 第一项。 • 第二项。 • 第三项。')).toBe('- 第一项。\n- 第二项。\n- 第三项。')
+    expect(normalizeMarkdownSource('只有一个。 • 符号')).toBe('只有一个。 • 符号')
+    expect(normalizeMarkdownSource('```\n第一项。 • 第二项。 • 第三项。\n```')).toBe('```\n第一项。 • 第二项。 • 第三项。\n```')
+    expect(normalizeMarkdownSource('`第一项。 • 第二项。 • 第三项。`')).toBe('`第一项。 • 第二项。 • 第三项。`')
+  })
+
   it('does not rewrite content inside fenced code blocks', () => {
     const input = ['说明。', '```', '1、不要改', '第二行。', '```', '结束。'].join('\n')
     expect(normalizeMarkdownSource(input)).toBe(

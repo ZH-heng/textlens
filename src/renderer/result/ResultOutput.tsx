@@ -1,3 +1,4 @@
+import { StreamingText } from './StreamingText'
 import {
   Component,
   Suspense,
@@ -185,7 +186,11 @@ function PlainOutput({
 }): JSX.Element {
   return (
     <>
-      <span className="stream-plain-text">{stripLeadingBlankLines(content)}</span>
+      <span className={showCaret ? 'stream-plain-text markdown-streaming' : 'stream-plain-text'}>
+        {showCaret && !/[`$]|\\[([]/u.test(content)
+          ? <StreamingText text={stripLeadingBlankLines(content)} animateInitial />
+          : stripLeadingBlankLines(content)}
+      </span>
       {showCaret && <span className="stream-caret" aria-hidden="true" />}
       {failed && (
         <button className="result-footer-button" type="button" onClick={retry}>

@@ -1385,7 +1385,7 @@ impl ActionService {
                     app,
                     &prepared.ticket,
                     "THINKING_CONTROL_FALLBACK",
-                    "服务商不支持当前的“关闭思考”控制，本次已按服务商默认设置继续生成。",
+                    "服务商拒绝了当前思考参数，本次已按服务商默认设置继续生成。",
                 );
                 if !matches!(notice, Ok(TransitionResult::Applied)) {
                     self.cleanup_stale_attempt(prepared);
@@ -1887,10 +1887,10 @@ fn resolve_route(
         .iter()
         .find(|model| model.id == model_id)
         .ok_or_else(|| ActionServiceError::Validation("选择的模型不存在，请重新选择".to_owned()))?;
-    let thinking = thinking::resolve_thinking_for_request(
+    let thinking = thinking::resolve_thinking_for_endpoint(
         provider.protocol,
         model_id,
-        model.thinking_enabled,
+        &provider.base_url,
         model.thinking_default,
         &model.thinking_levels,
         model.thinking_capability.as_ref(),
@@ -2304,167 +2304,9 @@ fn locale_code(locale: Locale) -> &'static str {
     }
 }
 
-/// Detect the likely source language by script share (mirrors TS
-/// `detectTranslationLanguage`). A single foreign character must not hijack a
-/// whole paragraph, so each script needs a meaningful share of the letters.
+/// Use the same offline detection rules as the result-window language route.
 fn detect_translation_language(text: &str) -> TranslationLanguage {
-    let mut han = 0usize;
-    let mut kana = 0usize;
-    let mut hangul = 0usize;
-    let mut cyrillic = 0usize;
-    let mut other = 0usize;
-    for character in text.chars() {
-        if is_han_character(character) {
-            han += 1;
-        } else if is_kana_character(character) {
-            kana += 1;
-        } else if is_hangul_character(character) {
-            hangul += 1;
-        } else if is_cyrillic_character(character) {
-            cyrillic += 1;
-        } else if character.is_alphabetic() {
-            other += 1;
-        }
-    }
-    let total = han + kana + hangul + cyrillic + other;
-    if total == 0 {
-        return TranslationLanguage::EnUs;
-    }
-    // Kana uses a lower share because Japanese prose splits itself between
-    // kana and a large Han share.
-    if kana * 10 >= total {
-        return TranslationLanguage::JaJp;
-    }
-    if hangul * 10 >= total * 3 {
-        return TranslationLanguage::KoKr;
-    }
-    if han * 10 >= total * 3 {
-        return TranslationLanguage::ZhCn;
-    }
-    if cyrillic * 10 >= total * 3 {
-        return TranslationLanguage::RuRu;
-    }
-    detect_latin_translation_language(text)
-}
-
-fn detect_latin_translation_language(text: &str) -> TranslationLanguage {
-    const DE: &[&str] = &[
-        "der",
-        "die",
-        "das",
-        "den",
-        "dem",
-        "des",
-        "ein",
-        "eine",
-        "einer",
-        "einem",
-        "einen",
-        "ist",
-        "sind",
-        "und",
-        "mit",
-        "für",
-        "von",
-        "auf",
-        "nicht",
-        "ich",
-        "sie",
-        "wir",
-        "diese",
-        "dies",
-        "dieser",
-        "dieses",
-        "über",
-        "aktuelle",
-        "auswahl",
-        "deutscher",
-        "deutsch",
-        "guten",
-        "tag",
-        "hallo",
-        "danke",
-        "bitte",
-        "übersetzen",
-    ];
-    const FR: &[&str] = &[
-        "le",
-        "la",
-        "les",
-        "des",
-        "du",
-        "un",
-        "une",
-        "est",
-        "sont",
-        "et",
-        "avec",
-        "pour",
-        "dans",
-        "pas",
-        "ce",
-        "ces",
-        "ceci",
-        "cette",
-        "vous",
-        "nous",
-        "français",
-        "texte",
-        "traduire",
-        "bonjour",
-        "merci",
-        "salut",
-        "au",
-        "aux",
-        "être",
-        "été",
-        "où",
-        "à",
-        "déjà",
-    ];
-    const EN: &[&str] = &[
-        "the", "this", "that", "is", "are", "was", "were", "and", "with", "for", "from", "have",
-        "has", "you", "your", "please", "to", "of", "in", "it", "not", "we", "a", "an", "english",
-        "hello", "good", "morning",
-    ];
-    let lowercase = text.to_lowercase();
-    let tokens: Vec<&str> = lowercase
-        .split(|character: char| !character.is_alphabetic())
-        .filter(|word| !word.is_empty())
-        .collect();
-    if tokens.len() == 1 {
-        let word = tokens[0];
-        if matches!(word, "hallo" | "danke" | "bitte") {
-            return TranslationLanguage::DeDe;
-        }
-        if matches!(word, "bonjour" | "merci" | "salut") {
-            return TranslationLanguage::FrFr;
-        }
-    }
-    let words: std::collections::HashSet<&str> = tokens.into_iter().collect();
-    let de = words
-        .iter()
-        .filter(|word| {
-            DE.contains(word) || word.chars().any(|character| "äöüß".contains(character))
-        })
-        .count();
-    let fr = words
-        .iter()
-        .filter(|word| {
-            FR.contains(word)
-                || word
-                    .chars()
-                    .any(|character| "àâæçéèêëîïôœùûÿ".contains(character))
-        })
-        .count();
-    let en = words.iter().filter(|word| EN.contains(word)).count();
-    if de >= 2 && de > fr && de > en {
-        TranslationLanguage::DeDe
-    } else if fr >= 2 && fr > de && fr > en {
-        TranslationLanguage::FrFr
-    } else {
-        TranslationLanguage::EnUs
-    }
+    crate::language_detection::detect_source_language(text)
 }
 
 /// Default translation target (mirrors TS `defaultTranslationTarget`).
@@ -2477,25 +2319,6 @@ fn default_translation_target(
     } else {
         settings.target_language
     }
-}
-
-fn is_han_character(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
-    )
-}
-
-fn is_kana_character(character: char) -> bool {
-    matches!(character as u32, 0x3040..=0x309F | 0x30A0..=0x30FF)
-}
-
-fn is_hangul_character(character: char) -> bool {
-    matches!(character as u32, 0xAC00..=0xD7AF | 0x1100..=0x11FF)
-}
-
-fn is_cyrillic_character(character: char) -> bool {
-    matches!(character as u32, 0x0400..=0x04FF)
 }
 
 fn build_base_body(prepared: &PreparedRequest) -> Value {
@@ -2805,6 +2628,35 @@ mod tests {
             error.to_string().contains("已停用"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn thinking_routes_keep_each_tools_effort_independent_of_legacy_model_toggle() {
+        let mut settings = configured_settings("prov-a", "gpt-5.2", ThinkingMode::High);
+        settings.providers[0].models[0].thinking_enabled = false;
+        settings.providers[0].models[0].thinking_default = Some(ThinkingLevel::Medium);
+        let first = settings
+            .actions
+            .iter()
+            .find(|action| action.id == "summary")
+            .unwrap()
+            .clone();
+        let mut second = first.clone();
+        second.id = "another-tool".to_owned();
+        second.thinking_mode = ThinkingMode::Low;
+        settings.actions.push(second.clone());
+        let restored: AppSettings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        for (action, expected) in [(&first, "high"), (&second, "low")] {
+            let route = resolve_route(&restored, action, "prov-a", "gpt-5.2").unwrap();
+            let (body, applied) = build_controlled_body(
+                &serde_json::json!({"model":"gpt-5.2"}),
+                route.provider.protocol,
+                &route.thinking,
+            );
+            assert_eq!(body["reasoning_effort"], expected);
+            assert!(applied.is_some());
+        }
     }
 
     fn request_ticket(request_id: &str) -> RequestTicket {
@@ -3288,6 +3140,43 @@ mod tests {
             service.commit_completed_for_test(&ticket),
             TransitionResult::Rejected,
         );
+    }
+
+    #[test]
+    fn translation_prompt_preserves_source_and_does_not_inject_formatting_rules() {
+        let settings = AppSettings::default();
+        let translate = settings
+            .actions
+            .iter()
+            .find(|action| action.id == "translate")
+            .unwrap();
+        let source = "A PDF line wrap\ncontinues here.\n\n- First item\n- Second item";
+        let built = build_prompt(translate, source, &settings, None, "multiline").unwrap();
+        assert!(built.user.contains("应合并为完整段落"));
+        assert!(built.user.contains(source));
+        assert!(!built.user.contains("preserve every nonempty source line"));
+        let mut custom = translate.clone();
+        custom.prompt = Some("Translate: {{text}}".to_owned());
+        let built = build_prompt(&custom, source, &settings, None, "custom").unwrap();
+        let boundary = built.boundary.unwrap();
+        assert_eq!(
+            built.user,
+            format!("Translate: {}\n{source}\n{}", boundary.begin, boundary.end)
+        );
+    }
+
+    #[test]
+    fn translation_detection_filters_code_without_changing_the_request_source() {
+        let settings = AppSettings::default();
+        let translate = settings
+            .actions
+            .iter()
+            .find(|action| action.id == "translate")
+            .unwrap();
+        let source = "请检查这段代码。\n```js\nconst message = \"This English code must not choose the target language\";\n```";
+        let built = build_prompt(translate, source, &settings, None, "technical").unwrap();
+        assert!(built.user.contains("翻译为 English"));
+        assert!(built.user.contains(source));
     }
 
     #[test]

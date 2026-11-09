@@ -616,7 +616,7 @@ describe('ResultApp window interactions', () => {
       content: '# 尚未完成'
     })
 
-    expect(screen.getByText('# 尚未完成')).toHaveClass('stream-plain-text')
+    expect(screen.getByText('# 尚未完成').closest('.stream-plain-text')).toBeInTheDocument()
 
     const store = await import('./actionEventStore')
     act(() => {
@@ -775,7 +775,7 @@ describe('ResultApp window interactions', () => {
         contentScalarCount: countUnicodeScalars('这是')
       })
     })
-    expect(screen.getByText('这是')).toHaveClass('stream-plain-text')
+    expect(screen.getByText('这是').closest('.stream-plain-text')).toBeInTheDocument()
 
     act(() => {
       store.hydrateActionEventStore({
@@ -786,7 +786,7 @@ describe('ResultApp window interactions', () => {
         contentScalarCount: countUnicodeScalars('这是持续输出')
       })
     })
-    expect(await screen.findByText('这是持续输出')).toHaveClass('stream-plain-text')
+    await waitFor(() => expect(document.querySelector('.stream-plain-text')?.textContent).toBe('这是持续输出'))
 
     act(() => {
       store.hydrateActionEventStore({
@@ -1243,7 +1243,7 @@ describe('ResultApp window interactions', () => {
       'aria-expanded',
       'true'
     )
-    const thinkingBody = screen.getByText('先拆解题意，再给出解释。')
+    const thinkingBody = screen.getByText('先拆解题意，再给出解释。').closest('.result-thinking__body')
     expect(thinkingBody).toBeInTheDocument()
     // Must not share .stream-plain-text (full body font-size) or the shrink CSS loses.
     expect(thinkingBody).toHaveClass('result-thinking__body')

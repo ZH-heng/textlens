@@ -36,16 +36,16 @@ Core selection-assistant workflow:
 
 - Selection toolbar: copy, search, translate, summarize, explain, polish, Ask AI, and custom actions.
 - Actions can be enabled/disabled, renamed, reordered, and re-iconed; icon-only mode is supported. Search can use Google / Bing / Baidu; URLs, domains, and IPs open directly when possible.
-- Multiple OpenAI-compatible providers and models; providers can be enabled or disabled; each action can bind its own model and prompt; fetch models, multi-select merge, and reorder are supported.
+- Multiple providers and models using OpenAI Chat Completions / Responses, Anthropic Messages, or Gemini; providers can be enabled or disabled; each action can bind its own model and prompt; fetch models, multi-select merge, and reorder are supported.
 - Streaming results with Markdown / tables / math; drag, resize, pin, and several dismiss modes; text in the result body can be selected again for a new toolbar.
 
 Enhancements beyond a basic selection assistant:
 
 - **Follow-up in results:** Translate / explain / summarize / polish result windows support multi-turn questions at the bottom (not only Ask AI).
 - **Header model switch & regenerate:** Switch models by provider group and regenerate in the same window; translation targets include CN/EN/JA/KO/RU/DE/FR.
-- **Multilingual translation:** Auto-detect source language; default other languages → Chinese, Chinese → English; primary/backup language pairs are configurable.
+- **Multilingual translation:** Detect source language locally after filtering code, commands, URLs, logs, and other technical content, using script distribution and word evidence. Defaults to other languages → Chinese and Chinese → English, with configurable primary/backup pairs. The default prompt asks the model to merge PDF copy-induced line wraps by meaning while preserving paragraphs, lists, tables, and code.
 - **Ask AI sessions:** Open a result window with selection as context; you can wait before the first model call, then chat multi-turn. Retrying a failed turn retains its question and earlier conversation, and both display and copy include the full transcript. Sessions stay within the current result window.
-- **Thinking & streaming:** Streaming thinking / reasoning display; thinking levels inferred from model names (including “off”); low-latency streaming.
+- **Thinking & streaming:** Each tool has its own thinking switch, effort selection, and re-detection button under Toolbar actions → Edit → Model thinking. Tools sharing a model can use different efforts. Controls are detected from provider metadata, model names, and endpoints; “off” uses the lowest supported effort when thinking cannot be disabled. Thinking / reasoning is displayed as it streams.
 - **Provider enable/disable:** Disabled providers are hidden from action binding and result model lists. Already-bound actions also refuse to run and prompt you to update their configuration.
 - **Popup and waiting feedback:** The toolbar and result window use a brief fade-in, and three dots bounce in sequence while waiting for the model. Long action names truncate or scroll horizontally while retaining full tooltips. The system’s reduced-motion preference disables waiting animations and stream typewriter playback.
 - **Plays well with other apps:** When the clipboard holds something TextLens cannot fully preserve (a screenshot, for example), the temporary copy is skipped instead of rewriting your clipboard. On macOS, the source highlight is cleared after a short delay once copy/search succeeds or the result window is shown; configuration rejection or a failed result reveal leaves it selected. Windows currently leaves source highlights unchanged. A leftover selection no longer brings the toolbar back on an unrelated click.

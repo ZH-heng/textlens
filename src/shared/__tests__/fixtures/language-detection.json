@@ -1,22 +1,454 @@
 [
-  { "text": "Dies ist ein deutscher Text über die aktuelle Auswahl.", "language": "de-DE" },
-  { "text": "Bitte übersetzen Sie diese Auswahl.", "language": "de-DE" },
-  { "text": "Guten Tag!", "language": "de-DE" },
-  { "text": "Hallo!", "language": "de-DE" },
-  { "text": "Ceci est un texte français pour vous.", "language": "fr-FR" },
-  { "text": "Traduire cette sélection, merci.", "language": "fr-FR" },
-  { "text": "Bonjour!", "language": "fr-FR" },
-  { "text": "Hello world", "language": "en-US" },
-  { "text": "Please translate this English text.", "language": "en-US" },
-  { "text": "The cafe offers a café menu with coffee.", "language": "en-US" },
-  { "text": "This English paragraph contains the word bonjour for illustration.", "language": "en-US" },
-  { "text": "bonjour bonjour bonjour", "language": "en-US" },
-  { "text": "café", "language": "en-US" },
-  { "text": "und et", "language": "en-US" },
-  { "text": "这是中文", "language": "zh-CN" },
-  { "text": "日本語能力試験に合格した", "language": "ja-JP" },
-  { "text": "안녕하세요", "language": "ko-KR" },
-  { "text": "Привет", "language": "ru-RU" },
-  { "text": "Hello の world", "language": "en-US" },
-  { "text": "12345 — !", "language": "en-US" }
+  {
+    "text": "Dies ist ein deutscher Text über die aktuelle Auswahl.",
+    "language": "de-DE"
+  },
+  {
+    "text": "Bitte übersetzen Sie diese Auswahl.",
+    "language": "de-DE"
+  },
+  {
+    "text": "Guten Tag!",
+    "language": "de-DE"
+  },
+  {
+    "text": "Hallo!",
+    "language": "de-DE"
+  },
+  {
+    "text": "Ceci est un texte français pour vous.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Traduire cette sélection, merci.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Bonjour!",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Hello world",
+    "language": "en-US"
+  },
+  {
+    "text": "Please translate this English text.",
+    "language": "en-US"
+  },
+  {
+    "text": "The cafe offers a café menu with coffee.",
+    "language": "en-US"
+  },
+  {
+    "text": "This English paragraph contains the word bonjour for illustration.",
+    "language": "en-US"
+  },
+  {
+    "text": "bonjour bonjour bonjour",
+    "language": "en-US"
+  },
+  {
+    "text": "café",
+    "language": "en-US"
+  },
+  {
+    "text": "und et",
+    "language": "en-US"
+  },
+  {
+    "text": "这是中文",
+    "language": "zh-CN"
+  },
+  {
+    "text": "日本語能力試験に合格した",
+    "language": "ja-JP"
+  },
+  {
+    "text": "안녕하세요",
+    "language": "ko-KR"
+  },
+  {
+    "text": "Привет",
+    "language": "ru-RU"
+  },
+  {
+    "text": "Hello の world",
+    "language": "en-US"
+  },
+  {
+    "text": "12345 — !",
+    "language": "en-US"
+  },
+  {
+    "text": "请检查这段代码。\n```js\nconst message = \"the English text should never decide our language\";\n```",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查。\n~~~python\nprint(\"this is a long English string that should be ignored\")\n~~~",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查。\n````markdown\n```js\nconst text = \"English words and comments\"\n```\n````",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查。\n```js\nconst text = \"Unclosed code is still code\"",
+    "language": "zh-CN"
+  },
+  {
+    "text": "Please read this explanation.\n```text\n这是中文代码块，不应该影响英文正文的语言。\n```",
+    "language": "en-US"
+  },
+  {
+    "text": "Bonjour, pouvez-vous lire ce texte ?\n```text\n这是中文代码，不参与检测。\n```",
+    "language": "fr-FR"
+  },
+  {
+    "text": "请检查这段代码。\n    const status = \"This English code should be ignored\";",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查 `the longer English code and comments belong here` 的结果。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请打开 https://this-is-a-long-english-domain.example.com/the/english/path/with/many/words 查看说明。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请联系 support-team@english-domain.example.com 处理。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请参阅 [使用说明](https://english.example.com/the/long/english/documentation)。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "[Bonjour et bienvenue](https://english.example.com/the/long/english/documentation)",
+    "language": "fr-FR"
+  },
+  {
+    "text": "请查看 user_configuration_cache 和 getConfigurationForCurrentUser 的值。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请打开 /Users/developer/very/long/english/project/path/settings.json 检查。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请打开 C:\\Users\\Developer\\very\\long\\project\\settings.json 检查。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请执行：\n$ pnpm install --frozen-lockfile\n然后重试。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请执行：\npnpm install --frozen-lockfile\n然后重试。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请执行：\ncargo test --manifest-path src-tauri/Cargo.toml\n然后重试。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请处理这个问题。\n2026-11-09 10:20:30 ERROR The connection could not be established with the remote server",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请处理这个问题。\n[ERROR] The connection could not be established with the remote server",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请处理这个问题。\nTypeError: Cannot read properties of undefined reading veryLongPropertyName\n    at getConfiguration (/Users/Developer/project/main.js:12:3)",
+    "language": "zh-CN"
+  },
+  {
+    "text": "启动失败：TypeError: Cannot read properties of undefined reading veryLongPropertyName",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查这个问题。\nTraceback (most recent call last):\n  File \"main.py\", line 23\nValueError: invalid literal for int with base ten",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查 JSON。\n{\"message\": \"This English text must not influence the source language\"}",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查代码。\nconst status = \"The English text should be ignored\";",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查代码。\nmessage = \"The English text should be ignored\"",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查 SQL。\nSELECT name, status FROM application_users WHERE status = \"active\";",
+    "language": "zh-CN"
+  },
+  {
+    "text": "这是中文说明 <!-- this is an English comment with many words -->。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "<p lang=\"en\" class=\"english-documentation\">这是中文说明。</p>",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查 API 和 HTTP 请求的返回值。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "这个 Transformer 模型使用 attention 和 embedding。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "此处使用 callback 和 promise 处理结果。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "The callback processes the 中文 field in this English paragraph.",
+    "language": "en-US"
+  },
+  {
+    "text": "這是一段繁體中文，請保留原來的語氣。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "𠀀𠀁𠀂",
+    "language": "zh-CN"
+  },
+  {
+    "text": "これは日本語の説明です。API を使ってください。",
+    "language": "ja-JP"
+  },
+  {
+    "text": "ｺﾝﾆﾁﾊ、これは説明です。",
+    "language": "ja-JP"
+  },
+  {
+    "text": "この設定を確認してください。\n```js\nconst status = \"the English model should ignore code\";\n```",
+    "language": "ja-JP"
+  },
+  {
+    "text": "설정을 확인하고 다시 시도해 주세요.\n```js\nconst value = \"This is an English string\";\n```",
+    "language": "ko-KR"
+  },
+  {
+    "text": "Проверьте настройки и повторите попытку.\n```js\nconst value = \"This is an English string\";\n```",
+    "language": "ru-RU"
+  },
+  {
+    "text": "Bitte lesen Sie die Datei und speichern Sie Ihre Änderungen.",
+    "language": "de-DE"
+  },
+  {
+    "text": "Ich möchte die Verbindung öffnen, aber es funktioniert nicht.",
+    "language": "de-DE"
+  },
+  {
+    "text": "Die Geschwindigkeit wird durch diese Einstellung geändert.",
+    "language": "de-DE"
+  },
+  {
+    "text": "Warum kann ich diese Datei nicht öffnen?",
+    "language": "de-DE"
+  },
+  {
+    "text": "Übersetzung",
+    "language": "de-DE"
+  },
+  {
+    "text": "Geschwindigkeit",
+    "language": "de-DE"
+  },
+  {
+    "text": "DANKE!",
+    "language": "de-DE"
+  },
+  {
+    "text": "Bitte lesen Sie diese Anleitung.\n```text\n这是中文代码，不参与检测。\n```",
+    "language": "de-DE"
+  },
+  {
+    "text": "Je voudrais modifier ce fichier, mais la connexion ne fonctionne pas.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Pourquoi ne pouvez-vous pas ouvrir cette page ?",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Veuillez sélectionner le texte puis enregistrer les modifications.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Où sont les fichiers que vous avez enregistrés ?",
+    "language": "fr-FR"
+  },
+  {
+    "text": "La traduction est déjà disponible pour cette sélection.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Connexion",
+    "language": "fr-FR"
+  },
+  {
+    "text": "MERCI!",
+    "language": "fr-FR"
+  },
+  {
+    "text": "La sélection est déjà disponible pour vous.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Die Übersetzung ist für diese Auswahl.",
+    "language": "de-DE"
+  },
+  {
+    "text": "The word \"die\" means to stop living in English.",
+    "language": "en-US"
+  },
+  {
+    "text": "This sentence uses café and naïve as borrowed words.",
+    "language": "en-US"
+  },
+  {
+    "text": "We use the French word merci in this English sentence.",
+    "language": "en-US"
+  },
+  {
+    "text": "The title is Bonjour and the subtitle is Guten Tag.",
+    "language": "en-US"
+  },
+  {
+    "text": "A user can configure this model without changing the software.",
+    "language": "en-US"
+  },
+  {
+    "text": "Привет Ж Hello world this is an English explanation with many words.",
+    "language": "en-US"
+  },
+  {
+    "text": "```js\nconst text = \"这是中文代码\";\n```",
+    "language": "en-US"
+  },
+  {
+    "text": "`这是中文变量`",
+    "language": "en-US"
+  },
+  {
+    "text": "https://example.com/中文路径",
+    "language": "en-US"
+  },
+  {
+    "text": "ERROR: 这是中文日志，不参与语种判断",
+    "language": "en-US"
+  },
+  {
+    "text": "中文\r\n```js\r\nconst message = \"These English words do not count\";\r\n```",
+    "language": "zh-CN"
+  },
+  {
+    "text": "中文\r```js\rconst message = \"These English words do not count\";\r```",
+    "language": "zh-CN"
+  },
+  {
+    "text": "    这是 PDF 复制出来的中文段落，前面的缩进不代表代码。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "    Bonjour, ceci est un paragraphe avec une indentation.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "请检查 `userConfigurationCache` 的返回值。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查 ``code with `nested backticks` and long English comments`` 的返回值。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "请检查。\nprint(\"This English string should be ignored\")",
+    "language": "zh-CN"
+  },
+  {
+    "text": "中文说明。<script>document.write(\"English text and variables\");</script>",
+    "language": "zh-CN"
+  },
+  {
+    "text": "中文说明。/* this is a very long English comment with many words */",
+    "language": "zh-CN"
+  },
+  {
+    "text": "本应用使用的\n模型可以配置。\n这是同一段的下一句。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "Hallo Welt!",
+    "language": "de-DE"
+  },
+  {
+    "text": "Wie geht’s?",
+    "language": "de-DE"
+  },
+  {
+    "text": "Gute Nacht!",
+    "language": "de-DE"
+  },
+  {
+    "text": "Guten Abend.",
+    "language": "de-DE"
+  },
+  {
+    "text": "Alles klar.",
+    "language": "de-DE"
+  },
+  {
+    "text": "Es tut mir leid.",
+    "language": "de-DE"
+  },
+  {
+    "text": "Entschuldigung!",
+    "language": "de-DE"
+  },
+  {
+    "text": "Ça va ?",
+    "language": "fr-FR"
+  },
+  {
+    "text": "C’est vrai.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Au revoir !",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Bien sûr.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Bonne nuit.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "Allô ?",
+    "language": "fr-FR"
+  },
+  {
+    "text": "S’il te plaît.",
+    "language": "fr-FR"
+  },
+  {
+    "text": "```const message = \"This is an English code sample\";```\n请检查这段代码的配置。",
+    "language": "zh-CN"
+  },
+  {
+    "text": "````const value = `hello`;````\n这是使用多个反引号的行内代码示例。",
+    "language": "zh-CN"
+  }
 ]

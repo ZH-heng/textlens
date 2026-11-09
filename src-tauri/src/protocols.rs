@@ -530,7 +530,7 @@ mod tests {
     fn thinking_mapping_targets_the_right_field() {
         let capability = ThinkingCapability {
             source: ThinkingCapabilitySource::Heuristic,
-            dialect: None,
+            dialect: Some(crate::models::ThinkingDialect::ReasoningEffort),
             supports_off: true,
         };
         let plan = |mode| ThinkingRequestPlan {

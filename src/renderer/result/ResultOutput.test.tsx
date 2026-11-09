@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { memo, useState, type JSX } from 'react'
 
-import type { SafeMarkdownProps } from './SafeMarkdown'
+import { SafeMarkdown, type SafeMarkdownProps } from './SafeMarkdown'
 import { createRetryableMarkdownLoader, type SafeMarkdownImporter } from './LazySafeMarkdown'
 import {
   ResultOutput,
@@ -74,7 +74,7 @@ describe('ResultOutput', () => {
 
   it('renders the plain stream view without leading blank lines', () => {
     render(<ResultOutput {...outputProps({ content: '\n\n\nAnswer body' })} />)
-    expect(screen.getByText('Answer body')).toHaveClass('stream-plain-text')
+    expect(screen.getByText('Answer body').closest('.stream-plain-text')).toBeInTheDocument()
   })
 
   it('commits plain content before presentation and starts Markdown on the next frame', async () => {
@@ -92,7 +92,7 @@ describe('ResultOutput', () => {
       />
     )
 
-    expect(screen.getByText('# Deferred heading')).toHaveClass('stream-plain-text')
+    expect(screen.getByText('# Deferred heading').closest('.stream-plain-text')).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Deferred heading' })).not.toBeInTheDocument()
     expect(milestones).toEqual(['plain-layout'])
 
@@ -104,11 +104,11 @@ describe('ResultOutput', () => {
         onMilestone={(milestone) => milestones.push(milestone)}
       />
     )
-    expect(screen.getByText('# Deferred heading')).toHaveClass('stream-plain-text')
+    expect(screen.getByText('# Deferred heading').closest('.stream-plain-text')).toBeInTheDocument()
     expect(scheduler.frames.size).toBe(1)
 
     act(() => scheduler.runNextFrame())
-    expect(screen.getByText('# Deferred heading')).toHaveClass('stream-plain-text')
+    expect(screen.getByText('# Deferred heading').closest('.stream-plain-text')).toBeInTheDocument()
     expect(importer).toHaveBeenCalledOnce()
 
     await act(async () => {
@@ -142,11 +142,20 @@ describe('ResultOutput', () => {
         />
       )
 
-      expect(screen.getByText('# Never rich')).toHaveClass('stream-plain-text')
+      expect(screen.getByText('# Never rich').closest('.stream-plain-text')).toBeInTheDocument()
       expect(scheduler.frames.size).toBe(0)
       expect(importer).not.toHaveBeenCalled()
     }
   )
+
+  it('recognizes and renders collapsed translation list items after completion', async () => {
+    const scheduler = new DeterministicScheduler()
+    const content = '改进了重试。 • 提高了可靠性。 • 防止了操作执行。'
+    render(<ResultOutput {...outputProps({ content, contentScalarCount: [...content].length, revealCommitted: true })}
+      loader={createRetryableMarkdownLoader(async () => ({ SafeMarkdown }))} scheduler={scheduler} />)
+    await act(async () => { scheduler.runNextFrame(); await Promise.resolve() })
+    expect(await screen.findAllByRole('listitem')).toHaveLength(3)
+  })
 
   it('keeps streaming Markdown plain and parses once after completion', async () => {
     const scheduler = new DeterministicScheduler()
@@ -167,7 +176,7 @@ describe('ResultOutput', () => {
       />
     )
 
-    expect(screen.getByText('# Streaming heading')).toHaveClass('stream-plain-text')
+    expect(screen.getByText('# Streaming heading').closest('.stream-plain-text')).toBeInTheDocument()
     expect(parser).not.toHaveBeenCalled()
 
     view.rerender(
@@ -221,7 +230,7 @@ describe('ResultOutput', () => {
       />
     )
 
-    expect(screen.getByText(content)).toHaveClass('stream-plain-text')
+    expect(screen.getByText(content).closest('.stream-plain-text')).toBeInTheDocument()
     expect(scheduler.frames.size).toBe(0)
     expect(importer).not.toHaveBeenCalled()
   })
@@ -248,7 +257,7 @@ describe('ResultOutput', () => {
       await Promise.resolve()
     })
 
-    expect(screen.getByText('# Deferred heading')).toHaveClass('stream-plain-text')
+    expect(screen.getByText('# Deferred heading').closest('.stream-plain-text')).toBeInTheDocument()
     const retry = await screen.findByRole('button', { name: '重试富文本渲染' })
     fireEvent.click(retry)
     expect(scheduler.frames.size).toBe(1)

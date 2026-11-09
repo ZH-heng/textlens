@@ -41,7 +41,6 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
-  SlidersHorizontal,
   Sparkles,
   Trash2,
   X
@@ -56,8 +55,6 @@ import {
   RESULT_FONT_SIZE_MAX,
   RESULT_FONT_SIZE_MIN,
   THEME_OPTIONS,
-  THINKING_LEVELS,
-  THINKING_LEVEL_LABELS,
   TRANSLATION_LANGUAGES,
   TRANSLATION_LANGUAGE_NAMES,
   actionDefinitionSchema,
@@ -66,7 +63,6 @@ import {
   inferredThinkingCapability,
   isAiActionDefinition,
   providerProtocolOption,
-  protocolSupportsThinkingOff,
   searchEngineDisplayName,
   type AccessibilityStatus,
   type ActionDefinition,
@@ -76,7 +72,6 @@ import {
   type ProviderProtocol,
   type SettingsGuidance,
   type SupportedLocale,
-  type ThinkingLevel,
   type TranslationLanguage
 } from '../../shared'
 import { ActionIcon } from '../components/ActionIcon'
@@ -261,23 +256,16 @@ function providerProtocol(provider: Pick<PublicProviderSettings, 'protocol'>): P
 
 function reseedModelThinking(
   model: ProviderModel,
-  protocol: ProviderProtocol
+  protocol: ProviderProtocol,
+  baseUrl: string
 ): ProviderModel {
-  if (model.thinkingCapability?.source === 'manual') {
-    return {
-      ...model,
-      thinkingCapability: {
-        ...model.thinkingCapability,
-        supportsOff: protocolSupportsThinkingOff(model.id, protocol)
-      }
-    }
-  }
-  const levels = inferThinkingLevels(model.id, protocol)
+  // Wire capabilities belong to the selected protocol and endpoint.
+  const levels = inferThinkingLevels(model.id, protocol, baseUrl)
   return {
     ...model,
     thinkingEnabled: model.thinkingEnabled ?? true,
     thinkingLevels: levels,
-    thinkingCapability: inferredThinkingCapability(model.id, protocol) ?? undefined,
+    thinkingCapability: inferredThinkingCapability(model.id, protocol, baseUrl) ?? undefined,
     thinkingDefault: defaultThinkingLevel(levels)
   }
 }
@@ -950,12 +938,15 @@ export function SettingsApp(): JSX.Element {
     const currentBase = provider.baseUrl.trim().replace(/\/+$/u, '')
     const replaceBase =
       currentBase === '' || currentBase === providerProtocolOption(previous).defaultBaseUrl
-    changeProvider(provider.id, (current) => ({
-      ...current,
-      protocol: next,
-      baseUrl: replaceBase ? providerProtocolOption(next).defaultBaseUrl : current.baseUrl,
-      models: current.models.map((model) => reseedModelThinking(model, next))
-    }))
+    changeProvider(provider.id, (current) => {
+      const baseUrl = replaceBase ? providerProtocolOption(next).defaultBaseUrl : current.baseUrl
+      return {
+        ...current,
+        protocol: next,
+        baseUrl,
+        models: current.models.map((model) => reseedModelThinking(model, next, baseUrl))
+      }
+    })
   }
 
   const deleteProvider = (provider: PublicProviderSettings): void => {
@@ -1183,7 +1174,7 @@ export function SettingsApp(): JSX.Element {
     }
     changeProvider(provider.id, (current) => {
       const protocol = providerProtocol(current)
-      const levels = inferThinkingLevels(id, protocol)
+      const levels = inferThinkingLevels(id, protocol, current.baseUrl)
       return {
         ...current,
         models: [
@@ -1192,7 +1183,7 @@ export function SettingsApp(): JSX.Element {
             id,
             name: id,
             thinkingLevels: levels,
-            thinkingCapability: inferredThinkingCapability(id, protocol) ?? undefined,
+            thinkingCapability: inferredThinkingCapability(id, protocol, current.baseUrl) ?? undefined,
             thinkingEnabled: true,
             thinkingDefault: defaultThinkingLevel(levels)
           }
@@ -1237,11 +1228,20 @@ export function SettingsApp(): JSX.Element {
       } else {
         candidate = base as ActionDefinition
       }
+      const thinkingModel = value.thinkingModel
       const action = actionDefinitionSchema.parse(candidate)
       const actions = existing
         ? current.actions.map((item) => (item.id === existing.id ? action : item))
         : [...current.actions, action]
-      return { ...current, actions: sortAndNumberActions(actions) }
+      return {
+        ...current,
+        actions: sortAndNumberActions(actions),
+        providers: thinkingModel
+          ? current.providers.map((provider) => provider.id === value.providerId
+            ? { ...provider, models: provider.models.map((model) => model.id === value.modelId ? thinkingModel : model) }
+            : provider)
+          : current.providers
+      }
     })
     setEditor(null)
   }
@@ -1683,14 +1683,7 @@ export function SettingsApp(): JSX.Element {
                           <SortableModelRow
                             key={model.id}
                             model={model}
-                            protocol={providerProtocol(provider)}
                             dragging={draggingModelId === model.id}
-                            onChange={(next) => changeProvider(provider.id, (current) => ({
-                              ...current,
-                              models: current.models.map((candidate) =>
-                                candidate.id === model.id ? next : candidate
-                              )
-                            }))}
                             onRemove={() => changeDraft((current) =>
                               removeProviderModelFromSettings(current, provider.id, model.id)
                             )}
@@ -2313,11 +2306,9 @@ function ActionZone({ title, count, actions, enabled, draggingId, fieldError, on
 }
 
 
-function SortableModelRow({ model, protocol, dragging, onChange, onRemove }: {
+function SortableModelRow({ model, dragging, onRemove }: {
   model: ProviderModel
-  protocol: ProviderProtocol
   dragging: boolean
-  onChange: (model: ProviderModel) => void
   onRemove: () => void
 }): JSX.Element {
   const {
@@ -2329,54 +2320,11 @@ function SortableModelRow({ model, protocol, dragging, onChange, onRemove }: {
     transform,
     transition
   } = useSortable({ id: model.id })
-  const [expanded, setExpanded] = useState(false)
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition
   }
   const showId = model.name !== model.id
-  const levels = model.thinkingLevels ?? []
-  const thinkingEnabled = model.thinkingEnabled !== false
-  const supportsOff =
-    model.thinkingCapability?.supportsOff ?? protocolSupportsThinkingOff(model.id, protocol)
-  const defaultLevel = model.thinkingDefault ?? defaultThinkingLevel(levels)
-  const openAiDialect = protocol === 'openAiChat' || protocol === 'openAiResponses'
-
-  const setLevels = (nextLevels: ThinkingLevel[]): void => {
-    const capability = {
-      source: 'manual' as const,
-      dialect: model.thinkingCapability?.dialect
-        ?? (openAiDialect ? ('reasoningEffort' as const) : null),
-      supportsOff
-    }
-    onChange({
-      ...model,
-      thinkingLevels: nextLevels,
-      thinkingCapability: nextLevels.length > 0 ? capability : undefined,
-      thinkingDefault:
-        model.thinkingDefault && nextLevels.includes(model.thinkingDefault)
-          ? model.thinkingDefault
-          : defaultThinkingLevel(nextLevels)
-    })
-  }
-
-  const autoDetect = (): void => {
-    const nextLevels = inferThinkingLevels(model.id, protocol)
-    onChange({
-      ...model,
-      thinkingEnabled: true,
-      thinkingLevels: nextLevels,
-      thinkingCapability: inferredThinkingCapability(model.id, protocol) ?? undefined,
-      thinkingDefault: defaultThinkingLevel(nextLevels)
-    })
-  }
-
-  const summary = !thinkingEnabled
-    ? supportsOff ? '不启用思考' : '最低档思考'
-    : levels.length === 0
-      ? '未识别思考档位'
-      : `默认 ${THINKING_LEVEL_LABELS[defaultLevel ?? levels[0] ?? 'medium']} · ${levels.map((level) => THINKING_LEVEL_LABELS[level]).join('/')}`
-
   return (
     <div
       ref={setNodeRef}
@@ -2399,18 +2347,7 @@ function SortableModelRow({ model, protocol, dragging, onChange, onRemove }: {
       <div className="model-row__body">
         <span className="model-row__name">{model.name}</span>
         {showId && <span className="model-row__id">{model.id}</span>}
-        <span className="model-row__thinking-summary">{summary}</span>
       </div>
-      <button
-        type="button"
-        className="model-row__settings"
-        aria-label={`${model.name}：思考设置`}
-        aria-expanded={expanded}
-        title="思考设置"
-        onClick={() => setExpanded((current) => !current)}
-      >
-        <SlidersHorizontal size={13} />
-      </button>
       <button
         type="button"
         className="model-row__remove"
@@ -2419,61 +2356,6 @@ function SortableModelRow({ model, protocol, dragging, onChange, onRemove }: {
       >
         <X size={12} />
       </button>
-      {expanded && (
-        <div className="model-row__thinking-panel">
-          <label className="model-thinking-toggle">
-            <input
-              type="checkbox"
-              role="switch"
-              checked={thinkingEnabled}
-              onChange={(event) => onChange({ ...model, thinkingEnabled: event.target.checked })}
-            />
-            启用思考
-          </label>
-          <label className="model-thinking-default">
-            默认强度
-            <select
-              className="control compact-control"
-              value={defaultLevel ?? ''}
-              disabled={!thinkingEnabled || levels.length === 0}
-              onChange={(event) => onChange({
-                ...model,
-                thinkingDefault: event.target.value as ThinkingLevel
-              })}
-            >
-              {levels.map((level) => (
-                <option value={level} key={level}>{THINKING_LEVEL_LABELS[level]}</option>
-              ))}
-            </select>
-          </label>
-          <div className="thinking-level-chips" role="group" aria-label="可用思考档位">
-            {THINKING_LEVELS.map((level) => (
-              <label className="thinking-chip" key={level}>
-                <input
-                  type="checkbox"
-                  checked={levels.includes(level)}
-                  onChange={() => setLevels(
-                    THINKING_LEVELS.filter((candidate) =>
-                      candidate === level
-                        ? !levels.includes(level)
-                        : levels.includes(candidate)
-                    )
-                  )}
-                />
-                {THINKING_LEVEL_LABELS[level]}
-              </label>
-            ))}
-          </div>
-          <div className="model-thinking-actions">
-            <button className="button button--quiet" type="button" onClick={autoDetect}>
-              <RefreshCw size={12} />重新自动识别
-            </button>
-            {!supportsOff && (
-              <span className="model-thinking-hint">该模型无法完全关闭思考，关闭时使用最低预算。</span>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   )
 }

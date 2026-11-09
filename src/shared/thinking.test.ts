@@ -1,7 +1,10 @@
+import thinkingFixtures from './__tests__/fixtures/thinking-protocols.json'
+import type { ProviderProtocol } from './constants'
 // src/shared/thinking.test.ts
 import { describe, expect, it } from 'vitest'
 import {
   clampThinkingMode,
+  detectModelThinking,
   defaultThinkingLevel,
   effectiveThinkingLevels,
   inferredThinkingCapability,
@@ -12,6 +15,17 @@ import {
 } from './thinking'
 
 describe('inferThinkingLevels', () => {
+  it('excludes every non-reasoning name variant across protocols', () => {
+    for (const marker of ['non-reasoning', 'non reasoning', 'nonreasoning', 'non-thinking', 'non thinking', 'nonthinking']) {
+      for (const [protocol, family] of [
+        ['openAiChat', 'qwen3'], ['openAiResponses', 'qwen3'],
+        ['anthropicMessages', 'claude-sonnet-4'], ['gemini', 'gemini-3-pro']
+      ] as const) {
+        expect(detectModelThinking(`${family}-${marker}`, protocol)).toEqual({ levels: [], capability: null })
+      }
+    }
+  })
+
   it('returns empty for ordinary chat models', () => {
     expect(inferThinkingLevels('gpt-4o-mini')).toEqual([])
     expect(inferThinkingLevels('qwen-plus')).toEqual([])
@@ -22,32 +36,18 @@ describe('inferThinkingLevels', () => {
     expect(inferThinkingLevels('o1')).toEqual(['low', 'medium', 'high'])
     expect(inferThinkingLevels('gpt-5')).toContain('medium')
     expect(inferThinkingLevels('gpt-5.1-codex')).toEqual([
-      'minimal',
       'low',
       'medium',
-      'high',
-      'xhigh'
+      'high'
     ])
-    expect(inferThinkingLevels('gpt6-luna')).toEqual([
-      'minimal',
-      'low',
-      'medium',
-      'high',
-      'xhigh'
-    ])
-    expect(inferThinkingLevels('openai/gpt-6-luna')).toEqual([
-      'minimal',
-      'low',
-      'medium',
-      'high',
-      'xhigh'
-    ])
+    expect(inferThinkingLevels('gpt6-luna')).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+    expect(inferThinkingLevels('openai/gpt-6-luna')).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
     expect(inferThinkingLevels('gpt-oss-120b')).toEqual(['low', 'medium', 'high'])
   })
 
   it('detects qwen3 thinking and Claude extended patterns', () => {
     expect(inferThinkingLevels('deepseek-r1')).toEqual([])
-    expect(inferThinkingLevels('qwen3-235b-a22b')).toEqual(['low', 'medium', 'high'])
+    expect(inferThinkingLevels('qwen3-235b-a22b')).toEqual(['medium'])
     expect(inferThinkingLevels('claude-opus-4-thinking')).toContain('high')
   })
 
@@ -85,11 +85,11 @@ describe('inferThinkingLevels', () => {
   })
 
   it('detects other vendor reasoning families by version', () => {
-    expect(inferThinkingLevels('glm-4.6')).toEqual(['low', 'medium', 'high'])
-    expect(inferThinkingLevels('glm-z1-air')).toEqual(['low', 'medium', 'high'])
-    expect(inferThinkingLevels('kimi-k3')).toEqual(['low', 'medium', 'high'])
+    expect(inferThinkingLevels('glm-4.6')).toEqual(['medium'])
+    expect(inferThinkingLevels('glm-z1-air')).toEqual(['medium'])
+    expect(inferThinkingLevels('kimi-k3')).toEqual(['medium'])
     expect(inferThinkingLevels('grok-4-fast')).toEqual(['low', 'medium', 'high'])
-    expect(inferThinkingLevels('magistral-medium-2506')).toEqual(['low', 'medium', 'high'])
+    expect(inferThinkingLevels('magistral-medium-2506')).toEqual([])
   })
 
   it('does not mistake dates or older versions for thinking models', () => {
@@ -97,7 +97,7 @@ describe('inferThinkingLevels', () => {
     expect(inferThinkingLevels('qwen2.5-72b-instruct')).toEqual([])
     expect(inferThinkingLevels('glm-4-plus')).toEqual([])
     expect(inferThinkingLevels('grok-3')).toEqual([])
-    expect(inferThinkingLevels('deepseek-v3')).toEqual([])
+    expect(inferThinkingLevels('deepseek-v3')).toEqual(['medium'])
     expect(inferThinkingLevels('gpt-4.1')).toEqual([])
     expect(inferThinkingLevels('chatgpt-4o-latest')).toEqual([])
   })
@@ -121,13 +121,13 @@ describe('thinking defaults and protocol capability', () => {
   it('marks Gemini Pro as unable to fully disable thinking', () => {
     expect(protocolSupportsThinkingOff('gemini-2.5-pro', 'gemini')).toBe(false)
     expect(protocolSupportsThinkingOff('gemini-2.5-flash', 'gemini')).toBe(true)
-    expect(protocolSupportsThinkingOff('o3-mini', 'openAiChat')).toBe(true)
+    expect(protocolSupportsThinkingOff('o3-mini', 'openAiChat')).toBe(false)
   })
 
   it('builds heuristic capability with the right dialect', () => {
     expect(inferredThinkingCapability('qwen3-235b-a22b', 'openAiChat')).toMatchObject({
       source: 'heuristic',
-      dialect: 'enableThinking'
+      dialect: 'chatTemplateKwargs'
     })
     expect(inferredThinkingCapability('o3-mini', 'openAiChat')).toMatchObject({
       source: 'heuristic',
@@ -140,7 +140,7 @@ describe('thinking defaults and protocol capability', () => {
     })
     expect(inferredThinkingCapability('glm-4.6', 'openAiChat')).toMatchObject({
       source: 'heuristic',
-      dialect: 'reasoningEffort'
+      dialect: 'thinkingToggle'
     })
     expect(inferredThinkingCapability('claude-sonnet-4-5', 'openAiChat')).toMatchObject({
       source: 'heuristic',
@@ -195,5 +195,15 @@ describe('modelSupportsThinkingOff', () => {
   it('is true whenever thinking levels exist', () => {
     expect(modelSupportsThinkingOff(['low', 'medium'])).toBe(true)
     expect(modelSupportsThinkingOff([])).toBe(false)
+  })
+})
+
+// Shared with Rust: the picker must offer exactly the gears the request layer sends.
+describe('thinking protocol parity', () => {
+  it.each(thinkingFixtures)('$protocol $modelId $mode', (fixture) => {
+    expect(detectModelThinking(fixture.modelId, fixture.protocol as ProviderProtocol, fixture.baseUrl)).toEqual({
+      levels: fixture.levels,
+      capability: { source: 'heuristic', dialect: fixture.dialect, supportsOff: fixture.supportsOff }
+    })
   })
 })

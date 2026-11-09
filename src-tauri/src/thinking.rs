@@ -26,6 +26,8 @@ pub enum ThinkingBodyControl {
     ReasoningEffort(String),
     EnableThinking(bool),
     ChatTemplateKwargs(bool),
+    ThinkingToggle(bool),
+    OpenRouterReasoning(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +43,7 @@ pub struct AppliedThinkingControl {
 /// pass the original attempt number and content/cancellation state.
 pub fn should_fallback_without_control(
     applied: &AppliedThinkingControl,
-    mode: ThinkingMode,
+    _mode: ThinkingMode,
     attempt: u8,
     _status: Option<u16>,
     provider_error: Option<&ProviderErrorEnvelope>,
@@ -49,7 +51,6 @@ pub fn should_fallback_without_control(
     cancelled: bool,
 ) -> bool {
     applied.source == ThinkingCapabilitySource::Heuristic
-        && mode == ThinkingMode::Off
         && attempt == 1
         && !content_seen
         && !cancelled
@@ -125,7 +126,8 @@ pub fn parse_level_str(raw: &str) -> Option<ThinkingLevel> {
         "low" => Some(ThinkingLevel::Low),
         "medium" => Some(ThinkingLevel::Medium),
         "high" => Some(ThinkingLevel::High),
-        "xhigh" | "x-high" | "extra_high" | "extra-high" | "max" => Some(ThinkingLevel::Xhigh),
+        "xhigh" | "x-high" | "extra_high" | "extra-high" => Some(ThinkingLevel::Xhigh),
+        "max" => Some(ThinkingLevel::Max),
         _ => None,
     }
 }
@@ -137,7 +139,9 @@ pub fn extract_thinking_capability_from_api_item(
 ) -> Option<DetectedThinkingCapability> {
     let supported_parameters = item.get("supported_parameters");
     let nested_options = item.pointer("/reasoning/effort_options");
-    let root_options = item.get("reasoning_effort_options");
+    let root_options = item
+        .get("reasoning_effort_options")
+        .or_else(|| item.get("supported_reasoning_efforts"));
     let has_support_flag = has_explicit_support_flag(item);
     if supported_parameters.is_none()
         && nested_options.is_none()
@@ -164,7 +168,12 @@ pub fn extract_thinking_capability_from_api_item(
     let options = nested_options
         .and_then(Value::as_array)
         .or_else(|| root_options.and_then(Value::as_array));
-    if parameters.iter().any(|value| value == "reasoning_effort") || options.is_some() {
+    let nested_effort = parameters
+        .iter()
+        .any(|value| value == "reasoning" || value == "reasoning.effort");
+    if parameters.iter().any(|value| value == "reasoning_effort")
+        || (options.is_some() && !nested_effort)
+    {
         add_dialect(ThinkingDialect::ReasoningEffort);
     }
     if parameters.iter().any(|value| value == "enable_thinking") {
@@ -179,10 +188,24 @@ pub fn extract_thinking_capability_from_api_item(
         add_dialect(ThinkingDialect::ChatTemplateKwargs);
     }
 
+    if parameters
+        .iter()
+        .any(|value| value == "thinking" || value == "thinking.type")
+    {
+        add_dialect(ThinkingDialect::ThinkingToggle);
+    }
+    if nested_effort && !parameters.iter().any(|value| value == "reasoning_effort") {
+        add_dialect(ThinkingDialect::OpenRouterReasoning);
+    }
+
     let mut levels = Vec::new();
     let mut supports_off = false;
     if let Some(options) = options {
-        for raw in options.iter().filter_map(Value::as_str) {
+        for raw in options.iter().filter_map(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("effort").and_then(Value::as_str))
+        }) {
             let normalized = raw.trim().to_ascii_lowercase();
             if normalized == "none" {
                 supports_off = true;
@@ -192,7 +215,9 @@ pub fn extract_thinking_capability_from_api_item(
                 }
             }
         }
-    } else if dialects == [ThinkingDialect::ReasoningEffort] {
+    } else if dialects == [ThinkingDialect::ReasoningEffort]
+        || dialects == [ThinkingDialect::OpenRouterReasoning]
+    {
         levels = standard_levels();
     }
 
@@ -204,11 +229,15 @@ pub fn extract_thinking_capability_from_api_item(
     let dialect = (!explicitly_unsupported && dialects.len() == 1).then(|| dialects[0]);
     if matches!(
         dialect,
-        Some(ThinkingDialect::EnableThinking | ThinkingDialect::ChatTemplateKwargs)
+        Some(
+            ThinkingDialect::EnableThinking
+                | ThinkingDialect::ChatTemplateKwargs
+                | ThinkingDialect::ThinkingToggle
+        )
     ) {
         supports_off = true;
         if levels.is_empty() {
-            levels = standard_levels();
+            levels = vec![ThinkingLevel::Medium];
         }
     }
 
@@ -391,7 +420,7 @@ fn is_reasoning_glm(id: &str) -> bool {
 }
 
 fn is_reasoning_kimi(id: &str) -> bool {
-    family_version(id, "kimi").is_some_and(|(major, _)| major >= 3)
+    family_version(id, "kimi").is_some_and(|(major, _)| major >= 2)
 }
 
 fn is_reasoning_grok(id: &str) -> bool {
@@ -405,6 +434,9 @@ fn detect_openai_family(id: &str) -> Option<ThinkingFamily> {
     }
     if id.contains("gpt-oss") {
         return Some(ThinkingFamily::GptOss);
+    }
+    if id.contains("chat") && family_version(id, "gpt").is_some() {
+        return None;
     }
     if family_version(id, "gpt").is_some_and(|(major, _)| major >= 5) {
         return Some(ThinkingFamily::Gpt);
@@ -442,53 +474,170 @@ fn detect_openai_family(id: &str) -> Option<ThinkingFamily> {
     None
 }
 
-/// Infer capability from model id only when provider metadata is silent.
+/// Infer a wire dialect from both the model family and endpoint, as in Myna.
+#[cfg(test)]
 pub fn infer_thinking_capability(model_id: &str) -> Option<DetectedThinkingCapability> {
-    let id = model_id.trim().to_ascii_lowercase();
-    let family = detect_openai_family(&id)?;
-    if family == ThinkingFamily::DeepSeekReasoner {
-        return Some(detected_from_family(family, None, false));
-    }
-    Some(detected_from_family(
-        family,
-        Some(family.openai_dialect()),
-        true,
-    ))
+    infer_endpoint_thinking_capability(ProviderProtocol::OpenAiChat, model_id, "")
 }
 
-/// Protocol-aware inference used when the provider model list carries no
-/// OpenAI-style thinking metadata.
 pub fn infer_protocol_thinking_capability(
     protocol: ProviderProtocol,
     model_id: &str,
 ) -> Option<DetectedThinkingCapability> {
+    infer_endpoint_thinking_capability(protocol, model_id, "")
+}
+
+pub fn infer_endpoint_thinking_capability(
+    protocol: ProviderProtocol,
+    model_id: &str,
+    base_url: &str,
+) -> Option<DetectedThinkingCapability> {
+    use ThinkingDialect::*;
+    use ThinkingLevel::*;
     let id = model_id.trim().to_ascii_lowercase();
-    if id.is_empty() {
+    if [
+        "non-reasoning",
+        "non reasoning",
+        "nonreasoning",
+        "non-thinking",
+        "non thinking",
+        "nonthinking",
+    ]
+    .iter()
+    .any(|marker| id.contains(marker))
+    {
         return None;
     }
-    match protocol {
-        ProviderProtocol::OpenAiChat | ProviderProtocol::OpenAiResponses => {
-            infer_thinking_capability(&id)
+    if protocol == ProviderProtocol::AnthropicMessages {
+        return is_reasoning_claude(&id)
+            .then(|| detected_from_family(ThinkingFamily::Claude, None, true));
+    }
+    if protocol == ProviderProtocol::Gemini {
+        if !is_reasoning_gemini(&id) {
+            return None;
         }
-        ProviderProtocol::AnthropicMessages => {
-            is_reasoning_claude(&id).then(|| {
-                // Omitting the thinking block keeps Claude in its default
-                // non-thinking mode, so off is always representable.
-                detected_from_family(ThinkingFamily::Claude, None, true)
-            })
+        if id.contains("gemini-2.0-flash-thinking") || id.contains("thinking-exp") {
+            let mut detected = detected_from_family(ThinkingFamily::Gemini, None, false);
+            detected.levels.clear();
+            return Some(detected);
         }
-        ProviderProtocol::Gemini => {
-            is_reasoning_gemini(&id).then(|| {
-                // Gemini Pro has a minimum thinking budget and cannot truly
-                // disable reasoning; Flash accepts a zero budget.
-                detected_from_family(
-                    ThinkingFamily::Gemini,
-                    None,
-                    !(id.contains("pro") && !id.contains("flash")),
-                )
-            })
+        let mut detected = detected_from_family(
+            ThinkingFamily::Gemini,
+            None,
+            !(id.contains("pro") && !id.contains("flash")),
+        );
+        if family_version(&id, "gemini").is_some_and(|(major, _)| major >= 3) {
+            detected.capability.dialect = Some(GeminiLevel);
+            detected.capability.supports_off = false;
+            detected.levels = if id.contains("flash") {
+                vec![Minimal, Low, Medium, High]
+            } else {
+                vec![Low, High]
+            };
+        }
+        return Some(detected);
+    }
+    let deepseek = family_version(&id, "deepseek");
+    let family = detect_openai_family(&id).or_else(|| {
+        if deepseek.is_some_and(|(major, _)| major == 3) {
+            Some(ThinkingFamily::Generic)
+        } else if id.contains("kimi") && (id.contains("k2") || id.contains("2.")) {
+            Some(ThinkingFamily::Kimi)
+        } else {
+            None
+        }
+    })?;
+    let mut detected = detected_from_family(family, Some(family.openai_dialect()), true);
+    if family == ThinkingFamily::Gpt {
+        let (major, minor) = family_version(&id, "gpt")?;
+        if major >= 6 {
+            detected.levels = vec![Low, Medium, High, Xhigh, Max];
+            detected.capability.supports_off =
+                !(id.contains("astra") || (minor == 1 && id.contains("sol")));
+        } else if minor >= 2 {
+            detected.levels = if id.contains("pro") {
+                vec![Medium, High, Xhigh]
+            } else {
+                vec![Low, Medium, High, Xhigh]
+            };
+            detected.capability.supports_off = !id.contains("pro");
+        } else {
+            detected.levels = if id.contains("codex") {
+                standard_levels()
+            } else if minor == 0 {
+                vec![Minimal, Low, Medium, High]
+            } else {
+                standard_levels()
+            };
+            detected.capability.supports_off = minor >= 1;
         }
     }
+    if matches!(
+        family,
+        ThinkingFamily::OSeries | ThinkingFamily::GptOss | ThinkingFamily::Grok
+    ) {
+        detected.capability.supports_off = false;
+    }
+    let base_id = id.rsplit('/').next().unwrap_or(&id);
+    if family == ThinkingFamily::OSeries
+        && (base_id.starts_with("o1-mini") || base_id.starts_with("o1-preview"))
+    {
+        detected.levels.clear();
+        detected.capability.dialect = None;
+    }
+    if family == ThinkingFamily::Qwen {
+        if family_version(&id, "qwen").is_some_and(|(major, minor)| major == 3 && minor >= 8) {
+            detected.levels = vec![Low, Medium, Xhigh];
+            detected.capability.dialect = Some(ReasoningEffort);
+        } else {
+            let host = url::Url::parse(base_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_default();
+            detected.capability.dialect = Some(
+                if host == "dashscope.aliyuncs.com" || host.ends_with(".dashscope.aliyuncs.com") {
+                    EnableThinking
+                } else {
+                    ChatTemplateKwargs
+                },
+            );
+            detected.levels = vec![Medium];
+        }
+    }
+    if family == ThinkingFamily::Glm {
+        if family_version(&id, "glm")
+            .is_some_and(|(major, minor)| major > 5 || (major == 5 && minor >= 1))
+        {
+            detected.levels = vec![Low, Medium, High, Xhigh];
+        } else {
+            detected.capability.dialect = Some(ThinkingToggle);
+            detected.levels = vec![Medium];
+        }
+    }
+    if family == ThinkingFamily::Kimi || deepseek.is_some_and(|(major, _)| major == 3) {
+        detected.capability.dialect = Some(ThinkingToggle);
+        detected.levels = vec![Medium];
+    }
+    if matches!(
+        family,
+        ThinkingFamily::DeepSeekReasoner | ThinkingFamily::Magistral
+    ) || (family == ThinkingFamily::Generic && !deepseek.is_some_and(|(major, _)| major == 3))
+        || (family == ThinkingFamily::Kimi && id.contains("thinking"))
+    {
+        detected.levels.clear();
+        detected.capability.dialect = None;
+        detected.capability.supports_off = false;
+    }
+    if url::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .as_deref()
+        == Some("openrouter.ai")
+        && !detected.levels.is_empty()
+    {
+        detected.capability.dialect = Some(OpenRouterReasoning);
+    }
+    Some(detected)
 }
 
 fn openai_full_levels() -> Vec<ThinkingLevel> {
@@ -562,6 +711,7 @@ fn level_api_str(level: ThinkingLevel) -> &'static str {
         ThinkingLevel::Medium => "medium",
         ThinkingLevel::High => "high",
         ThinkingLevel::Xhigh => "xhigh",
+        ThinkingLevel::Max => "max",
     }
 }
 
@@ -570,21 +720,22 @@ fn level_api_str_for(dialect: ThinkingDialect, level: ThinkingLevel) -> &'static
         ThinkingDialect::ReasoningEffortMax => match level {
             ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
             ThinkingLevel::Medium | ThinkingLevel::High => "high",
-            ThinkingLevel::Xhigh => "max",
+            ThinkingLevel::Xhigh | ThinkingLevel::Max => "max",
         },
         ThinkingDialect::ReasoningEffort
         | ThinkingDialect::EnableThinking
-        | ThinkingDialect::ChatTemplateKwargs => level_api_str(level),
+        | ThinkingDialect::ChatTemplateKwargs
+        | ThinkingDialect::ThinkingToggle
+        | ThinkingDialect::OpenRouterReasoning
+        | ThinkingDialect::GeminiLevel => level_api_str(level),
     }
 }
 
 pub fn resolve_body_control(plan: &ThinkingRequestPlan) -> Option<ThinkingBodyControl> {
     let capability = plan.capability.as_ref()?;
-    // Manual level edits may leave the dialect unset; Chat Completions still
-    // needs a concrete field, and reasoning_effort is the safest default.
-    let dialect = capability
-        .dialect
-        .unwrap_or(ThinkingDialect::ReasoningEffort);
+    // A fixed reasoning model or explicit unsupported metadata has no dialect.
+    // Never invent an effort parameter for those models.
+    let dialect = capability.dialect?;
     let mode = plan.mode;
     if mode == ThinkingMode::Auto {
         return None;
@@ -599,6 +750,11 @@ pub fn resolve_body_control(plan: &ThinkingRequestPlan) -> Option<ThinkingBodyCo
             }
             ThinkingDialect::EnableThinking => ThinkingBodyControl::EnableThinking(false),
             ThinkingDialect::ChatTemplateKwargs => ThinkingBodyControl::ChatTemplateKwargs(false),
+            ThinkingDialect::ThinkingToggle => ThinkingBodyControl::ThinkingToggle(false),
+            ThinkingDialect::OpenRouterReasoning => {
+                ThinkingBodyControl::OpenRouterReasoning("none".to_owned())
+            }
+            ThinkingDialect::GeminiLevel => return None,
         });
     }
 
@@ -610,6 +766,11 @@ pub fn resolve_body_control(plan: &ThinkingRequestPlan) -> Option<ThinkingBodyCo
         }
         ThinkingDialect::EnableThinking => ThinkingBodyControl::EnableThinking(true),
         ThinkingDialect::ChatTemplateKwargs => ThinkingBodyControl::ChatTemplateKwargs(true),
+        ThinkingDialect::ThinkingToggle => ThinkingBodyControl::ThinkingToggle(true),
+        ThinkingDialect::OpenRouterReasoning => {
+            ThinkingBodyControl::OpenRouterReasoning(level_api_str(mode.as_level()?).to_owned())
+        }
+        ThinkingDialect::GeminiLevel => return None,
     })
 }
 
@@ -619,6 +780,9 @@ pub fn apply_thinking_to_body(
     plan: &ThinkingRequestPlan,
 ) -> Option<AppliedThinkingControl> {
     let capability = plan.capability.as_ref()?;
+    if plan.levels.is_empty() && capability.dialect.is_none() && !capability.supports_off {
+        return None;
+    }
     if plan.mode == ThinkingMode::Auto {
         return None;
     }
@@ -636,6 +800,18 @@ pub fn apply_thinking_to_body(
                         .insert("enable_thinking".to_owned(), json!(value));
                     "enable_thinking"
                 }
+                ThinkingBodyControl::ThinkingToggle(value) => {
+                    body.as_object_mut()?.insert(
+                        "thinking".to_owned(),
+                        json!({"type": if value {"enabled"} else {"disabled"}}),
+                    );
+                    "thinking"
+                }
+                ThinkingBodyControl::OpenRouterReasoning(value) => {
+                    body.as_object_mut()?
+                        .insert("reasoning".to_owned(), json!({"effort": value}));
+                    "reasoning.effort"
+                }
                 ThinkingBodyControl::ChatTemplateKwargs(value) => {
                     body.as_object_mut()?.insert(
                         "chat_template_kwargs".to_owned(),
@@ -647,6 +823,17 @@ pub fn apply_thinking_to_body(
             field_path
         }
         ProviderProtocol::OpenAiResponses => {
+            if matches!(
+                capability.dialect,
+                Some(
+                    ThinkingDialect::EnableThinking
+                        | ThinkingDialect::ChatTemplateKwargs
+                        | ThinkingDialect::ThinkingToggle
+                )
+            ) {
+                return apply_thinking_to_body(ProviderProtocol::OpenAiChat, body, plan);
+            }
+            capability.dialect?;
             let reasoning = if plan.mode == ThinkingMode::Off {
                 if !capability.supports_off {
                     return None;
@@ -682,6 +869,25 @@ pub fn apply_thinking_to_body(
             "thinking"
         }
         ProviderProtocol::Gemini => {
+            if capability.dialect == Some(ThinkingDialect::GeminiLevel) {
+                let level = if plan.mode == ThinkingMode::Off {
+                    plan.levels.iter().min().copied()?
+                } else {
+                    plan.mode.as_level()?
+                };
+                let generation = body
+                    .as_object_mut()?
+                    .entry("generationConfig")
+                    .or_insert_with(|| json!({}));
+                generation.as_object_mut()?.insert(
+                    "thinkingConfig".to_owned(),
+                    json!({"thinkingLevel": level_api_str(level), "includeThoughts": plan.mode != ThinkingMode::Off}),
+                );
+                return Some(AppliedThinkingControl {
+                    field_path: "generationConfig.thinkingConfig.thinkingLevel",
+                    source,
+                });
+            }
             let (budget, include_thoughts) = if plan.mode == ThinkingMode::Off {
                 if capability.supports_off {
                     (0, false)
@@ -718,7 +924,7 @@ fn anthropic_budget(level: ThinkingLevel, max_tokens: u64) -> u64 {
         ThinkingLevel::Minimal | ThinkingLevel::Low => 1024,
         ThinkingLevel::Medium => 2048,
         ThinkingLevel::High => 4096,
-        ThinkingLevel::Xhigh => 7168,
+        ThinkingLevel::Xhigh | ThinkingLevel::Max => 7168,
     };
     requested.min(cap)
 }
@@ -731,53 +937,124 @@ fn gemini_budget(level: ThinkingLevel) -> u64 {
         ThinkingLevel::Low => 1024,
         ThinkingLevel::Medium => 4096,
         ThinkingLevel::High => 16384,
-        ThinkingLevel::Xhigh => 24576,
+        ThinkingLevel::Xhigh | ThinkingLevel::Max => 24576,
     }
 }
 
+#[cfg(test)]
 pub fn resolve_thinking_for_request(
     protocol: ProviderProtocol,
     model_id: &str,
-    thinking_enabled: bool,
+    _thinking_enabled: bool,
     thinking_default: Option<ThinkingLevel>,
     model_levels: &[ThinkingLevel],
     capability: Option<&ThinkingCapability>,
     mode: ThinkingMode,
 ) -> ThinkingRequestPlan {
-    let inferred = if capability.is_none() {
-        infer_protocol_thinking_capability(protocol, model_id)
-    } else {
-        None
-    };
-    let levels = if model_levels.is_empty() {
-        inferred
-            .as_ref()
-            .map(|value| value.levels.clone())
-            .unwrap_or_default()
+    resolve_thinking_for_endpoint(
+        protocol,
+        model_id,
+        "",
+        thinking_default,
+        model_levels,
+        capability,
+        mode,
+    )
+}
+
+pub fn resolve_thinking_for_endpoint(
+    protocol: ProviderProtocol,
+    model_id: &str,
+    base_url: &str,
+    thinking_default: Option<ThinkingLevel>,
+    model_levels: &[ThinkingLevel],
+    capability: Option<&ThinkingCapability>,
+    mode: ThinkingMode,
+) -> ThinkingRequestPlan {
+    let inferred =
+        if capability.is_none_or(|value| value.source == ThinkingCapabilitySource::Heuristic) {
+            infer_endpoint_thinking_capability(protocol, model_id, base_url)
+        } else {
+            None
+        };
+    let levels = if capability.is_some_and(|c| c.source != ThinkingCapabilitySource::Heuristic) {
+        model_levels.to_vec()
+    } else if let Some(detected) = &inferred {
+        detected.levels.clone()
     } else {
         model_levels.to_vec()
     };
-    let capability = capability
-        .cloned()
-        .or_else(|| inferred.map(|value| value.capability))
-        .or_else(|| manual_capability(protocol, model_id, &levels));
-    let mode = if !thinking_enabled {
-        ThinkingMode::Off
+    let capability = inferred
+        .map(|value| value.capability)
+        .or_else(|| capability.cloned())
+        .or_else(|| manual_capability(protocol, model_id, &levels))
+        .map(|mut capability| {
+            // Legacy manual level lists used the OpenAI effort field before
+            // dialect metadata existed. Preserve that behavior without guessing
+            // controls for explicit unsupported or fixed-reasoning evidence.
+            if capability.source == ThinkingCapabilitySource::Manual
+                && capability.dialect.is_none()
+                && !levels.is_empty()
+                && matches!(
+                    protocol,
+                    ProviderProtocol::OpenAiChat | ProviderProtocol::OpenAiResponses
+                )
+            {
+                capability.dialect = Some(ThinkingDialect::ReasoningEffort);
+            }
+            capability
+        });
+    let mode = if capability.as_ref().is_some_and(is_toggle_capability) && mode != ThinkingMode::Off
+    {
+        ThinkingMode::Medium
     } else {
+        mode
+    };
+    let mode = {
         match mode {
             ThinkingMode::Auto => thinking_default
                 .filter(|level| levels.contains(level))
                 .or_else(|| default_level(&levels))
                 .map(ThinkingMode::from_level)
                 .unwrap_or(ThinkingMode::Off),
+            ThinkingMode::Minimal
+                if !levels.contains(&ThinkingLevel::Minimal)
+                    && levels.contains(&ThinkingLevel::Low) =>
+            {
+                ThinkingMode::Low
+            }
             mode => clamp_thinking_mode(mode, &levels),
         }
+    };
+    let mode = if mode == ThinkingMode::Off
+        && capability.as_ref().is_some_and(|c| !c.supports_off)
+        && protocol != ProviderProtocol::Gemini
+    {
+        levels
+            .iter()
+            .min()
+            .copied()
+            .map(ThinkingMode::from_level)
+            .unwrap_or(mode)
+    } else {
+        mode
     };
     ThinkingRequestPlan {
         capability,
         levels,
         mode,
     }
+}
+
+pub fn is_toggle_capability(capability: &ThinkingCapability) -> bool {
+    matches!(
+        capability.dialect,
+        Some(
+            ThinkingDialect::EnableThinking
+                | ThinkingDialect::ChatTemplateKwargs
+                | ThinkingDialect::ThinkingToggle
+        )
+    )
 }
 
 fn default_level(levels: &[ThinkingLevel]) -> Option<ThinkingLevel> {
@@ -821,6 +1098,48 @@ fn manual_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_shared_protocol_fixtures_match_inference_and_wire_body() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../src/shared/__tests__/fixtures/thinking-protocols.json"
+        ))
+        .unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let model = fixture["modelId"].as_str().unwrap();
+            let protocol: ProviderProtocol =
+                serde_json::from_value(fixture["protocol"].clone()).unwrap();
+            let base_url = fixture["baseUrl"].as_str().unwrap();
+            let detected = infer_endpoint_thinking_capability(protocol, model, base_url).unwrap();
+            assert_eq!(
+                serde_json::to_value(&detected.levels).unwrap(),
+                fixture["levels"],
+                "{model}"
+            );
+            assert_eq!(
+                serde_json::to_value(detected.capability.dialect).unwrap(),
+                fixture["dialect"],
+                "{model}"
+            );
+            assert_eq!(
+                detected.capability.supports_off,
+                fixture["supportsOff"].as_bool().unwrap(),
+                "{model}"
+            );
+            let mode: ThinkingMode = serde_json::from_value(fixture["mode"].clone()).unwrap();
+            let plan =
+                resolve_thinking_for_endpoint(protocol, model, base_url, None, &[], None, mode);
+            let mut body = json!({"model":model,"max_tokens":8192});
+            apply_thinking_to_body(protocol, &mut body, &plan);
+            for (pointer, expected) in fixture["fields"].as_object().unwrap() {
+                assert_eq!(
+                    body.pointer(pointer).unwrap_or(&Value::Null),
+                    expected,
+                    "{model} {protocol:?} {mode:?} {pointer}: {body}"
+                );
+            }
+        }
+    }
 
     fn authorized(
         applied: &AppliedThinkingControl,
@@ -912,7 +1231,7 @@ mod tests {
             false,
             false
         ));
-        assert!(!authorized(
+        assert!(authorized(
             &heuristic,
             ThinkingMode::High,
             1,
@@ -1013,6 +1332,45 @@ mod tests {
     }
 
     #[test]
+    fn gpt6_discovery_and_disabled_fallback_use_supported_values() {
+        let metadata = serde_json::json!({"supported_reasoning_efforts": [{"effort":"low"}, {"effort":"high"}, {"effort":"max"}]});
+        let found = extract_thinking_capability_from_api_item(&metadata).unwrap();
+        assert_eq!(
+            found.levels,
+            vec![ThinkingLevel::Low, ThinkingLevel::High, ThinkingLevel::Max]
+        );
+        assert!(!found.capability.supports_off);
+        let plan = resolve_thinking_for_request(
+            ProviderProtocol::OpenAiChat,
+            "gpt-6-luna",
+            false,
+            None,
+            &found.levels,
+            Some(&found.capability),
+            ThinkingMode::Off,
+        );
+        let mut body = serde_json::json!({});
+        apply_thinking_to_body(ProviderProtocol::OpenAiChat, &mut body, &plan).unwrap();
+        assert_eq!(body["reasoning_effort"], "low");
+        let stale = ThinkingCapability {
+            source: ThinkingCapabilitySource::Heuristic,
+            dialect: Some(ThinkingDialect::ReasoningEffort),
+            supports_off: true,
+        };
+        let plan = resolve_thinking_for_request(
+            ProviderProtocol::OpenAiChat,
+            "gpt-6-luna",
+            true,
+            None,
+            &[ThinkingLevel::Minimal, ThinkingLevel::Low],
+            Some(&stale),
+            ThinkingMode::Minimal,
+        );
+        assert_eq!(plan.mode, ThinkingMode::Low);
+        assert!(plan.levels.contains(&ThinkingLevel::Max));
+    }
+
+    #[test]
     fn thinking_openai_dialect_never_contains_qwen_fields() {
         let plan = ThinkingRequestPlan {
             capability: Some(ThinkingCapability {
@@ -1063,9 +1421,7 @@ mod tests {
                 ThinkingDialect::ChatTemplateKwargs => {
                     assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false)
                 }
-                ThinkingDialect::ReasoningEffort | ThinkingDialect::ReasoningEffortMax => {
-                    unreachable!()
-                }
+                _ => unreachable!(),
             }
         }
     }
@@ -1128,7 +1484,7 @@ mod tests {
                 .unwrap()
                 .capability
                 .dialect,
-            Some(ThinkingDialect::EnableThinking)
+            Some(ThinkingDialect::ChatTemplateKwargs)
         );
         assert!(infer_thinking_capability("gpt-4o-mini").is_none());
     }
@@ -1143,7 +1499,21 @@ mod tests {
         ] {
             let detected =
                 infer_protocol_thinking_capability(ProviderProtocol::OpenAiChat, id).unwrap();
-            assert_eq!(detected.levels, openai_full_levels(), "{id}");
+            if id.contains('6') {
+                assert_eq!(
+                    detected.levels,
+                    vec![
+                        ThinkingLevel::Low,
+                        ThinkingLevel::Medium,
+                        ThinkingLevel::High,
+                        ThinkingLevel::Xhigh,
+                        ThinkingLevel::Max
+                    ],
+                    "{id}"
+                );
+            } else {
+                assert_eq!(detected.levels, standard_levels(), "{id}");
+            }
             assert_eq!(
                 detected.capability.dialect,
                 Some(ThinkingDialect::ReasoningEffort),
@@ -1157,11 +1527,7 @@ mod tests {
             "anthropic/claude-3.7-sonnet",
             "gemini-2.5-pro",
             "google/gemini-3-pro",
-            "glm-4.6",
-            "glm-z1-air",
-            "kimi-k3",
             "grok-4-fast",
-            "magistral-medium-2506",
             "gpt-oss-120b",
         ] {
             let detected =
@@ -1192,7 +1558,6 @@ mod tests {
             "glm-4-plus",
             "grok-3",
             "deepseek-chat",
-            "deepseek-v3",
         ] {
             assert!(
                 infer_protocol_thinking_capability(ProviderProtocol::OpenAiChat, id).is_none(),
@@ -1254,9 +1619,41 @@ mod tests {
     }
 
     #[test]
+    fn thinking_explicit_nested_effort_options_preserve_openrouter_dialect() {
+        for parameter in ["reasoning", "reasoning.effort"] {
+            let detected = extract_thinking_capability_from_api_item(&json!({
+                "supported_parameters": [parameter],
+                "reasoning": {"effort_options": ["none", "low", "high"]}
+            }))
+            .unwrap();
+            assert_eq!(
+                detected.capability.dialect,
+                Some(ThinkingDialect::OpenRouterReasoning)
+            );
+            assert_eq!(
+                detected.levels,
+                vec![ThinkingLevel::Low, ThinkingLevel::High]
+            );
+            assert!(detected.capability.supports_off);
+            let plan = resolve_thinking_for_endpoint(
+                ProviderProtocol::OpenAiChat,
+                "unknown-model",
+                "",
+                None,
+                &detected.levels,
+                Some(&detected.capability),
+                ThinkingMode::High,
+            );
+            let mut body = json!({});
+            apply_thinking_to_body(ProviderProtocol::OpenAiChat, &mut body, &plan).unwrap();
+            assert_eq!(body["reasoning"]["effort"], "high");
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
     fn thinking_ambiguous_explicit_metadata_never_guesses_a_dialect() {
         for parameters in [
-            serde_json::json!(["reasoning"]),
             serde_json::json!(["include_reasoning"]),
             serde_json::json!(["reasoning_effort", "enable_thinking"]),
         ] {
@@ -1318,7 +1715,7 @@ mod tests {
             Some(ThinkingDialect::ReasoningEffortMax)
         );
         assert!(detected.capability.supports_off);
-        assert_eq!(parse_level_str("max"), Some(ThinkingLevel::Xhigh));
+        assert_eq!(parse_level_str("max"), Some(ThinkingLevel::Max));
 
         for (mode, expected) in [
             (ThinkingMode::Low, "low"),
@@ -1357,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_auto_mode_uses_model_default_and_model_disable_wins() {
+    fn thinking_auto_mode_uses_default_and_ignores_legacy_provider_disable() {
         let auto = resolve_thinking_for_request(
             ProviderProtocol::AnthropicMessages,
             "claude-sonnet-4-5",
@@ -1386,7 +1783,7 @@ mod tests {
             None,
             ThinkingMode::Auto,
         );
-        assert_eq!(disabled.mode, ThinkingMode::Off);
+        assert_eq!(disabled.mode, ThinkingMode::High);
 
         let no_default = resolve_thinking_for_request(
             ProviderProtocol::OpenAiChat,
@@ -1397,7 +1794,7 @@ mod tests {
             None,
             ThinkingMode::Auto,
         );
-        assert_eq!(no_default.mode, ThinkingMode::Low);
+        assert_eq!(no_default.mode, ThinkingMode::Medium);
     }
 
     #[test]
@@ -1443,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_resolution_prefers_persisted_evidence_and_legacy_levels() {
+    fn thinking_resolution_prefers_explicit_evidence_and_refreshes_legacy_levels() {
         let persisted = ThinkingCapability {
             source: ThinkingCapabilitySource::Explicit,
             dialect: None,
@@ -1460,7 +1857,7 @@ mod tests {
         );
         assert_eq!(plan.capability, Some(persisted));
         assert_eq!(plan.levels, vec![ThinkingLevel::Low]);
-        assert_eq!(plan.mode, ThinkingMode::Off);
+        assert_eq!(plan.mode, ThinkingMode::Low);
 
         let legacy = resolve_thinking_for_request(
             ProviderProtocol::OpenAiChat,
@@ -1475,8 +1872,93 @@ mod tests {
             legacy.capability.unwrap().source,
             ThinkingCapabilitySource::Heuristic
         );
-        assert_eq!(legacy.levels, vec![ThinkingLevel::High]);
+        assert_eq!(
+            legacy.levels,
+            vec![
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High
+            ]
+        );
         assert_eq!(legacy.mode, ThinkingMode::High);
+    }
+
+    #[test]
+    fn thinking_non_reasoning_variants_never_infer_controls() {
+        for marker in [
+            "non-reasoning",
+            "non reasoning",
+            "nonreasoning",
+            "non-thinking",
+            "non thinking",
+            "nonthinking",
+        ] {
+            for (protocol, family) in [
+                (ProviderProtocol::OpenAiChat, "qwen3"),
+                (ProviderProtocol::OpenAiResponses, "qwen3"),
+                (ProviderProtocol::AnthropicMessages, "claude-sonnet-4"),
+                (ProviderProtocol::Gemini, "gemini-3-pro"),
+            ] {
+                assert!(infer_endpoint_thinking_capability(
+                    protocol,
+                    &format!("{family}-{marker}"),
+                    ""
+                )
+                .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_legacy_manual_levels_keep_working_without_dialect_metadata() {
+        for protocol in [
+            ProviderProtocol::OpenAiChat,
+            ProviderProtocol::OpenAiResponses,
+        ] {
+            for source in [
+                ThinkingCapabilitySource::Manual,
+                ThinkingCapabilitySource::Explicit,
+            ] {
+                let capability = ThinkingCapability {
+                    source,
+                    dialect: None,
+                    supports_off: true,
+                };
+                for mode in [ThinkingMode::High, ThinkingMode::Off] {
+                    let plan = resolve_thinking_for_endpoint(
+                        protocol,
+                        "custom-model",
+                        "https://example.com/v1",
+                        None,
+                        &[ThinkingLevel::Low, ThinkingLevel::High],
+                        Some(&capability),
+                        mode,
+                    );
+                    let mut body = json!({"model": "custom-model"});
+                    let applied = apply_thinking_to_body(protocol, &mut body, &plan);
+                    if source == ThinkingCapabilitySource::Explicit {
+                        assert!(applied.is_none());
+                        assert_eq!(body, json!({"model": "custom-model"}));
+                    } else {
+                        assert!(applied.is_some());
+                        let field = if protocol == ProviderProtocol::OpenAiChat {
+                            &body["reasoning_effort"]
+                        } else {
+                            &body["reasoning"]["effort"]
+                        };
+                        assert_eq!(
+                            field,
+                            if mode == ThinkingMode::Off {
+                                "none"
+                            } else {
+                                "high"
+                            }
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

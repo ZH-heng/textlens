@@ -1382,6 +1382,40 @@ describe('SettingsApp provider deletion', () => {
 })
 
 describe('SettingsApp provider protocols', () => {
+  it.each([
+    { modelId: 'gemini-3-pro', baseUrl: 'https://api.openai.com/v1', next: 'gemini',
+      expectedBase: 'https://generativelanguage.googleapis.com/v1beta',
+      levels: ['low', 'high'], dialect: 'geminiLevel', supportsOff: false },
+    { modelId: 'qwen3', baseUrl: 'https://openrouter.ai/api/v1', next: 'openAiResponses',
+      expectedBase: 'https://openrouter.ai/api/v1',
+      levels: ['medium'], dialect: 'openRouterReasoning', supportsOff: true }
+  ] as const)('refreshes manual wire metadata for $modelId when switching protocol', async (testCase) => {
+    const settings: PublicSettings = {
+      ...DEFAULT_PUBLIC_SETTINGS,
+      providers: [{
+        ...DEFAULT_PUBLIC_SETTINGS.providers[0]!, enabled: true, protocol: 'openAiChat',
+        baseUrl: testCase.baseUrl, keyConfigured: true,
+        models: [{ id: testCase.modelId, name: testCase.modelId, thinkingLevels: ['low', 'medium', 'high'],
+          thinkingCapability: { source: 'manual', dialect: 'reasoningEffort', supportsOff: true } }]
+      }]
+    }
+    const updateSettings = vi.fn(async (_update: SettingsUpdate) => settings)
+    installDefaultBridge({ getSettings: vi.fn(async () => settings), updateSettings })
+    render(<SettingsApp />)
+    await goToSettingsSection('AI 服务商')
+    fireEvent.change(await screen.findByLabelText('OpenAI Compatible：接口协议'), {
+      target: { value: testCase.next }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledOnce())
+    expect(updateSettings.mock.calls[0]![0].providers?.[0]).toMatchObject({
+      protocol: testCase.next, baseUrl: testCase.expectedBase,
+      models: [{ thinkingLevels: [...testCase.levels], thinkingCapability: {
+        source: 'heuristic', dialect: testCase.dialect, supportsOff: testCase.supportsOff
+      } }]
+    })
+  })
+
   it('switches protocol, reseeds model thinking and saves the new fields', async () => {
     const provider = DEFAULT_PUBLIC_SETTINGS.providers[0]!
     const settings: PublicSettings = {
@@ -1408,7 +1442,7 @@ describe('SettingsApp provider protocols', () => {
     fireEvent.change(protocol, { target: { value: 'anthropicMessages' } })
     expect(protocol).toHaveValue('anthropicMessages')
     expect(screen.getByDisplayValue('https://api.anthropic.com/v1')).toBeInTheDocument()
-    expect(screen.getByText(/默认 中 · 低\/中\/高/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /思考设置/ })).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1))
@@ -1430,53 +1464,53 @@ describe('SettingsApp provider protocols', () => {
 })
 
 describe('SettingsApp model thinking', () => {
-  it('shows disabled thinking without levels and re-detects DeepSeek V4', async () => {
+  it('keeps provider rows limited to the selected models', async () => {
     const provider = DEFAULT_PUBLIC_SETTINGS.providers[0]!
     const settings: PublicSettings = {
       ...DEFAULT_PUBLIC_SETTINGS,
-      providers: [{
-        ...provider,
-        enabled: true,
-        protocol: 'openAiChat',
-        keyConfigured: true,
-        models: [{
-          id: 'deepseek-ai/deepseek-v4.1-flash-1017',
-          name: 'DeepSeek-V4.1-Flash-1017',
-          thinkingLevels: [],
-          thinkingEnabled: false
-        }]
-      }]
+      providers: [{ ...provider, enabled: true, keyConfigured: true, models: [{
+        id: 'deepseek-v4', name: 'DeepSeek V4', thinkingLevels: [], thinkingEnabled: false
+      }] }]
     }
-    const updateSettings = vi.fn(async (_update: SettingsUpdate) => settings)
-    installDefaultBridge({
-      getSettings: vi.fn(async () => settings),
-      updateSettings
-    } as Partial<WindowTextLensApi>)
-
+    installDefaultBridge({ getSettings: vi.fn(async () => settings) })
     render(<SettingsApp />)
     await goToSettingsSection('AI 服务商')
+    expect(await screen.findByText('DeepSeek V4')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /思考设置/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '重新自动识别' })).not.toBeInTheDocument()
+    expect(screen.queryByText('启用思考')).not.toBeInTheDocument()
+  })
 
-    expect(
-      await screen.findByText('不启用思考', { selector: '.model-row__thinking-summary' })
-    ).toBeInTheDocument()
-    expect(screen.queryByText('未识别思考档位')).not.toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: 'DeepSeek-V4.1-Flash-1017：思考设置' }))
+  it('persists different efforts for two tools using the same model', async () => {
+    const provider = DEFAULT_PUBLIC_SETTINGS.providers[0]!
+    const settings: PublicSettings = {
+      ...DEFAULT_PUBLIC_SETTINGS,
+      providers: [{ ...provider, enabled: true, keyConfigured: true, models: [{
+        id: 'gpt-5.2', name: 'GPT 5.2', thinkingLevels: [], thinkingEnabled: false
+      }] }],
+      actions: DEFAULT_PUBLIC_SETTINGS.actions.map((action) => 'providerId' in action
+        ? { ...action, providerId: provider.id, modelId: 'gpt-5.2', thinkingMode: 'off' } : action)
+    }
+    const updateSettings = vi.fn(async (_update: SettingsUpdate) => settings)
+    installDefaultBridge({ getSettings: vi.fn(async () => settings), updateSettings })
+    render(<SettingsApp />)
+    await goToSettingsSection('工具栏动作')
+    fireEvent.click(await screen.findByRole('button', { name: '编辑翻译' }))
     fireEvent.click(screen.getByRole('button', { name: '重新自动识别' }))
-    expect(await screen.findByText('默认 高 · 低/高/最高')).toBeInTheDocument()
-
+    fireEvent.change(screen.getByLabelText('思考强度'), { target: { value: 'low' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+    fireEvent.click(screen.getByRole('button', { name: '编辑总结' }))
+    fireEvent.change(screen.getByLabelText('思考强度'), { target: { value: 'xhigh' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+    fireEvent.click(screen.getByRole('button', { name: '编辑翻译' }))
+    expect(screen.getByLabelText('思考强度')).toHaveValue('low')
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
     fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1))
-    expect(updateSettings.mock.calls[0]?.[0].providers?.[0]?.models[0]).toMatchObject({
-      thinkingLevels: ['low', 'high', 'xhigh'],
-      thinkingCapability: {
-        source: 'heuristic',
-        dialect: 'reasoningEffortMax',
-        supportsOff: true
-      },
-      thinkingEnabled: true,
-      thinkingDefault: 'high'
-    })
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledOnce())
+    const update = updateSettings.mock.calls[0]![0]
+    expect(update.actions?.find((action) => action.kind === 'translate')).toMatchObject({ modelId: 'gpt-5.2', thinkingMode: 'low' })
+    expect(update.actions?.find((action) => action.kind === 'summary')).toMatchObject({ modelId: 'gpt-5.2', thinkingMode: 'xhigh' })
+    expect(update.providers?.[0]?.models[0]).toMatchObject({ thinkingLevels: ['low', 'medium', 'high', 'xhigh'] })
   })
 
   it('auto-detects versioned GPT thinking levels on manual add', async () => {
@@ -1505,13 +1539,13 @@ describe('SettingsApp model thinking', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: '添加' }))
 
-    expect(await screen.findByText('默认 中 · 最低/低/中/高/最高')).toBeInTheDocument()
+    expect(await screen.findByText('gpt6-luna')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1))
     expect(updateSettings.mock.calls[0]?.[0].providers?.[0]?.models[0]).toMatchObject({
       id: 'gpt6-luna',
-      thinkingLevels: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+      thinkingLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
       thinkingCapability: {
         source: 'heuristic',
         dialect: 'reasoningEffort',

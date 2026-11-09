@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState, type FormEvent, type JSX } from 'react'
-import { Braces, RotateCcw, X } from 'lucide-react'
+import { Braces, RefreshCw, RotateCcw, X } from 'lucide-react'
 
 import {
   DEFAULT_ACTION_PROMPTS,
@@ -10,15 +10,15 @@ import {
   aiActionKindSchema,
   clampThinkingMode,
   defaultThinkingLevel,
-  effectiveThinkingLevels,
-  modelSupportsThinkingOff,
-  protocolSupportsThinkingOff,
+  detectModelThinking,
+  isThinkingToggle,
   type ActionDefinition,
   type ActionKind,
   type ProviderProtocol,
   type PublicProviderSettings,
   type SearchEngineId,
-  type ThinkingLevel,
+  type ProviderModel,
+  type ThinkingCapability,
   type ThinkingMode
 } from '../../shared'
 import { isLucideIconName } from '../components/lucideIconRegistry'
@@ -41,12 +41,9 @@ function isAiKind(kind: ActionKind): boolean {
 }
 
 function resolveThinkingMode(choice: ModelChoice | null, mode: ThinkingMode): ThinkingMode {
-  if (!choice || !choice.thinkingEnabled) return 'off'
-  const clamped = clampThinkingMode(mode, choice.thinkingLevels)
-  if (clamped !== 'off' || choice.supportsOff) return clamped
-  // The model cannot disable thinking; fall back to its default gear instead
-  // of leaving the request on an unavailable option.
-  return choice.thinkingDefault ?? choice.thinkingLevels[0] ?? 'off'
+  if (!choice) return 'off'
+  if (isThinkingToggle(choice.thinkingCapability)) return mode === 'off' ? 'off' : 'medium'
+  return clampThinkingMode(mode, choice.thinkingLevels)
 }
 
 function defaultPrompt(kind: ActionKind): string {
@@ -81,6 +78,7 @@ export interface ActionEditorValue {
   prompt?: string
   providerId?: string
   modelId?: string
+  thinkingModel?: ProviderModel
   thinkingMode?: ThinkingMode
   searchEngineId?: SearchEngineId
 }
@@ -117,9 +115,9 @@ interface ModelChoice extends ModelRoute {
   providerName: string
   modelName: string
   protocol: ProviderProtocol
-  thinkingLevels: ReturnType<typeof effectiveThinkingLevels>
-  thinkingEnabled: boolean
-  thinkingDefault: ThinkingLevel | null
+  model: ProviderModel
+  thinkingCapability: ThinkingCapability | null
+  thinkingLevels: ReturnType<typeof detectModelThinking>['levels']
   supportsOff: boolean
 }
 
@@ -148,6 +146,7 @@ export function CustomActionDialog({
   const [searchEngineId, setSearchEngineId] = useState<SearchEngineId>(initialSearchEngineId)
   const [prompt, setPrompt] = useState(initialAi?.prompt ?? DEFAULT_ACTION_PROMPTS.custom)
   const [error, setError] = useState('')
+  const [detectedModels, setDetectedModels] = useState<Record<string, ProviderModel>>({})
   const nameRef = useRef<HTMLInputElement>(null)
 
   const enabledProviders = useMemo(
@@ -165,11 +164,18 @@ export function CustomActionDialog({
           name: provider.name,
           keyConfigured: provider.keyConfigured,
           choices: provider.models.map<ModelChoice>((model) => {
-            const thinkingLevels = effectiveThinkingLevels(
-              model.id,
-              model.thinkingLevels,
-              protocol
-            )
+            const value = modelRouteValue({ providerId: provider.id, modelId: model.id })
+            const detected = detectModelThinking(model.id, protocol, provider.baseUrl)
+            const override = detectedModels[value]
+            const useStored = model.thinkingCapability?.source === 'explicit'
+              || model.thinkingCapability?.source === 'manual'
+            const thinkingCapability = override
+              ? override.thinkingCapability ?? null
+              : useStored ? model.thinkingCapability! : detected.capability
+            const storedLevels = override?.thinkingLevels
+              ?? (useStored || (!model.thinkingCapability && !detected.capability && model.thinkingLevels.length > 0)
+                ? model.thinkingLevels : detected.levels)
+            const thinkingLevels = isThinkingToggle(thinkingCapability) ? ['medium' as const] : storedLevels
             return {
               providerId: provider.id,
               modelId: model.id,
@@ -177,17 +183,15 @@ export function CustomActionDialog({
               modelName: model.name,
               protocol,
               thinkingLevels,
-              thinkingEnabled: model.thinkingEnabled !== false,
-              thinkingDefault: model.thinkingDefault ?? defaultThinkingLevel(thinkingLevels),
-              supportsOff:
-                model.thinkingCapability?.supportsOff
-                ?? protocolSupportsThinkingOff(model.id, protocol),
-              value: modelRouteValue({ providerId: provider.id, modelId: model.id })
+              model: override ?? model,
+              thinkingCapability,
+              supportsOff: thinkingCapability?.supportsOff ?? true,
+              value
             }
           })
         }
       })
-  }, [enabledProviders])
+  }, [enabledProviders, detectedModels])
 
   const modelChoices = useMemo(
     () => modelGroups.flatMap((group) => group.choices),
@@ -205,14 +209,26 @@ export function CustomActionDialog({
     ? modelRouteValue({ providerId, modelId })
     : ''
 
-  const thinkingLevels = selectedChoice?.thinkingEnabled ? selectedChoice.thinkingLevels : []
-  const showThinkingOff = modelSupportsThinkingOff(
-    thinkingLevels,
-    selectedChoice?.supportsOff ?? true
-  )
-  const showThinkingAuto = Boolean(
-    selectedChoice?.thinkingEnabled && selectedChoice.thinkingDefault && thinkingLevels.length > 0
-  )
+  const thinkingLevels = selectedChoice?.thinkingLevels ?? []
+  const toggleOnly = isThinkingToggle(selectedChoice?.thinkingCapability)
+
+  const autoDetect = (): void => {
+    if (!selectedChoice) return
+    const provider = enabledProviders.find((item) => item.id === selectedChoice.providerId)
+    const detected = detectModelThinking(selectedChoice.modelId, selectedChoice.protocol, provider?.baseUrl)
+    setDetectedModels((current) => ({
+      ...current,
+      [selectedChoice.value]: {
+        ...selectedChoice.model,
+        thinkingLevels: detected.levels,
+        thinkingCapability: detected.capability ?? undefined,
+        thinkingDefault: defaultThinkingLevel(detected.levels)
+      }
+    }))
+    setThinkingMode((current) => isThinkingToggle(detected.capability)
+      ? current === 'off' ? 'off' : 'medium'
+      : clampThinkingMode(current, detected.levels))
+  }
 
   const submit = (event: FormEvent): void => {
     event.preventDefault()
@@ -234,7 +250,8 @@ export function CustomActionDialog({
         prompt: cleanPrompt,
         providerId,
         modelId,
-        thinkingMode: resolveThinkingMode(selectedChoice, thinkingMode)
+        thinkingMode: resolveThinkingMode(selectedChoice, thinkingMode),
+        ...(selectedChoice && detectedModels[selectedChoice.value] ? { thinkingModel: detectedModels[selectedChoice.value] } : {})
       })
       return
     }
@@ -385,33 +402,50 @@ export function CustomActionDialog({
                 </span>
               </label>
 
-              {thinkingLevels.length > 0 && (
-                <label className="field">
-                  <span className="field__label">思考强度</span>
-                  <select
-                    className="control"
-                    aria-label="思考强度"
-                    value={resolveThinkingMode(selectedChoice, thinkingMode)}
-                    onChange={(event) => setThinkingMode(event.target.value as ThinkingMode)}
-                  >
-                    {showThinkingAuto && (
-                      <option value="auto">
-                        跟随模型默认（{THINKING_LEVEL_LABELS[selectedChoice?.thinkingDefault ?? 'medium']}）
-                      </option>
-                    )}
-                    {showThinkingOff && (
-                      <option value="off">关闭思考（更快首字）</option>
-                    )}
-                    {thinkingLevels.map((level) => (
-                      <option key={level} value={level}>
-                        {THINKING_LEVEL_LABELS[level]}
-                      </option>
-                    ))}
-                  </select>
-                  <span className="field__hint">
-                    档位来自服务商的模型列表，也可在「服务商」里为单个模型手动调整或关闭思考。
-                  </span>
-                </label>
+              {selectedChoice && (
+                <div className="field action-thinking-settings">
+                  <div className="action-thinking-heading">
+                    <span className="field__label">模型思考</span>
+                    <button className="button button--quiet" type="button" onClick={autoDetect}>
+                      <RefreshCw size={12} />重新自动识别
+                    </button>
+                  </div>
+                  {thinkingLevels.length > 0 ? (
+                    <>
+                      <label className="model-thinking-toggle">
+                        <input type="checkbox" role="switch" aria-label="启用思考"
+                          checked={resolveThinkingMode(selectedChoice, thinkingMode) !== 'off'}
+                          onChange={(event) => setThinkingMode(event.target.checked ? defaultThinkingLevel(thinkingLevels) ?? 'off' : 'off')} />
+                        启用思考
+                      </label>
+                      <label className="field">
+                        <span className="field__label">思考强度</span>
+                        <select className="control" aria-label="思考强度"
+                          value={resolveThinkingMode(selectedChoice, thinkingMode)}
+                          onChange={(event) => setThinkingMode(event.target.value as ThinkingMode)}>
+                          <option value="off">{selectedChoice.supportsOff ? '关闭思考（更快首字）' : '关闭思考（使用最低支持档位）'}</option>
+                          <option value="auto">自动选择档位</option>
+                          {thinkingLevels.map((level) => (
+                            <option key={level} value={level}>
+                              {toggleOnly ? '启用（模型默认）' : level === 'xhigh' && selectedChoice.thinkingCapability?.dialect === 'reasoningEffortMax' ? '最高' : THINKING_LEVEL_LABELS[level]}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <span className="field__hint">
+                        仅应用于当前工具；其他工具使用同一模型时可设置不同档位。
+                        {!selectedChoice.supportsOff && '该模型无法完全关闭思考，关闭时使用最低支持档位。'}
+                        {toggleOnly && '该模型支持开关，不提供可调强度。'}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="field__hint">
+                      {selectedChoice.thinkingCapability?.supportsOff === false
+                        ? '该模型固定开启思考，不支持关闭或调节档位。'
+                        : '未识别到可调节的思考能力，可重新自动识别。'}
+                    </span>
+                  )}
+                </div>
               )}
 
               <label className="field">

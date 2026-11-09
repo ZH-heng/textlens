@@ -156,6 +156,22 @@ describe('action event store publication pacing', () => {
     stop()
   })
 
+  it('publishes the first content after an idle gap without waiting for a frame', async () => {
+    const store = await import('./actionEventStore')
+    const stop = store.startActionEventStore()
+    emit(started())
+    emit(delta(2, '已'))
+    vi.advanceTimersByTime(100)
+    emit(delta(3, '阻止'))
+    expect(store.getActionEventSnapshot().content).toBe('已阻止')
+    expect(frameCallbacks.size).toBe(0)
+    emit(delta(4, '绑定'))
+    expect(store.getActionEventSnapshot().content).toBe('已阻止')
+    runNextFrame()
+    expect(store.getActionEventSnapshot().content).toBe('已阻止绑定')
+    stop()
+  })
+
   it('flushes the tail within one frame when reveal delays animation callbacks', async () => {
     const store = await import('./actionEventStore')
     const stop = store.startActionEventStore()

@@ -1,3 +1,4 @@
+import { AdaptiveTextBuffer } from './adaptiveTextBuffer'
 import { countUnicodeScalars } from '../../shared'
 
 export const MAX_GRAPHEME_CARRY_SCALARS = 256
@@ -71,123 +72,48 @@ export function advanceByUnicodeScalars(value: string, from: number, scalarCount
   return index
 }
 
-// Time budgets, not output speed limits. The first chunk bypasses playback.
-const MIN_SMOOTH_MS = 32
-const MAX_SMOOTH_MS = 48
-const MAX_QUEUED_MS = 64
-const RATE_RESET_MS = 250
-
-interface Chunk { text: string; offset: number; arrivedAt: number }
-
+/** Snapshot adapter: first content is immediate, subsequent content uses Myna's playout buffer. */
 export class SmoothStreamController {
+  private buffer = new AdaptiveTextBuffer()
   private target = ''
   private displayed = ''
   private scalarCount = 0
   private streaming = false
-  private chunks: Chunk[] = []
-  private size = 0
-  private lastArrival: number | null = null
-  private lastFrame = 0
-  private interval = 0
-  private rate = 0
-  private credit = 0
-
   getDisplayed(): string { return this.displayed }
   getDisplayedScalarCount(): number { return this.scalarCount }
   getTarget(): string { return this.target }
-  needsTick(): boolean { return this.streaming && this.size > 0 }
-  getDeadline(): number { return this.chunks.length ? this.chunks[0]!.arrivedAt + MAX_QUEUED_MS : Infinity }
-
+  needsTick(): boolean { return this.streaming && this.buffer.length > 0 }
+  getDeadline(): number { return this.buffer.deadline }
   reset(): void {
-    this.target = ''
-    this.displayed = ''
+    this.buffer = new AdaptiveTextBuffer()
+    this.target = this.displayed = ''
     this.scalarCount = 0
     this.streaming = false
-    this.clearQueue()
-    this.lastArrival = null
-    this.interval = this.rate = 0
   }
-
-  private clearQueue(): void {
-    this.chunks = []
-    this.size = 0
-    this.credit = 0
-  }
-
   setTarget(target: string, streaming: boolean, now = 0): string {
     const previous = this.target
+    if (!streaming || !target.startsWith(previous)) {
+      this.reset()
+      this.target = this.displayed = target
+      this.scalarCount = countUnicodeScalars(target)
+      this.streaming = streaming
+      return this.displayed
+    }
     this.streaming = streaming
     this.target = target
-    if (!streaming || !target.startsWith(previous)) {
-      this.clearQueue()
-      this.displayed = target
-      this.scalarCount = countUnicodeScalars(target)
-      this.lastArrival = streaming && target ? now : null
-      this.interval = this.rate = 0
-      return this.displayed
-    }
-    const delta = target.slice(previous.length)
-    if (!delta) return this.displayed
-    if (this.lastArrival !== null) {
-      const gap = now - this.lastArrival
-      if (gap > 0) {
-        const sample = delta.length * 1000 / Math.max(16, gap)
-        if (!this.interval || gap >= RATE_RESET_MS) {
-          this.interval = Math.min(gap, MAX_SMOOTH_MS * 2)
-          this.rate = sample
-        } else {
-          const weight = 1 - Math.exp(-gap / 120)
-          this.interval += weight * (Math.min(gap, MAX_SMOOTH_MS * 2) - this.interval)
-          this.rate += weight * (sample - this.rate)
-        }
-      }
-    }
-    this.lastArrival = now
-    if (!previous) {
-      this.displayed = delta
-      this.scalarCount = countUnicodeScalars(delta)
-      return this.displayed
-    }
-    if (!this.size) { this.lastFrame = now; this.credit = 0 }
-    this.chunks.push({ text: delta, offset: 0, arrivedAt: now })
-    this.size += delta.length
+    this.buffer.push(target.slice(previous.length), now)
+    if (!previous && target) this.release(now, true)
     return this.displayed
   }
-
-  tick(now: number): string {
-    if (!this.needsTick()) return this.displayed
-    const elapsed = Math.max(0, now - this.lastFrame)
-    this.lastFrame = now
-    const window = Math.max(MIN_SMOOTH_MS, Math.min(MAX_SMOOTH_MS, this.interval / 2))
-    const speed = Math.max(this.rate, this.size * 1000 / window)
-    const budget = this.credit + speed * elapsed / 1000
-    let count = elapsed >= MAX_SMOOTH_MS || this.size <= 2
-      ? this.size : Math.max(1, Math.floor(budget))
-    let due = 0
-    for (const chunk of this.chunks) {
-      if (now - chunk.arrivedAt < MAX_QUEUED_MS) break
-      due += chunk.text.length - chunk.offset
+  private release(now: number, all = false): void {
+    const text = this.buffer.take(now, all)
+    if (text) {
+      this.displayed += text
+      this.scalarCount += countUnicodeScalars(text)
     }
-    count = Math.min(this.size, Math.max(count, due))
-    this.credit = Math.max(0, budget - count) % 1
-    const parts: string[] = []
-    while (count > 0 && this.chunks.length) {
-      const chunk = this.chunks[0]!
-      let end = Math.min(chunk.text.length, chunk.offset + count)
-      const before = chunk.text.charCodeAt(end - 1)
-      const after = chunk.text.charCodeAt(end)
-      if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end++
-      const part = chunk.text.slice(chunk.offset, end)
-      parts.push(part)
-      const taken = end - chunk.offset
-      this.size -= taken
-      count -= taken
-      chunk.offset = end
-      if (end === chunk.text.length) this.chunks.shift()
-    }
-    const released = parts.join('')
-    this.displayed += released
-    this.scalarCount += countUnicodeScalars(released)
+  }
+  tick(now: number, all = false): string {
+    if (this.streaming) this.release(now, all)
     return this.displayed
   }
 }

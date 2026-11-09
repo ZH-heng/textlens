@@ -1,3 +1,4 @@
+import { StreamingText } from './StreamingText'
 import {
   useCallback,
   useEffect,
@@ -284,7 +285,7 @@ function ThinkingPanel(): JSX.Element | null {
       </button>
       {expanded && (
         <div className="result-thinking__body">
-          {stripLeadingBlankLines(thinkingContent)}
+          {live ? <span className="markdown-streaming"><StreamingText text={stripLeadingBlankLines(thinkingContent)} animateInitial /></span> : stripLeadingBlankLines(thinkingContent)}
           {live && <span className="stream-caret" aria-hidden="true" />}
         </div>
       )}

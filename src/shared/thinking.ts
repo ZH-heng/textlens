@@ -2,7 +2,7 @@ import { z } from 'zod'
 
 import type { ProviderProtocol } from './constants'
 
-export const THINKING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const
+export const THINKING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number]
 export type ThinkingMode = 'off' | 'auto' | ThinkingLevel
 
@@ -16,7 +16,10 @@ export const thinkingDialectSchema = z.enum([
   'reasoningEffort',
   'reasoningEffortMax',
   'enableThinking',
-  'chatTemplateKwargs'
+  'chatTemplateKwargs',
+  'thinkingToggle',
+  'openRouterReasoning',
+  'geminiLevel'
 ])
 export type ThinkingDialect = z.infer<typeof thinkingDialectSchema>
 
@@ -34,7 +37,8 @@ export const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
   low: '低',
   medium: '中',
   high: '高',
-  xhigh: '最高'
+  xhigh: '极高',
+  max: '最高'
 }
 
 const STANDARD_THREE: ThinkingLevel[] = ['low', 'medium', 'high']
@@ -137,7 +141,7 @@ function isReasoningGlm(id: string): boolean {
 
 function isReasoningKimi(id: string): boolean {
   const version = familyVersion(id, 'kimi')
-  return version !== null && version[0] >= 3
+  return version !== null && version[0] >= 2
 }
 
 function isReasoningGrok(id: string): boolean {
@@ -149,6 +153,7 @@ function detectOpenAiFamily(id: string): ThinkingFamily | null {
   if (isOSeries(id)) return 'oSeries'
   if (id.includes('gpt-oss')) return 'gptOss'
   const gpt = familyVersion(id, 'gpt')
+  if (gpt && id.includes('chat')) return null
   if (gpt && gpt[0] >= 5) return 'gpt'
   if (isReasoningClaude(id)) return 'claude'
   if (isReasoningGemini(id)) return 'gemini'
@@ -174,23 +179,111 @@ function detectThinkingFamily(id: string, protocol: ProviderProtocol): ThinkingF
   return detectOpenAiFamily(id)
 }
 
-/** Infer capability from model id when provider metadata is silent. */
-export function inferThinkingLevels(
+/** Keep the detected wire dialect separate from each tool's thinking preference. */
+export function detectModelThinking(
   modelId: string,
-  protocol: ProviderProtocol = 'openAiChat'
-): ThinkingLevel[] {
-  const family = detectThinkingFamily(modelId.trim().toLowerCase(), protocol)
-  return family ? [...FAMILY_LEVELS[family]] : []
+  protocol: ProviderProtocol = 'openAiChat',
+  baseUrl = ''
+): { levels: ThinkingLevel[]; capability: ThinkingCapability | null } {
+  const id = modelId.trim().toLowerCase()
+  let family = detectThinkingFamily(id, protocol)
+  const deepseek = familyVersion(id, 'deepseek')
+  const openAiProtocol = protocol === 'openAiChat' || protocol === 'openAiResponses'
+  if (!family && openAiProtocol && deepseek?.[0] === 3) family = 'generic'
+  if (!family || /non[- ]?(?:reasoning|thinking)/u.test(id)) return { levels: [], capability: null }
+  let levels = [...FAMILY_LEVELS[family]]
+  let dialect: ThinkingDialect | null = protocol === 'anthropicMessages' || protocol === 'gemini'
+    ? null
+    : family === 'deepseekMax' ? 'reasoningEffortMax' : 'reasoningEffort'
+  let supportsOff = true
+  if (protocol === 'gemini') {
+    if (id.includes('gemini-2.0-flash-thinking') || id.includes('thinking-exp')) {
+      return { levels: [], capability: { source: 'heuristic', dialect: null, supportsOff: false } }
+    }
+    if ((familyVersion(id, 'gemini')?.[0] ?? 0) >= 3) {
+      dialect = 'geminiLevel'
+      levels = id.includes('flash') ? ['minimal', 'low', 'medium', 'high'] : ['low', 'high']
+      supportsOff = false
+    } else {
+      supportsOff = !(id.includes('pro') && !id.includes('flash'))
+    }
+  } else if (protocol !== 'anthropicMessages') {
+    const gpt = familyVersion(id, 'gpt')
+    if (family === 'gpt' && gpt) {
+      if (gpt[0] >= 6) {
+        levels = ['low', 'medium', 'high', 'xhigh', 'max']
+        supportsOff = !(id.includes('astra') || (gpt[1] === 1 && id.includes('sol')))
+      } else if (gpt[1] >= 2) {
+        levels = id.includes('pro') ? ['medium', 'high', 'xhigh'] : ['low', 'medium', 'high', 'xhigh']
+        supportsOff = !id.includes('pro')
+      } else {
+        levels = gpt[1] === 0 && !id.includes('codex')
+          ? ['minimal', 'low', 'medium', 'high']
+          : ['low', 'medium', 'high']
+        supportsOff = gpt[1] >= 1
+      }
+    }
+    if (family === 'oSeries' || family === 'gptOss' || family === 'grok') supportsOff = false
+    if (family === 'oSeries' && /(?:^|[/])o1-(?:preview|mini)(?:-|$)/u.test(id)) {
+      levels = []
+      dialect = null
+    }
+    if (family === 'qwen') {
+      const qwen = familyVersion(id, 'qwen')
+      if (qwen && qwen[0] === 3 && qwen[1] >= 8) {
+        levels = ['low', 'medium', 'xhigh']
+      } else {
+        dialect = /(?:^|\.)dashscope\.aliyuncs\.com$/u.test(endpointHost(baseUrl))
+          ? 'enableThinking' : 'chatTemplateKwargs'
+        levels = ['medium']
+      }
+    }
+    if (family === 'glm') {
+      const glm = familyVersion(id, 'glm')
+      if (glm && (glm[0] > 5 || (glm[0] === 5 && glm[1] >= 1))) {
+        levels = ['low', 'medium', 'high', 'xhigh']
+      } else {
+        dialect = 'thinkingToggle'
+        levels = ['medium']
+      }
+    }
+    if (family === 'kimi' || deepseek?.[0] === 3) {
+      dialect = 'thinkingToggle'
+      levels = ['medium']
+    }
+    if (family === 'deepseekReasoner' || family === 'magistral'
+      || (family === 'generic' && deepseek?.[0] !== 3)
+      || (family === 'kimi' && id.includes('thinking'))) {
+      levels = []
+      dialect = null
+      supportsOff = false
+    }
+    if (endpointHost(baseUrl) === 'openrouter.ai' && levels.length > 0) dialect = 'openRouterReasoning'
+  }
+  return { levels, capability: { source: 'heuristic', dialect, supportsOff } }
 }
 
-/** Gemini Pro enforces a minimum thinking budget and cannot fully disable it. */
+function endpointHost(baseUrl: string): string {
+  try {
+    return new URL(baseUrl).hostname.toLowerCase()
+  } catch {
+    return ''
+  }
+}
+
+export function inferThinkingLevels(
+  modelId: string,
+  protocol: ProviderProtocol = 'openAiChat',
+  baseUrl = ''
+): ThinkingLevel[] {
+  return detectModelThinking(modelId, protocol, baseUrl).levels
+}
+
 export function protocolSupportsThinkingOff(
   modelId: string,
   protocol: ProviderProtocol = 'openAiChat'
 ): boolean {
-  if (protocol !== 'gemini') return true
-  const id = modelId.trim().toLowerCase()
-  return !(id.includes('pro') && !id.includes('flash'))
+  return detectModelThinking(modelId, protocol).capability?.supportsOff ?? true
 }
 
 export function defaultThinkingLevel(levels: readonly ThinkingLevel[]): ThinkingLevel | null {
@@ -201,25 +294,16 @@ export function defaultThinkingLevel(levels: readonly ThinkingLevel[]): Thinking
 
 export function inferredThinkingCapability(
   modelId: string,
-  protocol: ProviderProtocol = 'openAiChat'
+  protocol: ProviderProtocol = 'openAiChat',
+  baseUrl = ''
 ): ThinkingCapability | null {
-  const family = detectThinkingFamily(modelId.trim().toLowerCase(), protocol)
-  if (!family) return null
-  const openAiProtocol = protocol === 'openAiChat' || protocol === 'openAiResponses'
-  if (family === 'deepseekReasoner') {
-    return { source: 'heuristic', dialect: null, supportsOff: false }
-  }
-  return {
-    source: 'heuristic',
-    dialect: !openAiProtocol
-      ? null
-      : family === 'deepseekMax'
-        ? 'reasoningEffortMax'
-        : family === 'qwen'
-          ? 'enableThinking'
-          : 'reasoningEffort',
-    supportsOff: protocolSupportsThinkingOff(modelId, protocol)
-  }
+  return detectModelThinking(modelId, protocol, baseUrl).capability
+}
+
+export function isThinkingToggle(capability: ThinkingCapability | null | undefined): boolean {
+  return capability?.dialect === 'enableThinking'
+    || capability?.dialect === 'chatTemplateKwargs'
+    || capability?.dialect === 'thinkingToggle'
 }
 
 export function clampThinkingMode(
@@ -253,7 +337,7 @@ export function effectiveThinkingLevels(
 /**
  * Whether the action editor should offer “关闭思考”.
  * Always available when the model has thinking levels; backend adapts via
- * `supportsOff` (inject off-control vs omit the field).
+ * `supportsOff` (disable thinking or use the lowest supported level).
  */
 export function modelSupportsThinkingOff(
   levels: readonly ThinkingLevel[],

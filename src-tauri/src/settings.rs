@@ -24,10 +24,11 @@ use crate::models::{
     DEFAULT_PROVIDER_ID, DEFAULT_REFINE_PROMPT, DEFAULT_SUMMARY_PROMPT, DEFAULT_TRANSLATE_PROMPT,
     LEGACY_V11_CONCISE_EXPLAIN_PROMPT, LEGACY_V11_CONCISE_TRANSLATE_PROMPT,
     LEGACY_V11_EXPLAIN_PROMPT, LEGACY_V11_SUMMARY_PROMPT, LEGACY_V11_TIGHT_EXPLAIN_PROMPT,
-    LEGACY_V11_TRANSLATE_PROMPT, LEGACY_V3_EXPLAIN_PROMPT, LEGACY_V3_REFINE_PROMPT,
-    LEGACY_V3_SUMMARY_PROMPT, LEGACY_V3_TRANSLATE_PROMPT, LEGACY_V4_EXPLAIN_PROMPT,
-    LEGACY_V4_REFINE_PROMPT, LEGACY_V4_SUMMARY_PROMPT, LEGACY_V4_TRANSLATE_PROMPT,
-    LEGACY_V5_TRANSLATE_PROMPT, SETTINGS_VERSION,
+    LEGACY_V11_TRANSLATE_PROMPT, LEGACY_V13_EXPLAIN_PROMPT, LEGACY_V13_TRANSLATE_PROMPT,
+    LEGACY_V3_EXPLAIN_PROMPT, LEGACY_V3_REFINE_PROMPT, LEGACY_V3_SUMMARY_PROMPT,
+    LEGACY_V3_TRANSLATE_PROMPT, LEGACY_V4_EXPLAIN_PROMPT, LEGACY_V4_REFINE_PROMPT,
+    LEGACY_V4_SUMMARY_PROMPT, LEGACY_V4_TRANSLATE_PROMPT, LEGACY_V5_TRANSLATE_PROMPT,
+    SETTINGS_VERSION,
 };
 
 const SECRET_ACCOUNT_PREFIX: &str = "provider-api-key:";
@@ -963,6 +964,7 @@ fn migrate_default_action_prompts(settings: &mut AppSettings) {
                             | LEGACY_V5_TRANSLATE_PROMPT
                             | LEGACY_V11_TRANSLATE_PROMPT
                             | LEGACY_V11_CONCISE_TRANSLATE_PROMPT
+                            | LEGACY_V13_TRANSLATE_PROMPT
                     )
                 ) =>
             {
@@ -989,6 +991,7 @@ fn migrate_default_action_prompts(settings: &mut AppSettings) {
                             | LEGACY_V11_EXPLAIN_PROMPT
                             | LEGACY_V11_CONCISE_EXPLAIN_PROMPT
                             | LEGACY_V11_TIGHT_EXPLAIN_PROMPT
+                            | LEGACY_V13_EXPLAIN_PROMPT
                     )
                 ) =>
             {
@@ -2547,7 +2550,7 @@ mod tests {
         );
         assert!(fs::read_to_string(path)
             .unwrap()
-            .contains("You are a professional multilingual translator."));
+            .contains("你是专业的多语言译者。"));
     }
 
     #[test]
@@ -2624,9 +2627,83 @@ mod tests {
                 .and_then(|action| action.prompt.as_deref()),
             Some(LEGACY_V11_EXPLAIN_PROMPT)
         );
-        assert!(DEFAULT_EXPLAIN_PROMPT.contains("整体解释"));
-        assert!(DEFAULT_EXPLAIN_PROMPT.contains("核心意思"));
+        assert!(DEFAULT_EXPLAIN_PROMPT.contains("先说清整体意思"));
+        assert!(DEFAULT_EXPLAIN_PROMPT.contains("学科术语"));
         assert!(!DEFAULT_EXPLAIN_PROMPT.contains("必要上下文"));
+    }
+
+    #[test]
+    fn upgrades_only_untouched_v13_translation_and_explanation_defaults() {
+        for customized in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("settings.json");
+            let mut current = AppSettings::default();
+            for (id, old) in [
+                ("translate", LEGACY_V13_TRANSLATE_PROMPT),
+                ("explain", LEGACY_V13_EXPLAIN_PROMPT),
+            ] {
+                let action = current
+                    .actions
+                    .iter_mut()
+                    .find(|action| action.id == id)
+                    .unwrap();
+                action.prompt = Some(
+                    if customized {
+                        "用户自己的规则：{{text}}"
+                    } else {
+                        old
+                    }
+                    .to_owned(),
+                );
+                let mut duplicate = action.clone();
+                duplicate.id = format!("{id}-duplicate");
+                duplicate.enabled = false;
+                duplicate.order = current.actions.len() as u32;
+                duplicate.prompt = Some(old.to_owned());
+                current.actions.push(duplicate);
+            }
+            fs::write(&path, serde_json::to_vec_pretty(&current).unwrap()).unwrap();
+            let repository =
+                SettingsRepository::with_secret_store(&path, Arc::new(MemorySecrets::default()))
+                    .unwrap();
+            let migrated = repository.get_settings();
+            for (id, old, new) in [
+                (
+                    "translate",
+                    LEGACY_V13_TRANSLATE_PROMPT,
+                    DEFAULT_TRANSLATE_PROMPT,
+                ),
+                ("explain", LEGACY_V13_EXPLAIN_PROMPT, DEFAULT_EXPLAIN_PROMPT),
+            ] {
+                let expected = if customized {
+                    "用户自己的规则：{{text}}"
+                } else {
+                    new
+                };
+                assert_eq!(
+                    migrated
+                        .actions
+                        .iter()
+                        .find(|action| action.id == id)
+                        .unwrap()
+                        .prompt
+                        .as_deref(),
+                    Some(expected)
+                );
+                assert_eq!(
+                    migrated
+                        .actions
+                        .iter()
+                        .find(|action| action.id == format!("{id}-duplicate"))
+                        .unwrap()
+                        .prompt
+                        .as_deref(),
+                    Some(old)
+                );
+            }
+            let persisted: AppSettings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(persisted.actions, migrated.actions);
+        }
     }
 
     #[test]
@@ -2653,7 +2730,14 @@ mod tests {
             crate::models::ProviderProtocol::OpenAiChat
         );
         assert!(settings.providers[0].models[0].thinking_enabled);
-        assert_eq!(settings.providers[0].models[0].thinking_capability, None);
+        assert_eq!(
+            settings.providers[0].models[0]
+                .thinking_capability
+                .as_ref()
+                .unwrap()
+                .source,
+            ThinkingCapabilitySource::Heuristic
+        );
         assert_eq!(
             settings.providers[0].models[0].thinking_default,
             Some(ThinkingLevel::Medium)

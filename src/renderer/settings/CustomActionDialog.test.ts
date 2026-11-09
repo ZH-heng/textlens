@@ -161,6 +161,23 @@ describe('CustomActionDialog model + thinking', () => {
     }))
   })
 
+  it('lets a non-disableable model select off and saves the choice', () => {
+    const onSave = vi.fn()
+    render(createElement(CustomActionDialog, {
+      action: null,
+      providers: [{ id: 'provider-one', name: '服务商一', enabled: true, baseUrl: 'https://example.com/v1', keyConfigured: true,
+        models: [{ id: 'gpt-6-astra', name: 'Astra', thinkingLevels: ['low', 'medium'], thinkingCapability: { source: 'explicit', dialect: 'reasoningEffort', supportsOff: false } }] }],
+      onCancel: vi.fn(), onSave
+    }))
+    fireEvent.change(screen.getByLabelText('动作名称'), { target: { value: '测试' } })
+    fireEvent.change(screen.getByLabelText('模型'), { target: { value: modelRoute('provider-one', 'gpt-6-astra') } })
+    const select = screen.getByLabelText('思考强度')
+    expect(screen.getByRole('option', { name: '关闭思考（使用最低支持档位）' })).toBeInTheDocument()
+    fireEvent.change(select, { target: { value: 'off' } })
+    fireEvent.click(screen.getByRole('button', { name: '添加动作' }))
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ thinkingMode: 'off' }))
+  })
+
   it('hides disabled providers and leaves reasoner-only models without thinking controls', () => {
     render(createElement(CustomActionDialog, {
       action: null,
@@ -218,5 +235,71 @@ describe('CustomActionDialog model + thinking', () => {
       target: { value: modelRoute('provider-one', 'model-plain') }
     })
     expect(screen.queryByLabelText('思考强度')).not.toBeInTheDocument()
+  })
+})
+
+
+describe('CustomActionDialog thinking detection', () => {
+  const providers = [{
+    id: 'provider-one', name: '服务商一', enabled: true,
+    baseUrl: 'https://example.com/v1', keyConfigured: true,
+    models: [{ id: 'gpt-5.2', name: 'GPT 5.2', thinkingLevels: ['low' as const],
+      thinkingEnabled: false,
+      thinkingCapability: { source: 'manual' as const, dialect: 'reasoningEffort' as const, supportsOff: true } }]
+  }]
+  const action: ActionDefinition = {
+    id: 'tool', name: '工具', icon: 'sparkles', kind: 'custom', enabled: true, order: 1,
+    providerId: 'provider-one', modelId: 'gpt-5.2', thinkingMode: 'low', prompt: '处理：{{text}}'
+  }
+
+  it('re-detects in the tool editor and saves only its chosen effort', () => {
+    const onSave = vi.fn()
+    render(createElement(CustomActionDialog, { action, providers, onSave, onCancel: vi.fn() }))
+    expect(screen.getByRole('switch', { name: '启用思考' })).toBeChecked()
+    expect(screen.queryByRole('option', { name: '极高' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '重新自动识别' }))
+    expect(screen.getByRole('option', { name: '极高' })).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('思考强度'), { target: { value: 'xhigh' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
+      thinkingMode: 'xhigh',
+      thinkingModel: expect.objectContaining({ thinkingLevels: ['low', 'medium', 'high', 'xhigh'],
+        thinkingCapability: { source: 'heuristic', dialect: 'reasoningEffort', supportsOff: true } })
+    }))
+    expect(providers[0]!.models[0]!.thinkingLevels).toEqual(['low'])
+  })
+
+  it('keeps re-detection local until saved and provides a working off switch', () => {
+    const onSave = vi.fn()
+    const onCancel = vi.fn()
+    render(createElement(CustomActionDialog, { action, providers, onSave, onCancel }))
+    fireEvent.click(screen.getByRole('button', { name: '重新自动识别' }))
+    fireEvent.click(screen.getByRole('switch', { name: '启用思考' }))
+    expect(screen.getByLabelText('思考强度')).toHaveValue('off')
+    fireEvent.click(screen.getByRole('button', { name: '取消' }))
+    expect(onCancel).toHaveBeenCalledOnce()
+    expect(onSave).not.toHaveBeenCalled()
+    expect(providers[0]!.models[0]!.thinkingLevels).toEqual(['low'])
+  })
+
+  it('discards obsolete heuristic levels when the current protocol cannot detect the model', () => {
+    render(createElement(CustomActionDialog, { action, providers: [{
+      ...providers[0]!, protocol: 'gemini', models: [{ ...providers[0]!.models[0]!,
+        thinkingLevels: ['low', 'medium', 'high'],
+        thinkingCapability: { source: 'heuristic', dialect: 'reasoningEffort', supportsOff: true }
+      }]
+    }], onSave: vi.fn(), onCancel: vi.fn() }))
+    expect(screen.queryByLabelText('思考强度')).not.toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: '启用思考' })).not.toBeInTheDocument()
+  })
+
+  it('respects explicit empty capability evidence until re-detection', () => {
+    render(createElement(CustomActionDialog, { action, providers: [{ ...providers[0]!, models: [{
+      ...providers[0]!.models[0]!, thinkingLevels: [],
+      thinkingCapability: { source: 'explicit', dialect: null, supportsOff: false }
+    }] }], onSave: vi.fn(), onCancel: vi.fn() }))
+    expect(screen.queryByLabelText('思考强度')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '重新自动识别' }))
+    expect(screen.getByLabelText('思考强度')).toBeInTheDocument()
   })
 })

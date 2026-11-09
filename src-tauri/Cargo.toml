@@ -21,6 +21,7 @@ futures-util = "0.3"
 parking_lot = "0.12"
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
 ring = "0.17"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2.11.5", features = ["image-png", "macos-private-api", "tray-icon"] }

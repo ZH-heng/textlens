@@ -152,6 +152,12 @@ describe('SafeMarkdown', () => {
     expect(paragraphs[1]?.textContent).toContain('第二段完整内容。')
   })
 
+  it('renders collapsed translation bullets as separate list items', () => {
+    render(<SafeMarkdown content="改进了重试。 • 提高了可靠性。 • 防止了操作执行。" onOpenExternal={() => undefined} />)
+    expect(screen.getAllByRole('listitem')).toHaveLength(3)
+    expect(screen.getByText('提高了可靠性。')).toBeInTheDocument()
+  })
+
   it('renders Chinese-style list markers as real lists', () => {
     const { container } = render(
       <SafeMarkdown

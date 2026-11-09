@@ -22,6 +22,20 @@ const UNORDERED_BULLET = /^([ \t]{0,3})([•·●○])([ \t]+)(.*)$/u
 /** Sentence-like endings used to decide when a single newline is a paragraph break. */
 const SENTENCE_END = /(?:[.!?…。！？；;]|\u2026)["'”’」』》）)\]]*$/u
 
+// Some providers collapse list items into one line while keeping bullet glyphs.
+// Require multiple sentence-ending boundaries to avoid rewriting ordinary prose.
+const INLINE_BULLET_BOUNDARY = /(?<=[。！？.!?])\s+[•·●○]\s+/gu
+
+export function hasCollapsedBulletList(line: string): boolean {
+  if (/[`$|]/u.test(line) || /^[ \t]*(?:[#>*+\-]|\d+[.)])/u.test(line)) return false
+  return (line.match(INLINE_BULLET_BOUNDARY)?.length ?? 0) >= 2
+}
+
+function expandCollapsedBulletList(line: string): string {
+  if (!hasCollapsedBulletList(line)) return line
+  return '- ' + line.replace(/^[ \t]*[•·●○]\s+/u, '').replace(INLINE_BULLET_BOUNDARY, '\n- ')
+}
+
 type LineKind = 'blank' | 'list' | 'table' | 'heading' | 'quote' | 'hr' | 'fence' | 'prose'
 
 export function normalizeMarkdownSource(source: string): string {
@@ -82,6 +96,12 @@ export function normalizeMarkdownSource(source: string): string {
       continue
     }
 
+    const expanded = expandCollapsedBulletList(raw)
+    if (expanded !== raw) {
+      if (previousKind !== 'blank') emitBlank()
+      for (const item of expanded.split('\n')) emitLine(item, 'list')
+      continue
+    }
     const line = convertListMarkers(raw)
     const kind = priorKind === 'list' && /^[ \t]{2,}\S/u.test(line)
       ? 'list'

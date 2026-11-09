@@ -27,6 +27,8 @@ export type ActionEventFlushReason =
 // A newly revealed or hidden WebView can delay rAF. Keep the fallback within
 // one nominal frame so the immediate first token is not followed by a 50ms gap.
 const STREAM_FLUSH_TIMEOUT_MS = 16
+// Resume immediately after a visible pause; dense events still share a frame.
+const STREAM_RESUME_IMMEDIATE_MS = 32
 
 interface LogicalCursor {
   sessionGeneration: number
@@ -48,6 +50,7 @@ let cursor: LogicalCursor | null = null
 let bufferedEvents: ActionStreamEvent[] = []
 let logicalRevision = 0
 let hasPublishedNonEmptyContent = false
+let lastContentPublishedAt: number | null = null
 let hasPublishedNonEmptyThinking = false
 let pendingContent: string[] = []
 let pendingThinking: string[] = []
@@ -88,6 +91,7 @@ function publishPendingDeltas(notify: boolean): boolean {
     })
     pendingContent = []
     hasPublishedNonEmptyContent = true
+    lastContentPublishedAt = performance.now()
   }
   if (pendingThinking.length) {
     next = appendResultThinkingBatch(next, {
@@ -154,6 +158,7 @@ function acceptInitialStarted(
   }
   logicalRevision += 1
   hasPublishedNonEmptyContent = false
+  lastContentPublishedAt = null
   hasPublishedNonEmptyThinking = false
   publishReducedEvent(event, notify)
 }
@@ -173,7 +178,10 @@ function acceptDelta(
 
   pendingContent.push(event.delta)
   // First answer bypasses batching, including after a long reasoning phase.
-  if (!hasPublishedNonEmptyContent || !schedule) publishPendingDeltas(notify)
+  if (
+    !hasPublishedNonEmptyContent || !schedule ||
+    (lastContentPublishedAt !== null && performance.now() - lastContentPublishedAt >= STREAM_RESUME_IMMEDIATE_MS)
+  ) publishPendingDeltas(notify)
   else scheduleDeltaFlush()
 }
 
@@ -402,6 +410,7 @@ export function hydrateActionEventStore(
   bufferedEvents = []
   phase = 'live'
   hasPublishedNonEmptyContent = sessionSnapshot.contentScalarCount > 0
+  lastContentPublishedAt = hasPublishedNonEmptyContent ? performance.now() : null
   hasPublishedNonEmptyThinking = publishedSnapshot.thinkingContent.length > 0
   logicalRevision += 1
   notifySubscribers()

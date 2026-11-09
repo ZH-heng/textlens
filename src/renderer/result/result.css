@@ -125,8 +125,8 @@ body,
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 36px;
-  padding: 4px 8px 4px 10px;
+  height: 30px;
+  padding: 1px 8px 1px 10px;
   cursor: default;
   user-select: none;
   background: var(--surface-muted);
@@ -1478,4 +1478,15 @@ body,
       --result-model-menu-surface: color-mix(in srgb, var(--surface-solid) 78%, var(--surface-muted));
     }
   }
+}
+
+.markdown-streaming .stream-text-enter {
+  animation: stream-text-enter 250ms cubic-bezier(0.4, 0, 1, 1) backwards;
+}
+@keyframes stream-text-enter {
+  from { opacity: 0.45; }
+  to { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .markdown-streaming .stream-text-enter { animation: none; }
 }

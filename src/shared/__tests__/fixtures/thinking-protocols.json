@@ -1,0 +1,492 @@
+[
+  {
+    "modelId": "o3-mini",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "dialect": "reasoningEffort",
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/reasoning_effort": "low"
+    }
+  },
+  {
+    "modelId": "gpt-5.2-pro",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "dialect": "reasoningEffort",
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/reasoning_effort": "medium"
+    }
+  },
+  {
+    "modelId": "gpt-5.2",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "dialect": "reasoningEffort",
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/reasoning_effort": "none"
+    }
+  },
+  {
+    "modelId": "deepseek-v4",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "high",
+      "xhigh"
+    ],
+    "dialect": "reasoningEffortMax",
+    "supportsOff": true,
+    "mode": "xhigh",
+    "fields": {
+      "/reasoning_effort": "max"
+    }
+  },
+  {
+    "modelId": "o3-mini",
+    "protocol": "openAiResponses",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "dialect": "reasoningEffort",
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/reasoning/effort": "low"
+    }
+  },
+  {
+    "modelId": "gpt-5.2-pro",
+    "protocol": "openAiResponses",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "dialect": "reasoningEffort",
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/reasoning/effort": "medium"
+    }
+  },
+  {
+    "modelId": "gpt-5.2",
+    "protocol": "openAiResponses",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "dialect": "reasoningEffort",
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/reasoning/effort": "none"
+    }
+  },
+  {
+    "modelId": "deepseek-v4",
+    "protocol": "openAiResponses",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "high",
+      "xhigh"
+    ],
+    "dialect": "reasoningEffortMax",
+    "supportsOff": true,
+    "mode": "xhigh",
+    "fields": {
+      "/reasoning/effort": "max"
+    }
+  },
+  {
+    "modelId": "qwen3-235b",
+    "protocol": "openAiChat",
+    "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "levels": [
+      "medium"
+    ],
+    "dialect": "enableThinking",
+    "supportsOff": true,
+    "mode": "medium",
+    "fields": {
+      "/enable_thinking": true,
+      "/reasoning_effort": null
+    }
+  },
+  {
+    "modelId": "qwen3-235b",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "medium"
+    ],
+    "dialect": "chatTemplateKwargs",
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/chat_template_kwargs/enable_thinking": false,
+      "/reasoning_effort": null
+    }
+  },
+  {
+    "modelId": "qwen3.8",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "dialect": "reasoningEffort",
+    "supportsOff": true,
+    "mode": "xhigh",
+    "fields": {
+      "/reasoning_effort": "xhigh",
+      "/enable_thinking": null
+    }
+  },
+  {
+    "modelId": "glm-4.6",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "medium"
+    ],
+    "dialect": "thinkingToggle",
+    "supportsOff": true,
+    "mode": "medium",
+    "fields": {
+      "/thinking/type": "enabled",
+      "/reasoning_effort": null
+    }
+  },
+  {
+    "modelId": "glm-4.6",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "medium"
+    ],
+    "dialect": "thinkingToggle",
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/thinking/type": "disabled"
+    }
+  },
+  {
+    "modelId": "kimi-k2.5",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "medium"
+    ],
+    "dialect": "thinkingToggle",
+    "supportsOff": true,
+    "mode": "medium",
+    "fields": {
+      "/thinking/type": "enabled",
+      "/reasoning_effort": null
+    }
+  },
+  {
+    "modelId": "kimi-k2.5",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "medium"
+    ],
+    "dialect": "thinkingToggle",
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/thinking/type": "disabled"
+    }
+  },
+  {
+    "modelId": "deepseek-v3.2",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "medium"
+    ],
+    "dialect": "thinkingToggle",
+    "supportsOff": true,
+    "mode": "medium",
+    "fields": {
+      "/thinking/type": "enabled",
+      "/reasoning_effort": null
+    }
+  },
+  {
+    "modelId": "deepseek-v3.2",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "medium"
+    ],
+    "dialect": "thinkingToggle",
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/thinking/type": "disabled"
+    }
+  },
+  {
+    "modelId": "glm-5.1",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "dialect": "reasoningEffort",
+    "supportsOff": true,
+    "mode": "high",
+    "fields": {
+      "/reasoning_effort": "high"
+    }
+  },
+  {
+    "modelId": "gpt-5.2",
+    "protocol": "openAiChat",
+    "baseUrl": "https://openrouter.ai/api/v1",
+    "levels": [
+      "low",
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "dialect": "openRouterReasoning",
+    "supportsOff": true,
+    "mode": "high",
+    "fields": {
+      "/reasoning/effort": "high",
+      "/reasoning_effort": null
+    }
+  },
+  {
+    "modelId": "claude-sonnet-4-5",
+    "protocol": "anthropicMessages",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "dialect": null,
+    "supportsOff": true,
+    "mode": "high",
+    "fields": {
+      "/thinking/type": "enabled",
+      "/thinking/budget_tokens": 4096
+    }
+  },
+  {
+    "modelId": "claude-sonnet-4-5",
+    "protocol": "anthropicMessages",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "dialect": null,
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/thinking": null
+    }
+  },
+  {
+    "modelId": "gemini-2.5-flash",
+    "protocol": "gemini",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "dialect": null,
+    "supportsOff": true,
+    "mode": "off",
+    "fields": {
+      "/generationConfig/thinkingConfig/thinkingBudget": 0
+    }
+  },
+  {
+    "modelId": "gemini-2.5-pro",
+    "protocol": "gemini",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "dialect": null,
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/generationConfig/thinkingConfig/thinkingBudget": 128
+    }
+  },
+  {
+    "modelId": "gemini-3-pro",
+    "protocol": "gemini",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "low",
+      "high"
+    ],
+    "dialect": "geminiLevel",
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/generationConfig/thinkingConfig/thinkingLevel": "low",
+      "/generationConfig/thinkingConfig/thinkingBudget": null
+    }
+  },
+  {
+    "modelId": "gemini-3-flash",
+    "protocol": "gemini",
+    "baseUrl": "https://example.com/v1",
+    "levels": [
+      "minimal",
+      "low",
+      "medium",
+      "high"
+    ],
+    "dialect": "geminiLevel",
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/generationConfig/thinkingConfig/thinkingLevel": "minimal"
+    }
+  },
+  {
+    "modelId": "deepseek-r1",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [],
+    "dialect": null,
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/reasoning_effort": null,
+      "/thinking": null
+    }
+  },
+  {
+    "modelId": "magistral-medium-2506",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [],
+    "dialect": null,
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/reasoning_effort": null,
+      "/thinking": null
+    }
+  },
+  {
+    "modelId": "kimi-k2-thinking",
+    "protocol": "openAiChat",
+    "baseUrl": "https://example.com/v1",
+    "levels": [],
+    "dialect": null,
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/reasoning_effort": null,
+      "/thinking": null
+    }
+  },
+  {
+    "modelId": "gemini-2.0-flash-thinking-exp",
+    "protocol": "gemini",
+    "baseUrl": "",
+    "levels": [],
+    "dialect": null,
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/generationConfig/thinkingConfig": null
+    }
+  },
+  {
+    "modelId": "vendor-reasoning",
+    "protocol": "openAiChat",
+    "baseUrl": "",
+    "levels": [],
+    "dialect": null,
+    "supportsOff": false,
+    "mode": "off",
+    "fields": {
+      "/reasoning_effort": null
+    }
+  },
+  {
+    "modelId": "glm-4.6",
+    "protocol": "openAiChat",
+    "baseUrl": "",
+    "levels": [
+      "medium"
+    ],
+    "dialect": "thinkingToggle",
+    "supportsOff": true,
+    "mode": "high",
+    "fields": {
+      "/thinking/type": "enabled",
+      "/reasoning_effort": null
+    }
+  },
+  {
+    "modelId": "qwen3",
+    "protocol": "openAiChat",
+    "baseUrl": "",
+    "levels": [
+      "medium"
+    ],
+    "dialect": "chatTemplateKwargs",
+    "supportsOff": true,
+    "mode": "high",
+    "fields": {
+      "/chat_template_kwargs/enable_thinking": true,
+      "/reasoning_effort": null
+    }
+  }
+]

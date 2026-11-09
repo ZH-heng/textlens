@@ -41,114 +41,36 @@ describe('bounded grapheme tail', () => {
   })
 })
 
-describe('smooth stream typewriter', () => {
-  it('shows a small first-burst peek then drains backlog smoothly over time', () => {
+describe('adaptive snapshot playback', () => {
+  it('shows the first block immediately and flushes authoritative terminal content', () => {
     const stream = new SmoothStreamController()
-    // First chunks are always immediate.
-    expect(stream.setTarget('你好', true, 0)).toBe('你好')
-    expect(stream.needsTick()).toBe(false)
-
-    const long = `你好${'字'.repeat(80)}`
-    expect(stream.setTarget(long, true, 1000)).toBe('你好')
-    expect(stream.needsTick()).toBe(true)
-
-    const afterOne = stream.tick(1016)
-    expect(afterOne.startsWith('你好')).toBe(true)
-    expect(afterOne.length).toBeGreaterThan('你好'.length)
-    expect(afterOne.length).toBeLessThan(long.length)
-
-    let guard = 0
-    let t = 1016
-    while (stream.needsTick() && guard < 400) {
-      t += 16
-      stream.tick(t)
-      guard += 1
-    }
-    expect(stream.getDisplayed()).toBe(long)
-  })
-
-  it('shows the complete opening chunk immediately, including large chunks', () => {
-    const stream = new SmoothStreamController()
-    const opening = '字'.repeat(40)
-    const shown = stream.setTarget(opening, true, 0)
-    expect(shown).toBe(opening)
-    expect(shown.length).toBeGreaterThan(0)
+    expect(stream.setTarget('首😀', true, 0)).toBe('首😀')
+    stream.setTarget('首😀后续内容', true, 16)
+    expect(stream.getDisplayed()).toBe('首😀')
+    stream.tick(32)
+    expect(stream.setTarget('首😀后续内容', false, 40)).toBe('首😀后续内容')
     expect(stream.needsTick()).toBe(false)
   })
-
-  it('snaps to full text when streaming ends', () => {
+  it('drains without a terminal event and handles replacements', () => {
     const stream = new SmoothStreamController()
-    stream.setTarget('ab', true, 0)
-    stream.setTarget(`ab${'c'.repeat(50)}`, true, 16)
-    expect(stream.getDisplayed().length).toBeLessThan(52)
-    expect(stream.setTarget(`ab${'c'.repeat(50)}`, false, 32)).toBe(`ab${'c'.repeat(50)}`)
-    expect(stream.needsTick()).toBe(false)
-  })
-
-
-  it('bounds display lag even for huge bursts and continuous target growth', () => {
-    const stream = new SmoothStreamController()
-    stream.setTarget('My', true, 0)
-    stream.setTarget('My' + '😀'.repeat(2000), true, 1000)
-    const firstFrame = stream.tick(1016)
-    expect(firstFrame.length).toBeGreaterThan(2)
-    expect(firstFrame.length).toBeLessThan(stream.getTarget().length)
-    for (let t = 1032; t <= 1112; t += 16) {
-      stream.setTarget(stream.getTarget() + '中文', true, t)
-      stream.tick(t)
-    }
-    stream.tick(1176)
+    stream.setTarget('首', true, 0)
+    stream.setTarget('首' + '😀'.repeat(200), true, 16)
+    stream.tick(1100)
     expect(stream.getDisplayed()).toBe(stream.getTarget())
-    expect(stream.getDisplayedScalarCount()).toBe(Array.from(stream.getTarget()).length)
-    expect(stream.needsTick()).toBe(false)
-    // A new burst after an idle period gets its own playback budget.
-    const shown = stream.getDisplayed()
-    stream.setTarget(shown + 'x'.repeat(100), true, 5000)
-    expect(stream.tick(5016).length - shown.length).toBeLessThan(100)
-    stream.tick(5120)
-    expect(stream.getDisplayed()).toBe(stream.getTarget())
+    expect(stream.getDisplayedScalarCount()).toBe(201)
+    expect(stream.setTarget('替换', true, 1200)).toBe('替换')
+    expect(advanceByUnicodeScalars('😀😀', 0, 1)).toBe(2)
   })
+})
 
-  it('releases expired chunks during sustained arrivals at different rates', () => {
-    for (const charsPerSecond of [20, 80, 240, 1200, 6000]) {
-      const stream = new SmoothStreamController()
-      let target = '首'
-      stream.setTarget(target, true, 0)
-      const arrivals: Array<{ at: number; end: number }> = []
-      let emitted = 0
-      for (let time = 16; time <= 1000; time += 16) {
-        const next = Math.floor(charsPerSecond * time / 1000)
-        const delta = '字'.repeat(next - emitted)
-        emitted = next
-        target += delta
-        if (delta) {
-          stream.setTarget(target, true, time)
-          arrivals.push({ at: time, end: target.length })
-        }
-        stream.tick(time)
-        for (const arrival of arrivals) {
-          if (time - arrival.at >= 64) expect(stream.getDisplayed().length).toBeGreaterThanOrEqual(arrival.end)
-        }
-      }
-      stream.tick(1100)
-      expect(stream.getDisplayed()).toBe(target)
-    }
-  })
-
-  it('rebuilds safely for replaced and shortened snapshots', () => {
-    const stream = new SmoothStreamController()
-    stream.setTarget('first', true, 0)
-    stream.setTarget('first pending', true, 10)
-    expect(stream.setTarget('replacement😀', true, 20)).toBe('replacement😀')
-    expect(stream.setTarget('replace', true, 30)).toBe('replace')
-    expect(stream.needsTick()).toBe(false)
-  })
-
-  it('does not split surrogate pairs when advancing', () => {
-    const emoji = '😀'
-    const value = `${emoji}${emoji}${emoji}`
-    const mid = advanceByUnicodeScalars(value, 0, 1)
-    expect(value.slice(0, mid)).toBe(emoji)
-    expect(advanceByUnicodeScalars(value, 0, 3)).toBe(value.length)
-  })
+it('drains all queued chunks for a hidden window without advancing its clock', () => {
+  const stream = new SmoothStreamController()
+  stream.setTarget('首', true, 0)
+  stream.setTarget('首后续', true, 16)
+  stream.setTarget('首后续内容', true, 32)
+  expect(stream.tick(33, true)).toBe('首后续内容')
+  expect(stream.needsTick()).toBe(false)
+  stream.setTarget('首后续内容再次到达', true, 48)
+  stream.tick(64)
+  expect(stream.getDisplayed().startsWith('首后续内容')).toBe(true)
 })

@@ -705,7 +705,7 @@ Return only the translated content. Do not include explanations, labels, tags, o
     expect(migrated.actions.find((action) => action.id === 'explain')).toMatchObject({
       prompt: DEFAULT_ACTION_PROMPTS.explain
     })
-    expect(DEFAULT_ACTION_PROMPTS.explain).toContain('整体解释')
+    expect(DEFAULT_ACTION_PROMPTS.explain).toContain('先说清整体意思')
     expect(DEFAULT_ACTION_PROMPTS.explain).toContain('{{language}}')
     expect(migratedCustom.actions.find((action) => action.id === 'explain')).toMatchObject({
       prompt: customExplain

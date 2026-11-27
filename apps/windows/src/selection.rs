@@ -7484,7 +7484,10 @@ fn known_copy_compatibility_application(image_path: &str) -> bool {
     let executable = executable_name(image_path);
     pdf_accessibility_first_application(image_path)
         || docbox_suite_process(&executable)
-        || matches!(executable.as_str(), "emeditor.exe")
+        || matches!(
+            executable.as_str(),
+            "emeditor.exe" | "notepad4.exe" | "texstudio.exe"
+        )
 }
 
 /// How long to wait after mouse-up before the first capture attempt.
@@ -10351,6 +10354,16 @@ mod tests {
     #[test]
     fn configured_direct_copy_rules_override_the_selection_hook_default() {
         let settings = SelectionCaptureSettings::default();
+        for path in [
+            r"C:\Tools\Notepad4\Notepad4.exe",
+            r"C:\Tools\TeXstudio\texstudio.exe",
+        ] {
+            assert!(known_copy_compatibility_application(path));
+            assert_eq!(
+                capture_strategy_for_application(&settings, path),
+                SelectionCaptureStrategy::Clipboard
+            );
+        }
         assert_eq!(
             capture_strategy_for_application(
                 &settings,
